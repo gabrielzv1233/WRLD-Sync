@@ -681,6 +681,8 @@
     transform: none;
     z-index: 2;
   }
+  .kl.primary { z-index: 3; }
+  .kl.overlap-current { z-index: 2; }
   .kl.future { color: rgba(255,255,255,.34); opacity: .38; filter: blur(.48px); }
   .kl.editing { cursor: text; background: rgba(124,58,237,.12); transform: none; opacity: 1; filter: none; }
   .kl-content {
@@ -688,7 +690,8 @@
     transform-origin: left center;
     transition: transform .34s cubic-bezier(.2,.8,.2,1);
   }
-  .kl.current .kl-content { transform: translateX(4px) scale(1.025); }
+  .kl.primary .kl-content { transform: translateX(4px) scale(1.025); }
+  .kl.overlap-current .kl-content { transform: translateX(2px) scale(1.012); }
   .kl.editing .kl-content { transform: none; }
   .kl-text { display: inline; }
   .kw {
@@ -782,7 +785,7 @@
     z-index: 3;
   }
   .kl:hover .kl-actions,
-  .kl.current .kl-actions { opacity: 1; }
+  .kl.primary .kl-actions { opacity: 1; }
   .kl-time {
     font-size: .65rem;
     font-family: monospace;
@@ -1577,7 +1580,8 @@
     .karaoke-lines { gap: 5px; }
     .kl { font-size: 1.01rem; padding: 5px 8px; gap: 7px; }
     .kl.current { transform: none; }
-    .kl.current .kl-content { transform: translateX(2px) scale(1.018); }
+    .kl.primary .kl-content { transform: translateX(2px) scale(1.018); }
+    .kl.overlap-current .kl-content { transform: translateX(1px) scale(1.008); }
     .kl-actions { opacity: 1; }
     #lyricsSection { padding-bottom: calc(var(--controls-height, 116px) + 10px); }
     .controls { padding: 9px 10px 10px; }
@@ -1627,7 +1631,12 @@
   .settings-popout-head { grid-column:1/-1; display:flex; align-items:center; justify-content:space-between; padding:4px 4px 10px; border-bottom:1px solid var(--border-soft); }
   .settings-popout-head > div { display:flex; flex-direction:column; gap:2px; } .settings-popout-head strong{font-size:1rem}.settings-popout-head span{font-size:.72rem;color:var(--muted)}
   #settingsPanel .sg { align-content:start; } #settingsPanel .sg:first-of-type, #settingsPanel .sg:last-of-type { grid-column:1/-1; }
-  #lyricsSection, .lyrics-body, #karaokeView, .karaoke-lines, .kl { min-width:0; max-width:100%; overflow-x:hidden; }
+  #lyricsSection { min-width:0; max-width:100%; overflow-x:hidden; }
+  /* `overflow-x:hidden` on a child implicitly computes overflow-y to auto in
+     Chromium. That accidentally made .lyrics-body the real vertical scroller
+     while all Preview camera code was moving #lyricsSection. Use clip on
+     descendants so there is exactly one vertical scrolling element. */
+  .lyrics-body, #karaokeView, .karaoke-lines, .kl { min-width:0; max-width:100%; overflow-x:clip; overflow-y:visible; }
   .lyrics-body { width:100%; } .kl { overflow-wrap:anywhere; word-break:normal; }
   #plainLyricsText, #ttmlEditorText { width:100%; max-width:100%; }
   #ttmlView { display:none; min-width:0; } #ttmlView.visible { display:flex; flex-direction:column; min-height:320px; }
@@ -2824,8 +2833,10 @@ emptyFileBtn.addEventListener('click', () => showLocalLanding());
   lyricsSection.addEventListener(ev, () => {
     if (activeTab !== 'karaoke') return;
     if (_lyricsScrollRaf) { cancelAnimationFrame(_lyricsScrollRaf); _lyricsScrollRaf = 0; }
+    _lyricsScrollTargetTop = null;
     if (autoFollow) {
       autoFollow = false;
+      stopLyricsFollowLoop();
       resumeFollowBtn.classList.add('visible');
     }
   }, { passive: true })
@@ -2833,10 +2844,14 @@ emptyFileBtn.addEventListener('click', () => showLocalLanding());
 resumeFollowBtn.addEventListener('click', () => {
   autoFollow = true;
   resumeFollowBtn.classList.remove('visible');
-  if (activeLineIdx >= 0) {
-    const gap = computeGapState(audioPlayer.currentTime, activeLineIdx);
-    applyHighlight(activeLineIdx, true, false, gap.after);
-  }
+  _lyricsFollowKey = '';
+  _lyricsFollowHoldKey = '';
+  _lyricsFollowHoldUntil = 0;
+  startLyricsFollowLoop();
+  // Resume is an explicit request to get the camera back onto playback. Use the
+  // lyric interval closest to the current time and animate there, never teleport.
+  paintKaraokeFrame({ scroll: false });
+  ensureLyricsAutoFollow({ force: true, preferNearest: true });
 });
 
 // ── Random filter popover ─────────────────────────────────────────────────
@@ -3093,7 +3108,7 @@ async function loadSongData(song) {
   setSyncStatus('');
   syncBtn.disabled = false; autoWhisperBtn.disabled = false; transcribeBtn.disabled = false;
   setKaraokeDefault();
-  autoFollow = true; resumeFollowBtn.classList.remove('visible');
+  autoFollow = true; _lyricsFollowKey = ''; _lyricsFollowHoldKey = ''; _lyricsFollowHoldUntil = 0; _lyricsScrollTargetTop = null; resumeFollowBtn.classList.remove('visible');
   proposeBtn.classList.remove('visible'); copyTtmlBtn.classList.remove('visible'); copyLrcBtn.classList.remove('visible');
   verifyPanel.classList.remove('visible');
 
@@ -3278,6 +3293,11 @@ function renderKaraoke(lines, { live = false } = {}) {
   });
 
   karaokeLines.innerHTML = html.join('');
+  if (_lyricsScrollRaf) { cancelAnimationFrame(_lyricsScrollRaf); _lyricsScrollRaf = 0; }
+  _lyricsScrollTargetTop = null;
+  _lyricsFollowKey = '';
+  _lyricsFollowHoldKey = '';
+  _lyricsFollowHoldUntil = 0;
   activeLineIdx = computeActiveIdx();
   _activeOverlapKey = '';
   const gap = computeGapState(audioPlayer.currentTime, activeLineIdx);
@@ -3285,8 +3305,15 @@ function renderKaraoke(lines, { live = false } = {}) {
   applyHighlight(activeLineIdx, false, true, gap.after, computeActiveLineIndices(audioPlayer.currentTime, activeLineIdx));
   updateActiveWordAnimations(audioPlayer.currentTime, activeLineIdx);
   updateInterludeAnimation(audioPlayer.currentTime);
+  startLyricsFollowLoop();
 }
 function setKaraokeDefault() {
+  if (_lyricsScrollRaf) { cancelAnimationFrame(_lyricsScrollRaf); _lyricsScrollRaf = 0; }
+  _lyricsScrollTargetTop = null;
+  _lyricsFollowKey = '';
+  _lyricsFollowHoldKey = '';
+  _lyricsFollowHoldUntil = 0;
+  stopLyricsFollowLoop();
   karaokeLines.innerHTML = '<span style="color:var(--muted);font-size:.88rem">Run Auto to transcribe, or Sync to align the current Lyrics text.</span>';
   activeInterludeAfter = -1;
 }
@@ -3304,31 +3331,280 @@ function setWordFill(wordEl, fill, scale = 1, active = false) {
 }
 
 let _lyricsScrollRaf = 0;
-function scrollLyricsTo(target, instant = false) {
-  if (!target) return;
-  if (_lyricsScrollRaf) cancelAnimationFrame(_lyricsScrollRaf);
-  const maxScroll = Math.max(0, lyricsSection.scrollHeight - lyricsSection.clientHeight);
+let _lyricsScrollTargetTop = null;
+let _lyricsFollowKey = '';
+let _lyricsFollowHoldKey = '';
+let _lyricsFollowHoldUntil = 0;
+let _lyricsFollowLoopRaf = 0;
+
+function getLyricsSafeViewport() {
   const sectionRect = lyricsSection.getBoundingClientRect();
-  const targetRect = target.getBoundingClientRect();
-  const targetCenter = lyricsSection.scrollTop + (targetRect.top - sectionRect.top) + targetRect.height / 2;
-  const targetTop = Math.max(0, Math.min(maxScroll, targetCenter - lyricsSection.clientHeight / 2));
+  let top = 0;
+  let bottom = lyricsSection.clientHeight;
+
+  // The sticky Preview/Lyrics/TTML strip occupies part of the scroll viewport.
+  // The player controls are absolutely positioned over the bottom. Centering
+  // against the raw clientHeight can therefore place the lyric behind UI.
+  const tabs = lyricsSection.querySelector('.lyrics-tabs');
+  if (tabs && !tabs.hidden) {
+    const r = tabs.getBoundingClientRect();
+    top = Math.max(top, Math.min(lyricsSection.clientHeight, r.bottom - sectionRect.top + 10));
+  }
+
+  const controls = document.querySelector('.controls');
+  if (controls) {
+    const r = controls.getBoundingClientRect();
+    const controlsTop = r.top - sectionRect.top;
+    if (controlsTop > 0 && controlsTop < lyricsSection.clientHeight) {
+      bottom = Math.min(bottom, controlsTop - 12);
+    }
+  }
+
+  // Extremely short/mobile layouts can leave almost no measured safe region.
+  // Fall back to the actual viewport rather than producing a nonsense target.
+  if (bottom - top < 80) {
+    top = 0;
+    bottom = lyricsSection.clientHeight;
+  }
+  return { top, bottom, center: top + (bottom - top) / 2 };
+}
+
+function getLyricsContentY(el, edge = 'center') {
+  if (!el) return NaN;
+  const sectionRect = lyricsSection.getBoundingClientRect();
+  const rect = el.getBoundingClientRect();
+  const top = lyricsSection.scrollTop + (rect.top - sectionRect.top);
+  if (edge === 'top') return top;
+  if (edge === 'bottom') return top + rect.height;
+  return top + rect.height / 2;
+}
+
+function getLyricsNaturalMaxScroll(viewport) {
+  const physicalMax = Math.max(0, lyricsSection.scrollHeight - lyricsSection.clientHeight);
+  const contentRows = karaokeLines.querySelectorAll('.kl, .ki');
+  if (!contentRows.length) return physicalMax;
+
+  let contentBottom = 0;
+  contentRows.forEach(row => {
+    const bottom = getLyricsContentY(row, 'bottom');
+    if (Number.isFinite(bottom)) contentBottom = Math.max(contentBottom, bottom);
+  });
+
+  // Don't use the artificial bottom padding as empty camera space. The last
+  // lyric only needs to be able to rise above the floating controls, not all
+  // the way to mathematical center if doing so would expose a huge blank tail.
+  const naturalMax = Math.max(0, contentBottom - viewport.bottom + 14);
+  return Math.min(physicalMax, naturalMax);
+}
+
+function getLyricsTargetTop(targets) {
+  const rows = Array.from(targets ?? []).filter(Boolean);
+  if (!rows.length) return null;
+
+  const centers = rows.map(row => getLyricsContentY(row, 'center'))
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  if (!centers.length) return null;
+
+  // Two active rows use their exact midpoint. Larger overlap groups use the
+  // median center so one unusually tall/wrapped line cannot pull the camera.
+  const mid = Math.floor(centers.length / 2);
+  const targetCenter = centers.length % 2
+    ? centers[mid]
+    : (centers[mid - 1] + centers[mid]) / 2;
+  const viewport = getLyricsSafeViewport();
+  const maxScroll = getLyricsNaturalMaxScroll(viewport);
+
+  // Keep the active lyric group centered whenever the content physically
+  // allows it, but clamp hard at the real content edges instead of creating
+  // fake blank space above the first lyric or below the last one.
+  return Math.max(0, Math.min(maxScroll, targetCenter - viewport.center));
+}
+
+function lyricFollowEase(t) {
+  // Almost-immediate acceleration, then near-constant travel, then a visibly
+  // softer landing. The ~4.5% ease-in is short enough to be subconscious while
+  // the longer ease-out keeps the stop from feeling mechanical.
+  const accel = 0.045;
+  const decel = 0.24;
+  const cruiseEnd = 1 - decel;
+  const area = 1 - (accel + decel) / 2;
+
+  if (t <= accel) return (t * t / (2 * accel)) / area;
+  if (t <= cruiseEnd) return (accel / 2 + (t - accel)) / area;
+
+  const u = t - cruiseEnd;
+  const beforeDecel = accel / 2 + (cruiseEnd - accel);
+  return (beforeDecel + u - (u * u) / (2 * decel)) / area;
+}
+
+function scrollLyricsToTargets(targets, instant = false, force = false) {
+  const targetTop = getLyricsTargetTop(targets);
+  if (!Number.isFinite(targetTop)) return false;
+
   const from = lyricsSection.scrollTop;
   const distance = targetTop - from;
-  if (instant || Math.abs(distance) < 1) { lyricsSection.scrollTop = targetTop; return; }
-  // Native smooth scrolling can turn tiny line-to-line moves into a visual snap.
-  // Give every automatic lyric transition a real minimum animation time.
-  const duration = Math.max(420, Math.min(820, Math.abs(distance) / 1.1));
+
+  // Continuous follow calls this every animation frame. Do not restart an
+  // already-running move when its destination has not materially changed.
+  if (!force && _lyricsScrollRaf && Number.isFinite(_lyricsScrollTargetTop)
+      && Math.abs(_lyricsScrollTargetTop - targetTop) < 1.5) return true;
+
+  if (_lyricsScrollRaf) {
+    cancelAnimationFrame(_lyricsScrollRaf);
+    _lyricsScrollRaf = 0;
+  }
+  _lyricsScrollTargetTop = targetTop;
+
+  if (instant || Math.abs(distance) < 1.5) {
+    lyricsSection.scrollTop = targetTop;
+    _lyricsScrollTargetTop = null;
+    return true;
+  }
+
+  // Distance controls duration, giving the move a nearly fixed perceived
+  // speed. Short lyric hops still get enough time to read as motion, while a
+  // huge seek can travel farther without turning into a teleport; only extreme jumps are capped.
+  const duration = Math.max(170, Math.min(850, Math.abs(distance) / 2.25));
   const started = performance.now();
-  // Smoothstep starts and ends at zero velocity. Ease-out curves move almost half
-  // the distance immediately and can still look like a snap on one-line jumps.
-  const ease = t => t * t * (3 - 2 * t);
   const frame = now => {
+    // If the user left Preview or manually disabled follow, stop immediately.
+    if (!autoFollow || activeTab !== 'karaoke') {
+      _lyricsScrollRaf = 0;
+      _lyricsScrollTargetTop = null;
+      return;
+    }
     const t = Math.min(1, (now - started) / duration);
-    lyricsSection.scrollTop = from + distance * ease(t);
-    if (t < 1 && autoFollow) _lyricsScrollRaf = requestAnimationFrame(frame);
-    else _lyricsScrollRaf = 0;
+    lyricsSection.scrollTop = from + distance * lyricFollowEase(t);
+    if (t < 1) {
+      _lyricsScrollRaf = requestAnimationFrame(frame);
+    } else {
+      // Land exactly on the clamped destination so floating-point rounding does
+      // not leave us a pixel or two away and trigger another follow pass.
+      lyricsSection.scrollTop = targetTop;
+      _lyricsScrollRaf = 0;
+      _lyricsScrollTargetTop = null;
+    }
   };
   _lyricsScrollRaf = requestAnimationFrame(frame);
+  return true;
+}
+function scrollLyricsTo(target, instant = false, force = false) {
+  return scrollLyricsToTargets(target ? [target] : [], instant, force);
+}
+
+function computeNearestLineIdx(t = audioPlayer.currentTime) {
+  if (!syncedLines.length) return -1;
+  let best = -1;
+  let bestDistance = Infinity;
+  syncedLines.forEach((line, i) => {
+    const start = Number(line.start);
+    const end = Number(line.end);
+    if (!Number.isFinite(start)) return;
+    const safeEnd = Number.isFinite(end) && end >= start ? end : start;
+    const distance = t < start ? start - t : t > safeEnd ? t - safeEnd : 0;
+    // Prefer the newer line when two intervals are equally close.
+    if (distance <= bestDistance) {
+      best = i;
+      bestDistance = distance;
+    }
+  });
+  return best;
+}
+
+function getAutoFollowTargets(t = audioPlayer.currentTime, preferNearest = false) {
+  const divs = karaokeLines.querySelectorAll('.kl');
+  if (!divs.length) return { key: '', targets: [] };
+
+  if (pinnedIdx >= 0 && divs[pinnedIdx]) {
+    return { key: `pin:${pinnedIdx}`, targets: [divs[pinnedIdx]] };
+  }
+
+  const idx = computeActiveIdx();
+  const activeIndices = computeActiveLineIndices(t, idx);
+  const genuinelyActive = overlapLyricsToggle.checked
+    ? activeIndices.filter(i => {
+        const line = syncedLines[i];
+        return line && Number(line.start) <= t && t < Number(line.end);
+      })
+    : (idx >= 0 && syncedLines[idx] && Number(syncedLines[idx].start) <= t && t < Number(syncedLines[idx].end) ? [idx] : []);
+
+  if (genuinelyActive.length) {
+    const targets = genuinelyActive.map(i => divs[i]).filter(Boolean);
+    return { key: `lines:${genuinelyActive.join(',')}`, targets };
+  }
+
+  const gap = computeGapState(t, idx);
+  if (gap.after >= 0 && gap.interlude) {
+    const interlude = karaokeLines.querySelector(`.ki[data-after-i="${gap.after}"]`);
+    if (interlude) return { key: `gap:${gap.after}`, targets: [interlude] };
+  }
+
+  // During normal playback keep the most recently started lyric until the next
+  // one starts. On an explicit Resume/play/seek re-anchor, prefer the lyric
+  // interval actually closest to the current playback time.
+  const fallbackIdx = preferNearest || idx < 0 ? computeNearestLineIdx(t) : idx;
+  if (fallbackIdx >= 0 && divs[fallbackIdx]) {
+    return { key: `near:${fallbackIdx}`, targets: [divs[fallbackIdx]] };
+  }
+  return { key: '', targets: [] };
+}
+
+function ensureLyricsAutoFollow({ force = false, preferNearest = false } = {}) {
+  if (!autoFollow || activeTab !== 'karaoke' || !syncedLines.length) return false;
+  const follow = getAutoFollowTargets(audioPlayer.currentTime, preferNearest);
+  if (!follow.targets.length) return false;
+
+  // Returning to Preview first restores its exact old scroll position, but only
+  // holds it for a tiny grace period. After that, active auto-follow takes over
+  // again even if the lyric key never changed while another tab was open.
+  if (force) {
+    _lyricsFollowHoldKey = '';
+    _lyricsFollowHoldUntil = 0;
+  } else if (_lyricsFollowHoldKey) {
+    if (performance.now() < _lyricsFollowHoldUntil && follow.key === _lyricsFollowHoldKey) {
+      _lyricsFollowKey = follow.key;
+      return true;
+    }
+    _lyricsFollowHoldKey = '';
+    _lyricsFollowHoldUntil = 0;
+  }
+
+  // A group/key change is always a meaningful camera event. Otherwise the
+  // continuous frame loop only corrects position if the viewport is actually
+  // away from its clamped destination.
+  const keyChanged = follow.key !== _lyricsFollowKey;
+  _lyricsFollowKey = follow.key;
+  const targetTop = getLyricsTargetTop(follow.targets);
+  if (!Number.isFinite(targetTop)) return false;
+  const offBy = Math.abs(targetTop - lyricsSection.scrollTop);
+  if (!force && !keyChanged && offBy < 4 && !_lyricsScrollRaf) return true;
+  return scrollLyricsToTargets(follow.targets, false, force || keyChanged);
+}
+
+function stopLyricsFollowLoop() {
+  if (_lyricsFollowLoopRaf) {
+    cancelAnimationFrame(_lyricsFollowLoopRaf);
+    _lyricsFollowLoopRaf = 0;
+  }
+}
+
+function startLyricsFollowLoop() {
+  if (_lyricsFollowLoopRaf || !autoFollow || activeTab !== 'karaoke' || !syncedLines.length) return;
+  const tick = () => {
+    _lyricsFollowLoopRaf = 0;
+    if (!autoFollow || activeTab !== 'karaoke' || !syncedLines.length) return;
+
+    // This controller is deliberately independent from audio/play events. Even
+    // if Opera delays a media event or the DOM reflows, Preview continuously
+    // reconciles the camera toward the active/nearest lyric group.
+    ensureLyricsAutoFollow({ preferNearest: audioPlayer.paused });
+    // While paused, run only until the requested camera move has settled. Play,
+    // seek, resize, tab return, and Resume all restart this loop explicitly.
+    if (audioPlayer.paused && !_lyricsScrollRaf) return;
+    _lyricsFollowLoopRaf = requestAnimationFrame(tick);
+  };
+  _lyricsFollowLoopRaf = requestAnimationFrame(tick);
 }
 
 function applyHighlight(idx, scroll = true, instant = false, gapAfter = -1, activeIndices = null) {
@@ -3339,7 +3615,14 @@ function applyHighlight(idx, scroll = true, instant = false, gapAfter = -1, acti
     if (gapAfter >= 0) state = i <= gapAfter ? 'past' : 'future';
     else if (activeSet.has(i)) state = 'current';
     else state = i < idx ? 'past' : 'future';
-    d.className = `kl ${state}`;
+
+    // Multiple rows may genuinely be active at once. Keep all of them bright,
+    // but only the newest/pinned row is the primary UI row. This avoids scaling
+    // every overlapping row and avoids showing several timestamp/delete toolbars.
+    const roleClass = state === 'current'
+      ? (i === idx ? ' primary' : ' overlap-current')
+      : '';
+    d.className = `kl ${state}${roleClass}`;
     d.querySelectorAll('.kw').forEach(w => setWordFill(w, state === 'past' ? 100 : 0));
   });
 
@@ -3352,11 +3635,18 @@ function applyHighlight(idx, scroll = true, instant = false, gapAfter = -1, acti
   });
 
   if (scroll && autoFollow && activeTab === 'karaoke') {
-    let target = null;
-    if (gapAfter >= 0)
-      target = karaokeLines.querySelector(`.ki[data-after-i="${gapAfter}"]`);
-    if (!target && gapAfter < 0 && idx >= 0) target = divs[idx];
-    if (target) scrollLyricsTo(target, instant);
+    if (gapAfter >= 0) {
+      const interlude = karaokeLines.querySelector(`.ki[data-after-i="${gapAfter}"]`);
+      if (interlude) scrollLyricsTo(interlude, instant);
+      return;
+    }
+
+    const activeTargets = Array.from(activeSet)
+      .sort((a, b) => a - b)
+      .map(i => divs[i])
+      .filter(Boolean);
+    if (activeTargets.length) scrollLyricsToTargets(activeTargets, instant);
+    else if (idx >= 0 && divs[idx]) scrollLyricsTo(divs[idx], instant);
   }
 }
 
@@ -3456,7 +3746,7 @@ function updateInterludeAnimation(t) {
 
 let _karaokeRaf = 0;
 let _activeOverlapKey = '';
-function paintKaraokeFrame({ scroll = false, instant = false } = {}) {
+function paintKaraokeFrame({ scroll = false, instant = false, preferNearest = false, forceFollow = false } = {}) {
   if (!syncedLines.length) return;
   const t = audioPlayer.currentTime;
   const idx = computeActiveIdx();
@@ -3469,12 +3759,20 @@ function paintKaraokeFrame({ scroll = false, instant = false } = {}) {
     activeLineIdx = idx;
     activeInterludeAfter = gap.after;
     _activeOverlapKey = overlapKey;
-    // Ending an older overlapping line should only change its visual state. Do
-    // not kick off another auto-scroll to the same newest line.
-    if (pinnedIdx < 0) applyHighlight(idx, primaryChanged ? scroll : false, instant, gap.after, activeIndices);
+    // Highlighting and camera movement are intentionally separate. The old
+    // event-only coupling meant auto-follow could simply miss a move if state
+    // had already been updated elsewhere before this frame ran.
+    if (pinnedIdx < 0) applyHighlight(idx, false, instant, gap.after, activeIndices);
   }
   updateActiveWordAnimations(t, pinnedIdx >= 0 ? pinnedIdx : activeLineIdx);
   updateInterludeAnimation(t);
+
+  // Follow is continuously reconciled while Preview is active. The controller
+  // is target-aware, so this does not restart the animation every frame.
+  if (scroll) ensureLyricsAutoFollow({
+    force: forceFollow || primaryChanged || overlapChanged,
+    preferNearest,
+  });
 }
 function startKaraokeAnimation() {
   if (_karaokeRaf) cancelAnimationFrame(_karaokeRaf);
@@ -3487,24 +3785,36 @@ function startKaraokeAnimation() {
 }
 
 audioPlayer.addEventListener('play', () => {
-  // Re-anchor immediately when playback starts. If the current line did not
-  // change while paused, the animation loop would otherwise wait until the next
-  // timestamp transition before doing any follow scroll.
+  // Starting playback is an explicit re-anchor request. Even if the highlighted
+  // line did not change while paused, animate toward the current/nearest lyric.
   if (pinnedIdx < 0 && autoFollow && syncedLines.length) {
-    const idx = computeActiveIdx();
-    const gap = computeGapState(audioPlayer.currentTime, idx);
-    activeLineIdx = idx;
-    activeInterludeAfter = gap.after;
-    const activeIndices = computeActiveLineIndices(audioPlayer.currentTime, idx);
-    _activeOverlapKey = activeIndices.join(',');
-    applyHighlight(idx, true, false, gap.after, activeIndices);
+    _lyricsFollowKey = '';
+    _lyricsFollowHoldKey = '';
+    _lyricsFollowHoldUntil = 0;
+    startLyricsFollowLoop();
+    paintKaraokeFrame({ scroll: true, preferNearest: true, forceFollow: true });
   }
   startKaraokeAnimation();
 });
 audioPlayer.addEventListener('pause', () => paintKaraokeFrame());
-audioPlayer.addEventListener('seeked', () => paintKaraokeFrame({ scroll: true, instant: false }));
+audioPlayer.addEventListener('seeked', () => {
+  _lyricsFollowKey = '';
+  _lyricsFollowHoldKey = '';
+  _lyricsFollowHoldUntil = 0;
+  startLyricsFollowLoop();
+  paintKaraokeFrame({ scroll: true, preferNearest: true, forceFollow: true });
+});
 audioPlayer.addEventListener('timeupdate', () => {
-  if (audioPlayer.paused) paintKaraokeFrame({ scroll: true });
+  if (audioPlayer.paused) paintKaraokeFrame({ scroll: true, preferNearest: true });
+});
+
+window.addEventListener('resize', () => {
+  if (!autoFollow || activeTab !== 'karaoke' || !syncedLines.length) return;
+  _lyricsFollowKey = '';
+  requestAnimationFrame(() => {
+    startLyricsFollowLoop();
+    ensureLyricsAutoFollow({ force: true, preferNearest: true });
+  });
 });
 
 // Click to seek / edit time chip / delete line
@@ -3840,6 +4150,7 @@ function setTab(tab) {
       cancelAnimationFrame(_lyricsScrollRaf);
       _lyricsScrollRaf = 0;
     }
+    if (previousTab === 'karaoke') stopLyricsFollowLoop();
   }
 
   activeTab = tab;
@@ -3872,6 +4183,11 @@ function setTab(tab) {
       updateActiveWordAnimation(audioPlayer.currentTime, idx);
       updateInterludeAnimation(audioPlayer.currentTime);
       lyricsSection.scrollTop = Math.max(0, tabScrollPositions.karaoke ?? 0);
+      const follow = getAutoFollowTargets(audioPlayer.currentTime, false);
+      _lyricsFollowKey = follow.key;
+      _lyricsFollowHoldKey = follow.key;
+      _lyricsFollowHoldUntil = performance.now() + 260;
+      startLyricsFollowLoop();
     }
   });
 }
@@ -4502,7 +4818,7 @@ async function loadLocalTrack(meta) {
   updateLyricsSrc('manual', false);
   setSyncStatus('');
   setKaraokeDefault();
-  autoFollow = true; resumeFollowBtn.classList.remove('visible');
+  autoFollow = true; _lyricsFollowKey = ''; _lyricsFollowHoldKey = ''; _lyricsFollowHoldUntil = 0; _lyricsScrollTargetTop = null; resumeFollowBtn.classList.remove('visible');
   proposeBtn.classList.remove('visible'); copyTtmlBtn.classList.remove('visible'); copyLrcBtn.classList.remove('visible');
   verifyPanel.classList.remove('visible');
 

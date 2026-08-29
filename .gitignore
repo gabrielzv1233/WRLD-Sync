@@ -7,8 +7,6 @@ venv/
 *.egg-info/
 tests/
 .artifacts/
-changes.md
-scripts/
 
 # Whisper model cache
 .cache/

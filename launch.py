@@ -774,9 +774,11 @@ def stop_existing_server(port: int) -> None:
     time.sleep(0.5)  # give the OS a moment to release the socket
 
 
-def wait_for_server(port: int, proc: subprocess.Popen, timeout: float = 60.0) -> bool:
+def wait_for_server(port: int, proc: subprocess.Popen, timeout: float = 60.0, should_stop=None) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if should_stop is not None and should_stop():
+            return False
         if proc.poll() is not None:
             return False
         try:
@@ -800,10 +802,12 @@ def print_banner(port: int, uv_version: str | None) -> None:
 
 
 def _stop_server_process(proc: subprocess.Popen) -> None:
-    """Stop Uvicorn without letting native Whisper/executor threads hang Ctrl+C."""
+    """Stop Uvicorn quickly, then hard-kill its entire tree if native work is stuck."""
     if proc.poll() is not None:
         return
 
+    # Give Uvicorn one short chance to shut down cleanly. Whisper/CTranslate2
+    # can be inside native code, so graceful shutdown is intentionally bounded.
     try:
         if platform.system() == "Windows":
             proc.send_signal(signal.CTRL_BREAK_EVENT)
@@ -813,24 +817,37 @@ def _stop_server_process(proc: subprocess.Popen) -> None:
         pass
 
     try:
-        proc.wait(timeout=3)
+        proc.wait(timeout=1.25)
         return
     except subprocess.TimeoutExpired:
         pass
 
-    try:
-        proc.terminate()
-        proc.wait(timeout=2)
-        return
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    if platform.system() == "Windows":
+        # /T matters here: ffmpeg or other native children can survive killing
+        # only the Uvicorn PID. /F makes Ctrl+C a guaranteed exit path.
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
 
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
     try:
-        proc.kill()
-    except OSError:
-        return
-    try:
-        proc.wait(timeout=2)
+        proc.wait(timeout=1)
     except subprocess.TimeoutExpired:
         pass
 
@@ -849,13 +866,39 @@ def run_server(port: int, open_browser: bool) -> int:
         **popen_kwargs,
     )
 
+    stop_requested = False
+    previous_handlers: dict[int, object] = {}
+
+    def request_stop(signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    handled_signals = [signal.SIGINT]
+    if hasattr(signal, "SIGBREAK"):
+        handled_signals.append(signal.SIGBREAK)
+    if hasattr(signal, "SIGTERM"):
+        handled_signals.append(signal.SIGTERM)
+    for sig in handled_signals:
+        try:
+            previous_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, request_stop)
+        except (OSError, ValueError):
+            pass
+
     try:
-        ready = wait_for_server(port, proc)
+        ready = wait_for_server(port, proc, should_stop=lambda: stop_requested)
+        if stop_requested:
+            print()
+            step("Shutting down")
+            _stop_server_process(proc)
+            ok("Stopped.")
+            return 0
+
         if ready:
             ok(f"Server is ready at {url}")
-        elif proc.returncode is not None:
+        elif proc.poll() is not None:
             err(f"Server exited before it was ready (exit code {proc.returncode}).")
-            return proc.returncode
+            return proc.returncode or 0
         else:
             warn("Server didn't respond within 60s — it may still be starting. "
                  "The browser will stay closed; check the logs above.")
@@ -870,13 +913,33 @@ def run_server(port: int, open_browser: bool) -> int:
         status_color = C.GREEN if ready else C.YELLOW
         print(f"\n{paint(status, status_color, C.BOLD)}")
         print(f"{paint(url, C.CYAN)}  |  Press Ctrl+C here to stop it.\n")
-        return proc.wait()
+
+        # Do not block forever inside Popen.wait(). Polling keeps the launcher
+        # responsive to Windows console signals even while the child is stuck
+        # in native Whisper/CTranslate2 work.
+        while proc.poll() is None and not stop_requested:
+            time.sleep(0.12)
+
+        if stop_requested and proc.poll() is None:
+            print()
+            step("Shutting down")
+            _stop_server_process(proc)
+            ok("Stopped.")
+            return 0
+        return proc.returncode or 0
     except KeyboardInterrupt:
+        # Fallback for terminals that bypass/replace our explicit SIGINT hook.
         print()
         step("Shutting down")
         _stop_server_process(proc)
         ok("Stopped.")
         return 0
+    finally:
+        for sig, old_handler in previous_handlers.items():
+            try:
+                signal.signal(sig, old_handler)
+            except (OSError, ValueError):
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -906,4 +969,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        print(paint("Cancelled.", C.DIM))
+        sys.exit(130)

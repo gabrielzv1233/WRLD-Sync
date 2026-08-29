@@ -106,3 +106,8 @@ Settings includes **Inline (…) as background vocals**. Leave it enabled to tre
 ### Overlapping lyric playback
 
 Settings includes **Allow overlapping lyrics**, off by default. When enabled, Preview keeps every lyric line whose real timestamp range is still active highlighted and animates word timing on all of them at once. This is useful when a sustained last word continues after the next line starts, or when a separately timed background/ad-lib line overlaps the foreground vocal. The option does not invent or stretch timestamps; it only renders overlap that already exists in Whisper output, imported/edited TTML, or manual timing. TTML parent sections and interlude boundaries also account for the latest overlapping vocal end.
+
+
+btw these are the settings i use:
+![my settings](readmeimgs/image.png)
+it works great on a 5070 Ti laptop edition, gotta love CUDA
