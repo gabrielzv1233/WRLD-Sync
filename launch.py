@@ -19,6 +19,7 @@ import argparse
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -124,6 +125,17 @@ def human_time(seconds: float) -> str:
     return f"{minutes}m{seconds:02d}s"
 
 
+def port_number(value: str) -> int:
+    """An argparse type for TCP ports that can actually be bound."""
+    try:
+        port = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("port must be a number") from e
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
 def venv_python() -> Path:
     if platform.system() == "Windows":
         return VENV_DIR / "Scripts" / "python.exe"
@@ -218,7 +230,7 @@ def offer_git_conversion(auto_yes: bool) -> None:
     ok(f"Cloned in {human_time(time.time() - t0)}.")
 
     # Carry over local preferences that only exist on disk, not in git.
-    for name in (".env", ".model_pref", ".model_pref_align", ".model_pref_verify", ".device_pref"):
+    for name in (".env", ".model_pref", ".model_pref_align", ".model_pref_verify", ".device_pref", ".engine_pref"):
         src = ROOT / name
         if src.exists():
             shutil.copy2(src, tmp_dir / name)
@@ -321,7 +333,7 @@ def _try_enable_long_paths() -> None:
     MAX_PATH limit and make pip fail outright with WinError 206. NTFS long-path
     support (available since Windows 10 1607) fixes this. Best-effort only --
     requires admin to write HKLM, so this silently does nothing if we're not
-    elevated; _pip_failure_hint() below explains the manual fallback."""
+    elevated; _install_failure_hint() below explains the manual fallback."""
     if platform.system() != "Windows":
         return
     try:
@@ -336,7 +348,7 @@ def _try_enable_long_paths() -> None:
         pass
 
 
-def _pip_failure_hint() -> None:
+def _install_failure_hint() -> None:
     if platform.system() != "Windows":
         return
     warn("If the error above mentions 'WinError 206' or 'filename or extension is too "
@@ -362,9 +374,50 @@ def ensure_venv() -> None:
     ok(f"Created .venv in {human_time(time.time() - t0)}")
 
 
+def detect_uv() -> tuple[str | None, str | None]:
+    """Return uv's absolute path and version label when it can be launched.
+
+    Detection happens once per launcher run. Keeping the resolved path also
+    means a later Windows PATH refresh cannot accidentally hide uv.
+    """
+    executable = shutil.which("uv")
+    if not executable:
+        return None, None
+    try:
+        result = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None, None
+    if result.returncode != 0:
+        return None, None
+    version = (result.stdout or result.stderr or "").strip() or "uv"
+    return executable, version
+
+
+def _install_packages(args: list[str], uv_executable: str | None) -> subprocess.CompletedProcess:
+    """Install packages into this project's venv, preferring uv when available."""
+    if uv_executable:
+        command = [
+            uv_executable, "pip", "install", "--python", str(venv_python()), *args,
+        ]
+        try:
+            return subprocess.run(command, cwd=ROOT)
+        except OSError as e:
+            # A successful `uv --version` followed by a launch error generally
+            # means the executable was moved or blocked between the two calls.
+            # Resolution/network failures return normally and must not retry a
+            # multi-gigabyte PyTorch download with pip.
+            warn(f"uv could not be launched ({e}) — falling back to pip.")
+
+    return subprocess.run(
+        [str(venv_python()), "-m", "pip", "install", *args], cwd=ROOT,
+    )
+
+
 def requirements_satisfied() -> bool:
-    """Cheap check: has pip already installed everything from requirements.txt?
-    Avoids re-running the (slow) pip install/resolve on every single launch."""
+    """Cheap check: were the current requirements previously installed?
+    Avoids re-running the slow install/resolve on every single launch."""
     marker = VENV_DIR / ".requirements_installed"
     if not marker.exists():
         return False
@@ -414,86 +467,126 @@ MIN_SUPPORTED_COMPUTE_CAP = 7.5
 MIN_LEGACY_COMPUTE_CAP = 5.0
 
 
-def torch_cuda_build() -> str | None:
-    """The CUDA version torch reports (e.g. '12.8'), or None if torch isn't
-    installed yet or is a CPU-only wheel."""
+def torch_install_info() -> tuple[str | None, str | None]:
+    """Return (torch version, compiled CUDA version). CUDA is None for a CPU wheel."""
     result = subprocess.run(
-        [str(venv_python()), "-c", "import torch; print(torch.version.cuda or '')"],
+        [str(venv_python()), "-c",
+         "import torch; print(torch.__version__); print(torch.version.cuda or '')"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
+        return None, None
+    lines = result.stdout.splitlines()
+    version = lines[0].strip() if lines else None
+    cuda = lines[1].strip() if len(lines) > 1 else ""
+    return version or None, cuda or None
 
 
-def ensure_gpu_torch() -> None:
-    """PyPI's default 'torch' wheel (pulled in transitively by openai-whisper)
-    is CPU-only. If there's an NVIDIA GPU, install the CUDA build instead —
-    before requirements.txt installs anything, so pip sees torch already
-    satisfied and doesn't downgrade it back to CPU."""
+def torch_cuda_build() -> str | None:
+    return torch_install_info()[1]
+
+
+def torch_runtime_cuda_available() -> bool:
+    result = subprocess.run(
+        [str(venv_python()), "-c", "import torch; print(int(torch.cuda.is_available()))"],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "1"
+
+
+def ensure_gpu_torch(uv_executable: str | None) -> None:
+    """Ensure an NVIDIA machine does not stay stuck on a CPU-only Torch wheel.
+
+    uv/pip considers an already-installed CPU build to satisfy the package name
+    ``torch`` even when a CUDA-specific index is supplied. When that situation is
+    detected we explicitly reinstall from the CUDA index, then verify the wheel
+    reports both a CUDA build and a usable GPU before claiming success.
+    """
     step("Checking for GPU acceleration")
     if not venv_python().exists():
         ok("Skipping (.venv not created yet).")
         return
     if not has_nvidia_gpu():
-        ok("No NVIDIA GPU detected — using CPU.")
+        ok("No NVIDIA GPU detected — CUDA packages are not needed.")
         return
+
     cap = gpu_compute_capability()
     too_old_for_cu128 = cap is not None and cap < MIN_SUPPORTED_COMPUTE_CAP
     too_old_for_anything = cap is not None and cap < MIN_LEGACY_COMPUTE_CAP
+    version, build = torch_install_info()
 
-    build = torch_cuda_build()
     if build:
-        # A cu12x build already installed on a card too old for it (e.g. cu128 on a
-        # Pascal GT 1030) will silently fall back to CPU at inference time -- reinstall
-        # with the older cu118 build instead, which still ships kernels for it.
         if build.startswith("12") and too_old_for_cu128 and not too_old_for_anything:
-            warn(f"GPU-accelerated PyTorch (CUDA {build}) is installed, but its compute "
-                 f"capability requirement is too new for this GPU ({cap}) — reinstalling "
-                 "with an older CUDA 11.8 build that supports it (one-time, larger download, "
-                 "several minutes)...")
-            t0 = time.time()
-            result = subprocess.run(
-                [str(venv_python()), "-m", "pip", "install", "--force-reinstall",
-                 "torch", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu118"],
-                cwd=ROOT,
+            warn(
+                f"PyTorch {version} has CUDA {build}, but this GPU ({cap}) needs the "
+                "legacy CUDA 11.8 wheel. Reinstalling once..."
             )
-            if result.returncode != 0:
-                _pip_failure_hint()
-                warn(f"Reinstall failed — keeping the existing CUDA {build} build "
-                     "(this GPU will run on CPU until that's resolved).")
-                return
-            ok(f"Reinstalled with the CUDA 11.8 build in {human_time(time.time() - t0)}.")
+            index_url = "https://download.pytorch.org/whl/cu118"
+        else:
+            if torch_runtime_cuda_available():
+                ok(f"GPU PyTorch ready: {version} + CUDA {build}.")
+            else:
+                warn(
+                    f"PyTorch {version} is a CUDA {build} build, but torch.cuda.is_available() "
+                    "is false. Keeping it installed; Faster-Whisper can still use CUDA "
+                    "independently through CTranslate2 if that runtime is available."
+                )
             return
-        ok(f"GPU-accelerated PyTorch already installed (CUDA {build}).")
-        return
-
-    index_url = "https://download.pytorch.org/whl/cu128"
-    if too_old_for_cu128:
-        if too_old_for_anything:
-            warn(f"NVIDIA GPU detected, but its compute capability ({cap}) is too old for any "
-                 "current PyTorch GPU build — staying on CPU-only PyTorch.")
-            return
-        warn(f"NVIDIA GPU detected with an older compute capability ({cap}) than the default "
-             f"GPU-accelerated build supports ({MIN_SUPPORTED_COMPUTE_CAP}+) — installing an "
-             "older CUDA 11.8 build instead, which still ships kernels for this GPU "
-             "(one-time, larger download, several minutes)...")
-        index_url = "https://download.pytorch.org/whl/cu118"
     else:
-        warn("NVIDIA GPU detected — installing GPU-accelerated PyTorch instead of "
-             "the CPU-only default (one-time, larger download, several minutes)...")
+        if too_old_for_anything:
+            warn(
+                f"NVIDIA GPU detected, but compute capability {cap} is too old for the "
+                "supported PyTorch CUDA wheels. Keeping CPU PyTorch."
+            )
+            return
+        index_url = (
+            "https://download.pytorch.org/whl/cu118"
+            if too_old_for_cu128
+            else "https://download.pytorch.org/whl/cu128"
+        )
+        if version:
+            warn(
+                f"NVIDIA GPU detected, but PyTorch {version} is CPU-only. Replacing it "
+                f"with the {'CUDA 11.8' if too_old_for_cu128 else 'CUDA 12.8'} wheel..."
+            )
+        else:
+            warn(
+                f"NVIDIA GPU detected — installing the "
+                f"{'CUDA 11.8' if too_old_for_cu128 else 'CUDA 12.8'} PyTorch build..."
+            )
 
     t0 = time.time()
-    result = subprocess.run(
-        [str(venv_python()), "-m", "pip", "install", "torch", "torchaudio",
-         "--index-url", index_url],
-        cwd=ROOT,
-    )
+    install_args = []
+    # This is the important bit for an existing +cpu wheel: merely changing
+    # --index-url does NOT make uv replace an already-satisfied torch package.
+    if version is not None:
+        install_args.append("--force-reinstall")
+    install_args += ["torch", "torchaudio", "--index-url", index_url]
+
+    result = _install_packages(install_args, uv_executable)
     if result.returncode != 0:
-        _pip_failure_hint()
-        warn("GPU PyTorch install failed — continuing with CPU-only PyTorch.")
+        _install_failure_hint()
+        warn("GPU PyTorch install failed — leaving the existing Torch installation in place.")
         return
-    ok(f"GPU-accelerated PyTorch installed in {human_time(time.time() - t0)}.")
+
+    new_version, new_build = torch_install_info()
+    if not new_build:
+        warn(
+            "The install command completed, but Torch is still CPU-only. This Python/PyTorch "
+            "combination may not have a matching CUDA wheel yet."
+        )
+        return
+
+    if torch_runtime_cuda_available():
+        ok(
+            f"GPU PyTorch ready: {new_version} + CUDA {new_build} "
+            f"({human_time(time.time() - t0)})."
+        )
+    else:
+        warn(
+            f"Installed PyTorch {new_version} + CUDA {new_build}, but CUDA runtime detection "
+            "still failed. Check the NVIDIA driver if the Torch backend is needed."
+        )
 
 
 def has_ffmpeg() -> bool:
@@ -507,16 +600,39 @@ def _refresh_path_from_registry() -> None:
     Windows would on a fresh process/shell without needing a full restart."""
     if platform.system() != "Windows":
         return
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                             r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
-            system_path = winreg.QueryValueEx(key, "Path")[0]
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-            user_path = winreg.QueryValueEx(key, "Path")[0]
-        os.environ["PATH"] = system_path + os.pathsep + user_path
-    except OSError:
-        pass  # best-effort; if this fails we just fall back to telling the user to restart
+    import winreg
+    registry_paths = []
+    locations = (
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    )
+    for hive, location in locations:
+        try:
+            with winreg.OpenKey(hive, location) as key:
+                registry_paths.append(winreg.QueryValueEx(key, "Path")[0])
+        except OSError:
+            pass
+
+    # Preserve process-only entries (portable tools, activated shells, etc.)
+    # while appending paths an installer just added to the registry.
+    values = [os.environ.get("PATH", ""), *registry_paths]
+    os.environ["PATH"] = _merge_path_values(values)
+
+
+def _merge_path_values(values: list[str]) -> str:
+    entries = []
+    seen = set()
+    for value in values:
+        for entry in value.split(os.pathsep):
+            if not entry:
+                continue
+            key = os.path.normcase(os.path.normpath(entry))
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(entry)
+    return os.pathsep.join(entries)
 
 
 def ensure_ffmpeg() -> None:
@@ -559,7 +675,7 @@ def ensure_ffmpeg() -> None:
              "yet in this window — restart this launcher once (a fresh terminal will have it).")
 
 
-def install_requirements() -> None:
+def install_requirements(uv_executable: str | None) -> None:
     step("Checking Python dependencies")
     if requirements_satisfied():
         ok("Dependencies already installed and up to date.")
@@ -568,13 +684,13 @@ def install_requirements() -> None:
     warn("Installing dependencies (first run, or requirements.txt changed)...")
     warn("This includes PyTorch/Whisper and can take several minutes.")
     t0 = time.time()
-    result = subprocess.run(
-        [str(venv_python()), "-m", "pip", "install", "-r", str(REQUIREMENTS)],
-        cwd=ROOT,
+    result = _install_packages(
+        ["-r", str(REQUIREMENTS)],
+        uv_executable,
     )
     if result.returncode != 0:
-        _pip_failure_hint()
-        fail("Dependency installation failed — see the pip output above.")
+        _install_failure_hint()
+        fail("Dependency installation failed — see the installer output above.")
 
     marker = VENV_DIR / ".requirements_installed"
     marker.write_text(_requirements_fingerprint())
@@ -582,17 +698,49 @@ def install_requirements() -> None:
 
 
 def _pids_listening_on(port: int) -> list[int]:
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         f"(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue).OwningProcess"],
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+             "-ErrorAction SilentlyContinue).OwningProcess"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
     pids = []
     for line in result.stdout.splitlines():
         line = line.strip()
         if line.isdigit():
             pids.append(int(line))
-    return pids
+    return sorted(set(pids))
+
+
+def _process_command_line(pid: int) -> str | None:
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\" "
+             "-ErrorAction SilentlyContinue).CommandLine"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _is_wrld_sync_server(command_line: str | None) -> bool:
+    if not command_line:
+        return False
+    command = command_line.casefold().replace("/", "\\")
+    expected_python = str(venv_python()).casefold().replace("/", "\\")
+    padded = f" {command} "
+    return (expected_python in command and
+            " -m uvicorn " in padded and
+            " app:app " in padded)
 
 
 def stop_existing_server(port: int) -> None:
@@ -602,23 +750,35 @@ def stop_existing_server(port: int) -> None:
            "target port, starting a new one below will fail loudly.")
         return
 
-    # Find whatever's actually bound to our port, rather than assuming it was
-    # launched as "uvicorn.exe" — we ourselves launch it as "python.exe -m
-    # uvicorn", which a name-based taskkill would never match.
     pids = [p for p in _pids_listening_on(port) if p != os.getpid()]
     if not pids:
         ok("No existing server was running on this port.")
         return
 
+    unknown = [p for p in pids if not _is_wrld_sync_server(_process_command_line(p))]
+    if unknown:
+        joined = ", ".join(str(p) for p in unknown)
+        fail(f"Port {port} is already in use by another process (PID {joined}). "
+             f"Close it or choose another port with --port.")
+
     for pid in pids:
-        subprocess.run(["taskkill", "/f", "/pid", str(pid)], capture_output=True)
+        try:
+            result = subprocess.run(
+                ["taskkill", "/f", "/pid", str(pid)], capture_output=True, timeout=5,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            fail(f"Couldn't stop the previous WRLD Sync server on port {port} (PID {pid}).")
+        if result.returncode != 0:
+            fail(f"Couldn't stop the previous WRLD Sync server on port {port} (PID {pid}).")
     ok(f"Stopped {len(pids)} process(es) previously listening on port {port}.")
     time.sleep(0.5)  # give the OS a moment to release the socket
 
 
-def wait_for_server(port: int, timeout: float = 60.0) -> bool:
+def wait_for_server(port: int, proc: subprocess.Popen, timeout: float = 60.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1.5):
                 return True
@@ -627,15 +787,108 @@ def wait_for_server(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
-def main() -> None:
+def print_banner(port: int, uv_version: str | None) -> None:
+    installer = f"{uv_version} (accelerated)" if uv_version else "pip (uv not available)"
+    print()
+    print(paint("=" * 58, C.MAGENTA))
+    print(f"  {paint('WRLD Sync', C.BOLD, C.MAGENTA)}")
+    print(f"  {paint('Local lyrics syncing workspace', C.DIM)}")
+    print(paint("-" * 58, C.DIM))
+    print(f"  Address    http://127.0.0.1:{port}")
+    print(f"  Installer  {installer}")
+    print(paint("=" * 58, C.MAGENTA))
+
+
+def _stop_server_process(proc: subprocess.Popen) -> None:
+    """Stop Uvicorn without letting native Whisper/executor threads hang Ctrl+C."""
+    if proc.poll() is not None:
+        return
+
+    try:
+        if platform.system() == "Windows":
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(proc.pid, signal.SIGINT)
+    except (OSError, ValueError):
+        pass
+
+    try:
+        proc.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        proc.kill()
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_server(port: int, open_browser: bool) -> int:
+    step("Starting the server")
+    url = f"http://127.0.0.1:{port}"
+    popen_kwargs = {"cwd": ROOT}
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        [str(venv_python()), "-m", "uvicorn", "app:app", "--host", "127.0.0.1",
+         "--port", str(port), "--no-access-log", "--log-level", "warning"],
+        **popen_kwargs,
+    )
+
+    try:
+        ready = wait_for_server(port, proc)
+        if ready:
+            ok(f"Server is ready at {url}")
+        elif proc.returncode is not None:
+            err(f"Server exited before it was ready (exit code {proc.returncode}).")
+            return proc.returncode
+        else:
+            warn("Server didn't respond within 60s — it may still be starting. "
+                 "The browser will stay closed; check the logs above.")
+
+        if ready and open_browser:
+            if webbrowser.open(url):
+                ok("Opened in your browser.")
+            else:
+                warn(f"Couldn't open a browser automatically — visit {url} manually.")
+
+        status = "WRLD Sync is running." if ready else "WRLD Sync is still starting."
+        status_color = C.GREEN if ready else C.YELLOW
+        print(f"\n{paint(status, status_color, C.BOLD)}")
+        print(f"{paint(url, C.CYAN)}  |  Press Ctrl+C here to stop it.\n")
+        return proc.wait()
+    except KeyboardInterrupt:
+        print()
+        step("Shutting down")
+        _stop_server_process(proc)
+        ok("Stopped.")
+        return 0
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Set up and launch WRLD Sync.")
-    parser.add_argument("--port", type=int, default=8000, help="Port to serve on (default: 8000)")
+    parser.add_argument("--port", type=port_number, default=8000, help="Port to serve on (default: 8000)")
     parser.add_argument("--no-browser", action="store_true", help="Don't automatically open a browser tab")
     parser.add_argument("--auto-update", action="store_true", help="Pull updates automatically without asking")
     parser.add_argument("--no-update-check", action="store_true", help="Don't check for updates at all")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    print(paint("WRLD Sync launcher", C.BOLD, C.MAGENTA))
+    uv_executable, uv_version = detect_uv()
+    print_banner(args.port, uv_version)
 
     check_for_updates(auto_update=args.auto_update, skip=args.no_update_check)
 
@@ -644,41 +897,13 @@ def main() -> None:
 
     _try_enable_long_paths()
     ensure_venv()
-    ensure_gpu_torch()
+    ensure_gpu_torch(uv_executable)
     ensure_ffmpeg()
-    install_requirements()
+    install_requirements(uv_executable)
     stop_existing_server(args.port)
 
-    step("Starting the server")
-    url = f"http://127.0.0.1:{args.port}"
-    proc = subprocess.Popen(
-        [str(venv_python()), "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(args.port)],
-        cwd=ROOT,
-    )
-
-    if wait_for_server(args.port):
-        ok(f"Server is up at {url}")
-    else:
-        warn("Server didn't respond within 60s — it may still be starting. Check the logs above.")
-
-    if not args.no_browser:
-        webbrowser.open(url)
-        ok("Opened in your browser.")
-
-    print(f"\n{paint('WRLD Sync is running.', C.GREEN, C.BOLD)} Press Ctrl+C here to stop it.\n")
-
-    try:
-        proc.wait()
-    except KeyboardInterrupt:
-        print()
-        step("Shutting down")
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        ok("Stopped.")
+    return run_server(args.port, open_browser=not args.no_browser)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

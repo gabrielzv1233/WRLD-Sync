@@ -247,17 +247,29 @@
     gap: 9px;
     padding: 10px 14px;
     background: var(--surface2);
-    cursor: pointer;
     user-select: none;
     transition: background .12s var(--ease);
   }
   .group-header:hover { background: #212134; }
-  .group-header svg {
+  .group-toggle {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .group-toggle .group-chevron {
     color: var(--muted-dim);
     flex-shrink: 0;
     transition: transform .18s var(--ease);
   }
-  .group.collapsed .group-header svg { transform: rotate(-90deg); }
+  .group.collapsed .group-chevron { transform: rotate(-90deg); }
   .group-name { font-size: .87rem; font-weight: 700; letter-spacing: -.005em; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .group.has-pending { box-shadow: inset 3px 0 0 var(--accent2); }
   .group.has-pending .group-header { background: var(--accent-soft); }
@@ -546,6 +558,63 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
+
+  /* The toolbar naturally wraps on smaller windows; these rules give each
+     cluster a predictable row instead of letting individual controls get
+     clipped off-screen. */
+  @media (max-width: 760px) {
+    body { height: 100dvh; }
+    header { padding: 10px 12px; gap: 6px; }
+    #status {
+      order: 1;
+      flex: 1 0 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .search-wrap { order: 2; width: 100%; }
+    header > .back-btn, header > .header-divider { order: 3; }
+    #loadSongsBtn { margin-left: 0; }
+    .header-divider { display: none; }
+    main { padding: 16px 12px 32px; }
+    #pickerOverlay { align-items: center; padding: 18px; }
+    #pickerPanel { max-height: min(78vh, 620px); }
+    #modalOverlay { padding: 18px; }
+  }
+
+  @media (max-width: 520px) {
+    .page-title { font-size: .66rem; padding: 4px 7px; }
+    #pendingOnlyLabel, #sortModeLabel, #collapseAllLabel, .back-label { display: none; }
+    header > .back-btn {
+      min-width: 34px;
+      min-height: 34px;
+      padding: 7px 9px;
+      justify-content: center;
+    }
+    #loadSongsBtn, #runAutogroupBtn, #discardChangesBtn, #saveChangesBtn { flex: 1 1 auto; }
+    .group-header { flex-wrap: wrap; padding: 9px 10px; gap: 6px; }
+    .group-toggle { flex-basis: calc(100% - 20px); }
+    .group-header > .edit-btn, .group-header > .reset-btn,
+    .group-header > .merge-btn, .group-header > .save-group-btn,
+    .group-count { order: 2; }
+    .group-count { margin-left: auto; }
+    .song-row { flex-wrap: wrap; padding: 9px 10px; gap: 6px; }
+    .song-title { flex-basis: 100%; }
+    .tag { max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
+  }
+
+  /* Hover cannot reveal controls on touchscreens. Keep the compact desktop
+     treatment, but expose comfortable targets whenever the primary pointer
+     is coarse or the device has no hover capability. */
+  @media (hover: none), (pointer: coarse) {
+    .edit-btn, .reset-btn, .move-btn, .merge-btn { opacity: .72; }
+    .edit-btn, .reset-btn, .move-btn, .merge-btn,
+    .save-group-btn, .info-btn {
+      min-width: 32px;
+      min-height: 32px;
+      align-items: center;
+      justify-content: center;
+    }
+  }
 </style>
 </head>
 <body>
@@ -553,41 +622,41 @@
 <header>
   <div class="logo">WRLD Sync</div>
   <span class="page-title">Autogroup</span>
-  <span id="status">Click "Load songs" to fetch the catalog</span>
-  <span id="syncStatus" class="sync-status" title=""></span>
+  <span id="status" role="status" aria-live="polite">Click "Load songs" to fetch the catalog</span>
+  <span id="syncStatus" class="sync-status" title="" role="status" aria-live="polite" aria-atomic="true"></span>
   <div class="search-wrap">
-    <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+    <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
       <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
     </svg>
-    <input id="searchInput" type="text" placeholder="Find a song's group…" autocomplete="off" />
+    <input id="searchInput" type="search" placeholder="Find a song's group…" autocomplete="off" aria-label="Search groups and songs" />
   </div>
-  <button id="pendingOnlyBtn" class="back-btn" title="Show only groups with unsaved changes">
+  <button id="pendingOnlyBtn" class="back-btn" type="button" title="Show only groups with unsaved changes" aria-label="Show only groups with unsaved changes" aria-pressed="false" aria-controls="groups">
     <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
       <circle cx="12" cy="12" r="9"/>
     </svg>
     <span id="pendingOnlyLabel">Pending only</span>
   </button>
-  <button id="sortModeBtn" class="back-btn" title="Sort groups by number of versions, most first">
+  <button id="sortModeBtn" class="back-btn" type="button" title="Sort groups by number of versions, most first" aria-label="Sort groups by version count" aria-pressed="false" aria-controls="groups">
     <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
       <line x1="4" y1="6" x2="4" y2="18"/><polyline points="2 16 4 18 6 16"/>
       <line x1="10" y1="6" x2="20" y2="6"/><line x1="10" y1="12" x2="17" y2="12"/><line x1="10" y1="18" x2="14" y2="18"/>
     </svg>
     <span id="sortModeLabel">A–Z</span>
   </button>
-  <button id="loadSongsBtn" class="back-btn" title="Fetch every song that doesn't already have a saved version — songs with a version load automatically">
+  <button id="loadSongsBtn" class="back-btn" type="button" title="Fetch every song that doesn't already have a saved version — songs with a version load automatically">
     <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
     </svg>
     <span id="loadSongsLabel">Load songs</span>
   </button>
-  <button id="collapseAllBtn" class="back-btn" title="Expand all visible groups">
+  <button id="collapseAllBtn" class="back-btn" type="button" title="Expand all visible groups" aria-label="Expand all visible groups" aria-expanded="false" aria-controls="groups">
     <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
       <polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/>
       <line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/>
     </svg>
     <span id="collapseAllLabel">Expand all</span>
   </button>
-  <button id="runAutogroupBtn" class="back-btn" title="Load songs first" disabled>
+  <button id="runAutogroupBtn" class="back-btn" type="button" title="Load songs first" disabled>
     <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
       <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
       <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
@@ -595,46 +664,46 @@
     <span id="runAutogroupLabel">Run Autogroup</span>
   </button>
   <span class="header-divider"></span>
-  <button id="discardChangesBtn" class="back-btn" title="Discard all unsaved changes and revert to last saved state" disabled>
+  <button id="discardChangesBtn" class="back-btn" type="button" title="Discard all unsaved changes and revert to last saved state" disabled>
     <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
       <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>
     </svg>
     <span id="discardChangesLabel">Discard changes</span>
   </button>
-  <button id="saveChangesBtn" class="back-btn save-changes-btn" title="Push your renames/moves/merges to the API" disabled>
+  <button id="saveChangesBtn" class="back-btn save-changes-btn" type="button" title="Push your renames/moves/merges to the API" disabled>
     <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
       <polyline points="20 6 9 17 4 12"/>
     </svg>
     <span id="saveChangesLabel">Save changes</span>
   </button>
   <span class="header-divider"></span>
-  <a class="back-btn" href="/db-manager.html">
+  <a class="back-btn" href="/db-manager.html" aria-label="Back to Database Manager">
     <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
       <polyline points="15 18 9 12 15 6"/>
     </svg>
-    Back
+    <span class="back-label">Back</span>
   </a>
 </header>
 
 <main>
   <div id="groups"></div>
-  <button id="showMoreBtn">Show more</button>
+  <button id="showMoreBtn" type="button">Show more</button>
 </main>
 
-<div id="modalOverlay">
-  <div id="modalPanel">
+<div id="modalOverlay" aria-hidden="true">
+  <div id="modalPanel" role="dialog" aria-modal="true" aria-labelledby="modalTitle" tabindex="-1">
     <div id="modalHeader">
       <span id="modalTitle">Song data</span>
-      <button id="modalClose">×</button>
+      <button id="modalClose" type="button" aria-label="Close song data">×</button>
     </div>
     <pre id="modalBody">Loading…</pre>
   </div>
 </div>
 
-<div id="pickerOverlay">
-  <div id="pickerPanel">
+<div id="pickerOverlay" aria-hidden="true">
+  <div id="pickerPanel" role="dialog" aria-modal="true" aria-labelledby="pickerTitle" tabindex="-1">
     <div id="pickerTitle">Move to group…</div>
-    <input id="pickerInput" type="text" placeholder="Type a group name…" autocomplete="off" />
+    <input id="pickerInput" type="text" placeholder="Type a group name…" autocomplete="off" aria-label="Find or create a target group" />
     <div id="pickerList"></div>
   </div>
 </div>
@@ -1363,20 +1432,20 @@ function rowMatches(row, q) {
   return false;
 }
 
-const PENCIL_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+const PENCIL_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
   <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>
 </svg>`;
-const RESET_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+const RESET_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
   <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>
 </svg>`;
-const MOVE_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+const MOVE_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
   <path d="M9 13h6"/><path d="M12 10l3 3-3 3"/>
 </svg>`;
-const MERGE_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+const MERGE_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
   <path d="M8 7l4-4 4 4"/><path d="M12 3v9"/><path d="M5 21a7 7 0 0 1 7-7 7 7 0 0 1 7 7"/>
 </svg>`;
-const SAVE_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+const SAVE_SVG = `<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
   <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
   <polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
 </svg>`;
@@ -1392,14 +1461,14 @@ function groupBodyHTML(rows, q) {
     const isMoved = overrides.moves[song.id] !== undefined;
     return `<div class="song-row" data-song-id="${song.id}">
       <span class="song-title${isFallback && !isOverridden ? ' fallback' : ''}${isOverridden ? ' overridden' : ''}">${highlight(displayLabel, q)}</span>
-      <button class="edit-btn" data-edit="song" title="Rename this version">${PENCIL_SVG}</button>
-      ${isOverridden ? `<button class="reset-btn" data-reset="song" title="Reset to automatic name">${RESET_SVG}</button>` : ''}
-      <button class="move-btn" title="Move to another group">${MOVE_SVG}</button>
-      ${isMoved ? `<button class="reset-btn" data-reset="move" title="Reset to automatic group">${RESET_SVG}</button>` : ''}
+      <button class="edit-btn" data-edit="song" type="button" title="Rename this version" aria-label="Rename this version">${PENCIL_SVG}</button>
+      ${isOverridden ? `<button class="reset-btn" data-reset="song" type="button" title="Reset to automatic name" aria-label="Reset this version to its automatic name">${RESET_SVG}</button>` : ''}
+      <button class="move-btn" type="button" title="Move to another group" aria-label="Move this song to another group">${MOVE_SVG}</button>
+      ${isMoved ? `<button class="reset-btn" data-reset="move" type="button" title="Reset to automatic group" aria-label="Reset this song to its automatic group">${RESET_SVG}</button>` : ''}
       ${song.category ? `<span class="tag tag-${esc(song.category)}">${esc(categoryLabel(song.category))}</span>` : ''}
       ${song.era?.name ? `<span class="tag">${esc(song.era.name)}</span>` : ''}
-      <button class="info-btn" data-song-id="${song.id}" title="View full song data">
-        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+      <button class="info-btn" data-song-id="${song.id}" type="button" title="View full song data" aria-label="View full song data">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
           <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
         </svg>
       </button>
@@ -1415,18 +1484,21 @@ function renderGroupShell(key, rows, q, expanded) {
   const isKeyOverridden = overrides.groups[key] !== undefined;
   const hasPending = rows.some(r => pendingChanges.has(r.song.id));
   const body = expanded ? groupBodyHTML(rows, q) : '';
+  const regionId = `group-items-${Math.min(...rows.map(r => r.song.id))}`;
   return `<div class="group${expanded ? '' : ' collapsed'}${hasPending ? ' has-pending' : ''}" data-group-key="${esc(key)}"${expanded ? ' data-populated="1"' : ''}>
     <div class="group-header">
-      <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
-      <span class="group-name">${highlight(displayKey, q)}</span>
+      <button class="group-toggle" type="button" aria-expanded="${expanded}" aria-controls="${regionId}" aria-label="${expanded ? 'Collapse' : 'Expand'} ${esc(displayKey)}">
+        <svg class="group-chevron" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+        <span class="group-name">${highlight(displayKey, q)}</span>
+      </button>
       ${hasPending ? '<span class="pending-dot" title="Unsaved changes"></span>' : ''}
-      <button class="edit-btn" data-edit="group" title="Rename this group">${PENCIL_SVG}</button>
-      ${isKeyOverridden ? `<button class="reset-btn" data-reset="group" title="Reset to automatic name">${RESET_SVG}</button>` : ''}
-      <button class="merge-btn" title="Merge this group into another">${MERGE_SVG}</button>
-      ${hasPending ? `<button class="save-group-btn" title="Save just this group's pending changes">${SAVE_SVG}</button>` : ''}
+      <button class="edit-btn" data-edit="group" type="button" title="Rename this group" aria-label="Rename ${esc(displayKey)}">${PENCIL_SVG}</button>
+      ${isKeyOverridden ? `<button class="reset-btn" data-reset="group" type="button" title="Reset to automatic name" aria-label="Reset ${esc(displayKey)} to its automatic name">${RESET_SVG}</button>` : ''}
+      <button class="merge-btn" type="button" title="Merge this group into another" aria-label="Merge ${esc(displayKey)} into another group">${MERGE_SVG}</button>
+      ${hasPending ? `<button class="save-group-btn" type="button" title="Save just this group's pending changes" aria-label="Save pending changes for ${esc(displayKey)}">${SAVE_SVG}</button>` : ''}
       <span class="group-count">${rows.length}</span>
     </div>
-    <div class="group-items">${body}</div>
+    <div class="group-items" id="${regionId}">${body}</div>
   </div>`;
 }
 
@@ -1509,6 +1581,8 @@ function render(query, { resetPaging = true } = {}) {
     updateShowMore(matched.length);
   }
 
+  updateCollapseAllControl();
+
   // No per-element wiring here on purpose — see the single delegated
   // listener on groupsEl below.
 }
@@ -1521,17 +1595,23 @@ function render(query, { resetPaging = true } = {}) {
 // than a separately-tracked flag that could drift out of sync.
 const collapseAllBtn = document.getElementById('collapseAllBtn');
 const collapseAllLabel = document.getElementById('collapseAllLabel');
+
+function updateCollapseAllControl() {
+  const visible = (currentMatched ?? renderedGroups).slice(0, visibleCount);
+  const allVisibleExpanded = visible.length > 0 && visible.every(g => expandedKeys.has(g.key));
+  collapseAllLabel.textContent = allVisibleExpanded ? 'Collapse all' : 'Expand all';
+  collapseAllBtn.title = allVisibleExpanded ? 'Collapse all expanded groups' : 'Expand all visible groups';
+  collapseAllBtn.setAttribute('aria-label', collapseAllBtn.title);
+  collapseAllBtn.setAttribute('aria-expanded', String(allVisibleExpanded));
+}
+
 collapseAllBtn.addEventListener('click', () => {
   const visible = (currentMatched ?? renderedGroups).slice(0, visibleCount);
   const allVisibleExpanded = visible.length > 0 && visible.every(g => expandedKeys.has(g.key));
   if (allVisibleExpanded) {
     visible.forEach(g => expandedKeys.delete(g.key));
-    collapseAllLabel.textContent = 'Expand all';
-    collapseAllBtn.title = 'Expand all visible groups';
   } else {
     visible.forEach(g => expandedKeys.add(g.key));
-    collapseAllLabel.textContent = 'Collapse all';
-    collapseAllBtn.title = 'Collapse all expanded groups';
   }
   render(searchInput.value, { resetPaging: false });
 });
@@ -1628,6 +1708,7 @@ showMoreBtn.addEventListener('click', () => {
   visibleCount += PAGE_SIZE;
   groupsEl.insertAdjacentHTML('beforeend', nextSlice.map(g => renderGroupShell(g.key, g.rows, q, expandedKeys.has(g.key))).join(''));
   updateShowMore(source.length);
+  updateCollapseAllControl();
 });
 
 // Builds and injects a group's rows on first expand. First resolves any
@@ -1746,9 +1827,9 @@ groupsEl.addEventListener('click', (e) => {
     return;
   }
 
-  const header = e.target.closest('.group-header');
-  if (header) {
-    const groupEl = header.closest('.group');
+  const toggle = e.target.closest('.group-toggle');
+  if (toggle) {
+    const groupEl = toggle.closest('.group');
     const key = groupEl.dataset.groupKey;
     const willExpand = groupEl.classList.contains('collapsed');
     if (willExpand) {
@@ -1758,6 +1839,9 @@ groupsEl.addEventListener('click', (e) => {
       expandedKeys.delete(key);
     }
     groupEl.classList.toggle('collapsed');
+    toggle.setAttribute('aria-expanded', String(willExpand));
+    toggle.setAttribute('aria-label', `${willExpand ? 'Collapse' : 'Expand'} ${resolvedKey(key)}`);
+    updateCollapseAllControl();
   }
 });
 
@@ -1802,6 +1886,7 @@ const pendingOnlyBtn = document.getElementById('pendingOnlyBtn');
 pendingOnlyBtn.addEventListener('click', () => {
   pendingOnlyFilter = !pendingOnlyFilter;
   pendingOnlyBtn.classList.toggle('active', pendingOnlyFilter);
+  pendingOnlyBtn.setAttribute('aria-pressed', String(pendingOnlyFilter));
   render(searchInput.value);
 });
 
@@ -1810,6 +1895,7 @@ const sortModeLabel = document.getElementById('sortModeLabel');
 sortModeBtn.addEventListener('click', () => {
   sortMode = sortMode === 'versions' ? 'alpha' : 'versions';
   sortModeBtn.classList.toggle('active', sortMode === 'versions');
+  sortModeBtn.setAttribute('aria-pressed', String(sortMode === 'versions'));
   sortModeLabel.textContent = sortMode === 'versions' ? 'Most versions' : 'A–Z';
   render(searchInput.value);
 });
@@ -1958,7 +2044,7 @@ function renderEmptyState() {
     ${LOAD_SVG}
     <h2>No songs loaded yet</h2>
     <p>Songs with a saved grouping load automatically. Click "Load songs" to also pull in the rest of the catalog — everything that doesn't have a version yet.</p>
-    <button class="back-btn" id="emptyStateLoadBtn">Load songs</button>
+    <button class="back-btn" id="emptyStateLoadBtn" type="button">Load songs</button>
   </div>`;
   document.getElementById('emptyStateLoadBtn')?.addEventListener('click', load);
 }
@@ -1972,7 +2058,7 @@ function renderErrorState(message) {
     ${ERROR_SVG}
     <h2>Couldn't load songs</h2>
     <p>${esc(message)}</p>
-    <button class="back-btn" id="errorStateRetryBtn">Try again</button>
+    <button class="back-btn" id="errorStateRetryBtn" type="button">Try again</button>
   </div>`;
   document.getElementById('errorStateRetryBtn')?.addEventListener('click', load);
 }
@@ -2076,11 +2162,17 @@ const modalOverlay = document.getElementById('modalOverlay');
 const modalTitle   = document.getElementById('modalTitle');
 const modalBody    = document.getElementById('modalBody');
 const modalClose   = document.getElementById('modalClose');
+const modalPanel   = document.getElementById('modalPanel');
+let modalReturnFocus = null;
 
 async function showSongData(songId) {
+  if (!modalOverlay.classList.contains('visible')) modalReturnFocus = document.activeElement;
   modalTitle.textContent = `Song #${songId}`;
   modalBody.textContent = 'Loading…';
+  modalBody.setAttribute('aria-busy', 'true');
   modalOverlay.classList.add('visible');
+  modalOverlay.setAttribute('aria-hidden', 'false');
+  modalClose.focus({ preventScroll: true });
   try {
     const resp = await fetch(`/api/song/${songId}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -2089,21 +2181,31 @@ async function showSongData(songId) {
     modalBody.textContent = JSON.stringify(song, null, 2);
   } catch (e) {
     modalBody.textContent = 'Failed to load song data: ' + (e.message ?? e);
+  } finally {
+    modalBody.removeAttribute('aria-busy');
   }
 }
 
-function closeModal() { modalOverlay.classList.remove('visible'); }
+function closeModal() {
+  if (!modalOverlay.classList.contains('visible')) return;
+  modalOverlay.classList.remove('visible');
+  modalOverlay.setAttribute('aria-hidden', 'true');
+  const returnTo = modalReturnFocus;
+  modalReturnFocus = null;
+  if (returnTo?.isConnected) returnTo.focus({ preventScroll: true });
+}
 modalClose.addEventListener('click', closeModal);
 modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeModal(); closePicker(); } });
 
 // ── Group picker — target chooser for "move song" and "merge group" ──────
 const pickerOverlay = document.getElementById('pickerOverlay');
+const pickerPanel   = document.getElementById('pickerPanel');
 const pickerTitle   = document.getElementById('pickerTitle');
 const pickerInput   = document.getElementById('pickerInput');
 const pickerList    = document.getElementById('pickerList');
 
 let pickerCtx = null; // { mode: 'move'|'merge', songId?, groupKey?, label }
+let pickerReturnFocus = null;
 
 // Regroup + full re-render after a structural change (move/merge/rename/
 // unmove). Cheap enough to do wholesale — the grouping pipeline runs in
@@ -2120,6 +2222,7 @@ function applyStructureChange(focusKey) {
 }
 
 function openPicker(ctx) {
+  pickerReturnFocus = document.activeElement;
   pickerCtx = ctx;
   pickerTitle.textContent = ctx.mode === 'merge'
     ? `Merge "${ctx.label}" into…`
@@ -2127,12 +2230,18 @@ function openPicker(ctx) {
   pickerInput.value = '';
   renderPickerList('');
   pickerOverlay.classList.add('visible');
-  pickerInput.focus();
+  pickerOverlay.setAttribute('aria-hidden', 'false');
+  pickerInput.focus({ preventScroll: true });
 }
 
 function closePicker() {
+  if (!pickerOverlay.classList.contains('visible')) return;
   pickerOverlay.classList.remove('visible');
+  pickerOverlay.setAttribute('aria-hidden', 'true');
   pickerCtx = null;
+  const returnTo = pickerReturnFocus;
+  pickerReturnFocus = null;
+  if (returnTo?.isConnected) returnTo.focus({ preventScroll: true });
 }
 
 function renderPickerList(query) {
@@ -2143,13 +2252,13 @@ function renderPickerList(query) {
   // existing group (compared against display names, override-aware).
   const exact = renderedGroups.some(g => resolvedKey(g.key).toLowerCase() === q);
   if (q && !exact) {
-    items.push(`<button class="picker-item pi-create" data-create="${esc(query.trim())}">＋ Create group “${esc(query.trim())}”</button>`);
+    items.push(`<button class="picker-item pi-create" type="button" data-create="${esc(query.trim())}">＋ Create group “${esc(query.trim())}”</button>`);
   }
 
   // When moving a song that already has a manual placement, offer undo here
   // too (same as the row's reset button, but discoverable in context).
   if (pickerCtx?.mode === 'move' && overrides.moves[pickerCtx.songId] !== undefined) {
-    items.push(`<button class="picker-item pi-reset" data-unmove="1">↺ Reset to automatic group</button>`);
+    items.push(`<button class="picker-item pi-reset" type="button" data-unmove="1">↺ Reset to automatic group</button>`);
   }
 
   let shown = 0;
@@ -2157,7 +2266,7 @@ function renderPickerList(query) {
     if (pickerCtx?.mode === 'merge' && g.key === pickerCtx.groupKey) continue; // not into itself
     const name = resolvedKey(g.key);
     if (q && !name.toLowerCase().includes(q)) continue;
-    items.push(`<button class="picker-item" data-key="${esc(g.key)}">${esc(name)}<span class="pi-count">${g.rows.length}</span></button>`);
+    items.push(`<button class="picker-item" type="button" data-key="${esc(g.key)}">${esc(name)}<span class="pi-count">${g.rows.length}</span></button>`);
     if (++shown >= 50) break;
   }
 
@@ -2195,10 +2304,48 @@ pickerInput.addEventListener('keydown', (e) => {
     if (first) first.click();
   } else if (e.key === 'Escape') {
     e.preventDefault();
+    e.stopPropagation();
     closePicker();
   }
 });
 pickerOverlay.addEventListener('click', (e) => { if (e.target === pickerOverlay) closePicker(); });
+
+// Keep keyboard focus inside whichever lightweight dialog is currently open.
+// Focus is restored to the control that opened it when the dialog closes.
+function trapDialogFocus(e, panel) {
+  const focusable = [...panel.querySelectorAll(
+    'button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])'
+  )].filter(el => el.getClientRects().length > 0);
+  if (!focusable.length) {
+    e.preventDefault();
+    panel.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (!panel.contains(document.activeElement)) {
+    e.preventDefault();
+    first.focus();
+  } else if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  const pickerOpen = pickerOverlay.classList.contains('visible');
+  const modalOpen = modalOverlay.classList.contains('visible');
+  if (e.key === 'Escape') {
+    if (pickerOpen) closePicker();
+    else if (modalOpen) closeModal();
+  } else if (e.key === 'Tab') {
+    if (pickerOpen) trapDialogFocus(e, pickerPanel);
+    else if (modalOpen) trapDialogFocus(e, modalPanel);
+  }
+});
 </script>
 </body>
 </html>

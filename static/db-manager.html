@@ -3,98 +3,282 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="theme-color" content="#09090f" />
 <title>DB Manager — WRLD Sync</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --bg: #0a0a0f;
-    --surface: #13131c;
-    --surface2: #1c1c2a;
-    --border: #2a2a3d;
+    --bg: #09090f;
+    --surface: #131320;
+    --surface2: #1a1a29;
+    --border: #26263a;
+    --border-soft: #1c1c2c;
     --accent: #7c3aed;
     --accent2: #a855f7;
-    --text: #f0f0ff;
-    --muted: #7878a0;
+    --accent-soft: rgba(124, 58, 237, .14);
+    --text: #f2f2fb;
+    --muted: #8888ab;
+    --muted-dim: #686888;
+    --radius: 10px;
+    --radius-sm: 7px;
+    --shadow-1: 0 1px 2px rgba(0,0,0,.4);
+    --shadow-2: 0 18px 54px rgba(0,0,0,.42);
+    --ease: cubic-bezier(.4,0,.2,1);
+    color-scheme: dark;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
   }
 
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: var(--bg);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-feature-settings: "cv11", "ss01";
+    background:
+      radial-gradient(1000px 520px at 15% -12%, rgba(124,58,237,.13), transparent 56%),
+      var(--bg);
     color: var(--text);
-    height: 100vh;
-    overflow: hidden;
+    min-height: 100vh;
+    min-height: 100dvh;
     display: flex;
     flex-direction: column;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus { outline: none; }
+  :focus-visible {
+    outline: 2px solid var(--accent2);
+    outline-offset: 3px;
+    border-radius: 4px;
   }
 
   header {
-    padding: 14px 20px;
+    min-height: 55px;
+    padding: 11px 20px;
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
-    gap: 12px;
-    background: var(--surface);
+    gap: 10px;
+    background: rgba(19,19,32,.94);
+    box-shadow: var(--shadow-1);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    position: sticky;
+    top: 0;
+    z-index: 10;
   }
   .logo {
-    font-size: 1.3rem;
+    font-size: 1.22rem;
     font-weight: 800;
-    letter-spacing: -0.5px;
-    background: linear-gradient(135deg, #a855f7, #7c3aed);
+    letter-spacing: -.02em;
+    background: linear-gradient(135deg, #c084fc, #7c3aed);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     white-space: nowrap;
   }
   .page-title {
-    font-size: .9rem;
-    font-weight: 600;
+    font-size: .74rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .04em;
     color: var(--muted);
+    padding: 4px 9px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    white-space: nowrap;
   }
   .back-btn {
     margin-left: auto;
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 7px 13px;
-    border-radius: 8px;
+    min-height: 32px;
+    padding: 7px 12px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border);
-    background: none;
+    background: var(--surface2);
     color: var(--muted);
-    font-size: .82rem;
+    font-size: .8rem;
     font-weight: 600;
     text-decoration: none;
-    transition: color .15s, border-color .15s, background .15s;
+    transition: color .15s var(--ease), border-color .15s var(--ease), background .15s var(--ease), transform .08s var(--ease);
   }
-  .back-btn:hover { color: var(--text); border-color: var(--accent2); background: rgba(124,58,237,.08); }
+  .back-btn:hover { color: var(--text); border-color: var(--accent2); background: var(--accent-soft); }
+  .back-btn:active { transform: scale(.96); }
 
   main {
+    width: 100%;
     flex: 1;
-    overflow-y: auto;
-    padding: 28px;
+    padding: clamp(38px, 7vw, 82px) 20px 52px;
   }
-  .tools-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-    gap: 14px;
-    max-width: 900px;
+  .manager-shell {
+    width: min(820px, 100%);
     margin: 0 auto;
   }
+  .intro {
+    margin-bottom: 28px;
+  }
+  .eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin-bottom: 12px;
+    color: var(--accent2);
+    font-size: .7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .09em;
+  }
+  .eyebrow::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent2);
+    box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+  h1 {
+    max-width: 640px;
+    font-size: clamp(1.85rem, 5vw, 3rem);
+    line-height: 1.08;
+    letter-spacing: -.045em;
+    margin-bottom: 13px;
+  }
+  .intro p {
+    max-width: 620px;
+    color: var(--muted);
+    font-size: .94rem;
+    line-height: 1.65;
+  }
+
+  .tools-label {
+    margin: 0 0 9px 2px;
+    color: var(--muted-dim);
+    font-size: .68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+  }
   .tool-card {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 16px;
-    border-radius: 12px;
+    width: 100%;
+    min-height: 178px;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 20px;
+    padding: clamp(20px, 4vw, 30px);
+    border-radius: 16px;
     border: 1px solid var(--border);
-    background: var(--surface);
+    background:
+      linear-gradient(130deg, rgba(168,85,247,.08), transparent 55%),
+      var(--surface);
     color: var(--text);
     text-decoration: none;
-    transition: border-color .15s, background .15s, transform .1s;
+    box-shadow: var(--shadow-2);
+    position: relative;
+    overflow: hidden;
+    transition: border-color .16s var(--ease), background .16s var(--ease), transform .12s var(--ease), box-shadow .16s var(--ease);
   }
-  .tool-card:hover { border-color: var(--accent2); background: var(--surface2); transform: translateY(-1px); }
-  .tool-card svg { color: var(--accent2); }
-  .tool-name { font-size: .92rem; font-weight: 700; }
-  .tool-desc { font-size: .78rem; color: var(--muted); line-height: 1.4; }
+  .tool-card::after {
+    content: '';
+    position: absolute;
+    width: 210px;
+    height: 210px;
+    right: -105px;
+    bottom: -135px;
+    border-radius: 50%;
+    background: rgba(124,58,237,.12);
+    pointer-events: none;
+  }
+  .tool-card:hover {
+    border-color: rgba(168,85,247,.72);
+    background:
+      linear-gradient(130deg, rgba(168,85,247,.13), transparent 58%),
+      var(--surface2);
+    transform: translateY(-2px);
+    box-shadow: 0 22px 64px rgba(0,0,0,.5);
+  }
+  .tool-card:active { transform: translateY(0) scale(.995); }
+  .tool-icon {
+    width: 58px;
+    height: 58px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 15px;
+    border: 1px solid rgba(168,85,247,.28);
+    background: var(--accent-soft);
+    color: #c084fc;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.05);
+  }
+  .tool-icon, .tool-copy, .tool-arrow { position: relative; z-index: 1; }
+  .tool-copy { min-width: 0; }
+  .tool-name {
+    display: block;
+    margin-bottom: 7px;
+    font-size: 1.08rem;
+    font-weight: 750;
+    letter-spacing: -.015em;
+  }
+  .tool-desc {
+    display: block;
+    max-width: 580px;
+    color: var(--muted);
+    font-size: .84rem;
+    line-height: 1.55;
+  }
+  .tool-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 14px;
+  }
+  .tool-tag {
+    padding: 3px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--muted);
+    font-size: .66rem;
+    font-weight: 650;
+  }
+  .tool-arrow {
+    width: 38px;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--surface2);
+    color: var(--muted);
+    transition: color .15s var(--ease), border-color .15s var(--ease), transform .15s var(--ease);
+  }
+  .tool-card:hover .tool-arrow { color: var(--text); border-color: var(--accent2); transform: translateX(2px); }
+
+  @media (max-width: 600px) {
+    header { padding: 10px 14px; }
+    .page-title { font-size: .66rem; padding: 4px 7px; }
+    .back-label { display: none; }
+    .back-btn { padding: 7px 9px; }
+    main { padding: 34px 14px 36px; }
+    .intro { margin-bottom: 24px; }
+    .intro p { font-size: .88rem; }
+    .tool-card {
+      min-height: 0;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 14px;
+      padding: 20px;
+    }
+    .tool-icon { width: 48px; height: 48px; border-radius: 13px; }
+    .tool-desc { font-size: .8rem; }
+    .tool-arrow { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -102,24 +286,46 @@
 <header>
   <div class="logo">WRLD Sync</div>
   <span class="page-title">Database Manager</span>
-  <a class="back-btn" href="/">
-    <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+  <a class="back-btn" href="/" aria-label="Back to WRLD Sync">
+    <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
       <polyline points="15 18 9 12 15 6"/>
     </svg>
-    Back
+    <span class="back-label">Back</span>
   </a>
 </header>
 
 <main>
-  <div class="tools-grid">
-    <a class="tool-card" href="/autogroup.html">
-      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
-        <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
-      </svg>
-      <span class="tool-name">Autogroup</span>
-      <span class="tool-desc">Group every song by title (version tags stripped), falling back to category when no version is present.</span>
-    </a>
+  <div class="manager-shell">
+    <section class="intro" aria-labelledby="managerTitle">
+      <span class="eyebrow">Catalog maintenance</span>
+      <h1 id="managerTitle">Keep song versions organized.</h1>
+      <p>Review how related recordings are grouped before staging precise changes for the Juice WRLD API. Nothing is pushed until you choose to save it.</p>
+    </section>
+
+    <section aria-labelledby="toolsTitle">
+      <h2 class="tools-label" id="toolsTitle">Available tool</h2>
+      <a class="tool-card" href="/autogroup.html" aria-describedby="autogroupDesc">
+        <span class="tool-icon">
+          <svg width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/>
+            <rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>
+          </svg>
+        </span>
+        <span class="tool-copy">
+          <span class="tool-name">Autogroup</span>
+          <span class="tool-desc" id="autogroupDesc">Review saved version groups, load the remaining catalog, then rename, move, merge, or automatically group related song versions. Changes stay staged until you save them.</span>
+          <span class="tool-meta">
+            <span class="tool-tag">API-backed</span>
+            <span class="tool-tag">Review before save</span>
+          </span>
+        </span>
+        <span class="tool-arrow" aria-hidden="true">
+          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <line x1="5" y1="12" x2="19" y2="12"/><polyline points="13 6 19 12 13 18"/>
+          </svg>
+        </span>
+      </a>
+    </section>
   </div>
 </main>
 

@@ -5,6 +5,10 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+tests/
+.artifacts/
+changes.md
+scripts/
 
 # Whisper model cache
 .cache/
@@ -27,3 +31,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+.engine_pref
+
+# Local processed lyrics cache
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal

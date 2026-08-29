@@ -1,15 +1,23 @@
 import asyncio
+import gc
+import hashlib
 import io
 import json
+import mimetypes
 import os
 import pathlib
+import queue as thread_queue
 import re
 import signal
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field as dc_field
 
@@ -38,11 +46,41 @@ import httpx
 import stable_whisper
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
+from rich.table import Table
 
 BASE = "https://juicewrldapi.com/juicewrld"
+CONSOLE = Console(highlight=False)
+
+# Faster-Whisper/CTranslate2 needs CUDA 12 cuBLAS + cuDNN on Windows. A CUDA
+# PyTorch wheel already carries those DLLs under torch/lib, so expose that
+# directory to the process before CTranslate2 tries to load a CUDA model. This
+# avoids making users separately install a full CUDA toolkit when the matching
+# runtime DLLs are already present in the project's venv.
+_CUDA_DLL_DIR_HANDLE = None
+if sys.platform == "win32":
+    try:
+        import torch as _bootstrap_torch
+        _torch_lib = pathlib.Path(_bootstrap_torch.__file__).resolve().parent / "lib"
+        _has_cuda_runtime_dlls = (
+            any(_torch_lib.glob("cublas64_*.dll"))
+            and any(_torch_lib.glob("cudnn64_*.dll"))
+        )
+        if _has_cuda_runtime_dlls:
+            os.environ["PATH"] = str(_torch_lib) + os.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory"):
+                _CUDA_DLL_DIR_HANDLE = os.add_dll_directory(str(_torch_lib))
+    except Exception:
+        pass
+
+
+def _display_name(value: str) -> str:
+    return urllib.parse.unquote(str(value or "")).replace("\\", "/").rsplit("/", 1)[-1]
+
 
 # ---------------------------------------------------------------------------
 # tqdm progress spy — captures stable_whisper alignment/transcription progress
@@ -126,6 +164,264 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 _audio_cache: dict | None = None   # {"path": str, "file": str}
 _audio_cache_lock = asyncio.Lock()
 
+# ---------------------------------------------------------------------------
+# Local processed-lyrics database
+# ---------------------------------------------------------------------------
+_DATA_DIR = pathlib.Path(__file__).parent / "data"
+DB_PATH = _DATA_DIR / "wrld_sync.sqlite3"
+
+
+def _db_connect() -> sqlite3.Connection:
+    _DATA_DIR.mkdir(exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db() -> None:
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_lyrics (
+                song_id INTEGER PRIMARY KEY,
+                song_name TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT '',
+                lyrics_text TEXT NOT NULL DEFAULT '',
+                synced_lines_json TEXT NOT NULL,
+                ttml TEXT NOT NULL DEFAULT '',
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                processed_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_processed_lyrics_updated ON processed_lyrics(updated_at DESC)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS local_tracks (
+                track_hash TEXT PRIMARY KEY,
+                original_name TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                file_path TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                artist TEXT NOT NULL DEFAULT '',
+                duration REAL NOT NULL DEFAULT 0,
+                cover_mime TEXT NOT NULL DEFAULT '',
+                cover_blob BLOB,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_local_tracks_updated ON local_tracks(updated_at DESC)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS local_processed_lyrics (
+                track_hash TEXT PRIMARY KEY,
+                track_name TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT '',
+                lyrics_text TEXT NOT NULL DEFAULT '',
+                synced_lines_json TEXT NOT NULL,
+                ttml TEXT NOT NULL DEFAULT '',
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                processed_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(track_hash) REFERENCES local_tracks(track_hash) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_local_processed_updated ON local_processed_lyrics(updated_at DESC)"
+        )
+
+
+def _get_processed_lyrics(song_id: int) -> dict | None:
+    if song_id <= 0:
+        return None
+    try:
+        with _db_connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM processed_lyrics WHERE song_id = ?", (int(song_id),)
+            ).fetchone()
+    except sqlite3.Error as exc:
+        CONSOLE.print(f"[yellow]Could not read local lyrics cache: {exc}[/yellow]")
+        return None
+    if row is None:
+        return None
+    try:
+        lines = json.loads(row["synced_lines_json"])
+    except Exception:
+        lines = []
+    try:
+        settings = json.loads(row["settings_json"])
+    except Exception:
+        settings = {}
+    return {
+        "song_id": row["song_id"],
+        "song_name": row["song_name"],
+        "source_type": row["source_type"],
+        "lyrics": row["lyrics_text"],
+        "lines": lines,
+        "ttml": row["ttml"],
+        "settings": settings,
+        "processed_at": row["processed_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _get_local_processed(track_hash: str) -> dict | None:
+    track_hash = str(track_hash or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", track_hash):
+        return None
+    try:
+        with _db_connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM local_processed_lyrics WHERE track_hash = ?", (track_hash,)
+            ).fetchone()
+    except sqlite3.Error as exc:
+        CONSOLE.print(f"[yellow]Could not read local-file lyrics cache: {exc}[/yellow]")
+        return None
+    if row is None:
+        return None
+    try:
+        lines = json.loads(row["synced_lines_json"])
+    except Exception:
+        lines = []
+    try:
+        settings = json.loads(row["settings_json"])
+    except Exception:
+        settings = {}
+    return {
+        "track_hash": row["track_hash"],
+        "track_name": row["track_name"],
+        "source_type": row["source_type"],
+        "lyrics": row["lyrics_text"],
+        "lines": lines,
+        "ttml": row["ttml"],
+        "settings": settings,
+        "processed_at": row["processed_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _get_local_track(track_hash: str, include_cover: bool = False) -> dict | None:
+    track_hash = str(track_hash or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", track_hash):
+        return None
+    fields = "*" if include_cover else "track_hash,original_name,source_url,file_path,title,artist,duration,cover_mime,created_at,updated_at"
+    try:
+        with _db_connect() as conn:
+            row = conn.execute(f"SELECT {fields} FROM local_tracks WHERE track_hash = ?", (track_hash,)).fetchone()
+    except sqlite3.Error as exc:
+        CONSOLE.print(f"[yellow]Could not read local track: {exc}[/yellow]")
+        return None
+    return dict(row) if row is not None else None
+
+
+def _store_processed_lyrics(task) -> None:
+    """Persist a successful result to the catalog-song or local-track table."""
+    song_id = int(getattr(task, "song_id", 0) or 0)
+    local_hash = str(getattr(task, "local_hash", "") or "").strip().lower()
+    if song_id <= 0 and not re.fullmatch(r"[0-9a-f]{64}", local_hash):
+        return
+    result = getattr(task, "result", None) or {}
+    lines = result.get("lines") or []
+    if not lines:
+        return
+
+    ttml = ""
+    used_word_timing = False
+    try:
+        ttml, used_word_timing = _build_ttml(
+            lines,
+            word_timing=bool(getattr(task, "word_timing", True)),
+            detect_interludes=bool(getattr(task, "detect_interludes", True)),
+            inline_parenthetical_background=bool(getattr(task, "inline_parenthetical_background", True)),
+            interlude_threshold=float(getattr(task, "interlude_threshold", 2.0)),
+        )
+    except Exception as exc:
+        CONSOLE.print(f"[yellow]Could not build cached TTML for song {task.song_id}: {exc}[/yellow]")
+
+    fast_mode = False
+    settings = {
+        "task_type": getattr(task, "type", ""),
+        "engine": ENGINE_PREF,
+        "device_pref": DEVICE_PREF,
+        "resolved_device": _get_device(ENGINE_PREF),
+        "align_model": ALIGN_MODEL_SIZE,
+        "verify_model": VERIFY_MODEL_SIZE,
+        "auto_mode": result.get("auto_mode", ""),
+        "fast_auto": False,  # legacy field retained for older cache readers
+        "word_timing_requested": bool(getattr(task, "word_timing", True)),
+        "word_timing_used": used_word_timing,
+        "detect_interludes": bool(getattr(task, "detect_interludes", True)),
+        "inline_parenthetical_background": bool(getattr(task, "inline_parenthetical_background", True)),
+        "allow_overlapping_lyrics": bool(getattr(task, "allow_overlapping_lyrics", False)),
+        "interlude_threshold": float(getattr(task, "interlude_threshold", 2.0)),
+        "background_vocals": "parenthetical-inline-toggle",
+        "alignment": {
+            "original_split": True,
+            "fast_mode": fast_mode,
+            "token_step": 200 if fast_mode else 100,
+            "nonspeech_skip": 2.0 if fast_mode else 5.0,
+            "suppress_silence": True,
+            "suppress_word_ts": True,
+        },
+    }
+    lyrics_text = str(result.get("text") or getattr(task, "lyrics", "") or "")
+    now = time.time()
+    with _db_connect() as conn:
+        if song_id > 0:
+            conn.execute(
+                """
+                INSERT INTO processed_lyrics (
+                    song_id, song_name, source_type, lyrics_text, synced_lines_json,
+                    ttml, settings_json, processed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(song_id) DO UPDATE SET
+                    song_name = excluded.song_name,
+                    source_type = excluded.source_type,
+                    lyrics_text = excluded.lyrics_text,
+                    synced_lines_json = excluded.synced_lines_json,
+                    ttml = excluded.ttml,
+                    settings_json = excluded.settings_json,
+                    processed_at = excluded.processed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    song_id, str(task.song_name or ""), str(task.type or ""),
+                    lyrics_text, json.dumps(lines, ensure_ascii=False), ttml,
+                    json.dumps(settings, ensure_ascii=False), now, now,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO local_processed_lyrics (
+                    track_hash, track_name, source_type, lyrics_text, synced_lines_json,
+                    ttml, settings_json, processed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(track_hash) DO UPDATE SET
+                    track_name = excluded.track_name,
+                    source_type = excluded.source_type,
+                    lyrics_text = excluded.lyrics_text,
+                    synced_lines_json = excluded.synced_lines_json,
+                    ttml = excluded.ttml,
+                    settings_json = excluded.settings_json,
+                    processed_at = excluded.processed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    local_hash, str(task.song_name or ""), str(task.type or ""),
+                    lyrics_text, json.dumps(lines, ensure_ascii=False), ttml,
+                    json.dumps(settings, ensure_ascii=False), now, now,
+                ),
+            )
+
 
 async def ensure_audio(song_path: str):
     """Async generator: yields SSE dicts during download, then {"_path": str} as last item."""
@@ -176,6 +472,7 @@ async def ensure_audio(song_path: str):
 # Model loading — separate align (sync) and verify models, lazy-loaded
 # ---------------------------------------------------------------------------
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
+WHISPER_ENGINES = ["faster", "torch"]
 _PREF_DIR = pathlib.Path(__file__).parent
 
 def _read_pref(filename: str, choices: list, default: str) -> str:
@@ -195,24 +492,17 @@ def _write_pref(filename: str, value: str) -> None:
 
 # Device preference: "auto" | "cpu" | "cuda"
 DEVICE_PREF: str = _read_pref(".device_pref", ["auto", "cpu", "cuda"], "auto")
+# Faster-Whisper/CTranslate2 is the default because this app is inference-only and
+# it is substantially faster on modern NVIDIA GPUs. "torch" keeps the original
+# OpenAI Whisper backend available for compatibility/debugging.
+ENGINE_PREF: str = _read_pref(".engine_pref", WHISPER_ENGINES, "faster")
 
-def _cuda_usable() -> bool:
-    """torch.cuda.is_available() only checks that a driver + device are present —
-    it stays True even when the installed PyTorch build has no compiled kernels
-    for that GPU's compute capability (e.g. a cu128 wheel on an old Pascal card
-    like the GT 1030 / sm_61), which fails loudly mid-computation instead of at
-    startup. Cross-check the device's capability against what this build ships
-    kernels for.
-
-    Note this is a floor check, not exact membership: CUDA's minor-version
-    compatibility means e.g. sm_86-compiled kernels already run fine on sm_89
-    (Ada/RTX 40-series) hardware, so a capability that's simply absent from
-    get_arch_list() but *higher* than everything in it is still fine. Only a
-    capability *lower* than the build's floor is a real incompatibility."""
-    import torch
-    if not torch.cuda.is_available():
-        return False
+def _torch_cuda_usable() -> bool:
+    """Whether this PyTorch build can actually execute on the visible NVIDIA GPU."""
     try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
         major, minor = torch.cuda.get_device_capability()
         cap = major + minor / 10
         arch_caps = []
@@ -220,23 +510,72 @@ def _cuda_usable() -> bool:
             digits = "".join(ch for ch in arch if ch.isdigit())
             if len(digits) >= 2:
                 arch_caps.append(int(digits[:-1]) + int(digits[-1]) / 10)
-        if arch_caps and cap < min(arch_caps):
-            print(f"[whisper] GPU compute capability {major}.{minor} is older than the "
-                  f"installed PyTorch build's minimum ({min(arch_caps):.1f}) — falling back to CPU.")
-            return False
+        return not arch_caps or cap >= min(arch_caps)
     except Exception:
-        pass
-    return True
+        return False
 
 
-def _get_device() -> str:
+def _faster_cuda_usable() -> bool:
+    """CTranslate2 owns Faster-Whisper inference, so do not gate it on Torch CUDA."""
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def _cuda_usable(engine: str | None = None) -> bool:
+    engine = engine or ENGINE_PREF
+    if engine == "faster":
+        return _faster_cuda_usable()
+    return _torch_cuda_usable()
+
+
+_device_fallback_warned: set[str] = set()
+
+def _get_device(engine: str | None = None) -> str:
+    engine = engine or ENGINE_PREF
     if DEVICE_PREF == "cpu":
         return "cpu"
-    avail = "cuda" if _cuda_usable() else "cpu"
-    if DEVICE_PREF == "cuda" and avail != "cuda":
-        print("[whisper] CUDA requested but not usable — falling back to CPU.")
-        return "cpu"
-    return avail
+    if _cuda_usable(engine):
+        return "cuda"
+    if DEVICE_PREF == "cuda" and engine not in _device_fallback_warned:
+        _device_fallback_warned.add(engine)
+        CONSOLE.print(f"[yellow]CUDA was requested for {engine}, but that backend cannot use it. Falling back to CPU.[/yellow]")
+    return "cpu"
+
+
+def _release_models() -> None:
+    """Drop model references and release cached accelerator memory after a setting change."""
+    global _align_model, _verify_model
+    _align_model = None
+    _verify_model = None
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _load_whisper_model(size: str):
+    if ENGINE_PREF == "faster":
+        faster_device = _get_device("faster")
+        try:
+            compute_type = "float16" if faster_device == "cuda" else "int8"
+            return stable_whisper.load_faster_whisper(
+                size, device=faster_device, compute_type=compute_type
+            )
+        except Exception as exc:
+            # A visible NVIDIA GPU does not guarantee the CUDA runtime libraries
+            # CTranslate2 needs are usable. Fall back cleanly rather than trying
+            # PyTorch on a CUDA device that its own wheel cannot support.
+            CONSOLE.print(f"[yellow]Faster-Whisper could not initialize on {faster_device.upper()}: {exc}[/yellow]")
+            CONSOLE.print("[yellow]Falling back to PyTorch Whisper for this model load.[/yellow]")
+
+    torch_device = _get_device("torch")
+    return stable_whisper.load_model(size, device=torch_device)
 
 # Align model (used for sync / alignment tasks)
 ALIGN_MODEL_SIZE: str = _read_pref(".model_pref_align", WHISPER_MODELS,
@@ -257,26 +596,31 @@ async def get_align_model():
     if _align_model is None:
         async with _model_lock:
             if _align_model is None:
-                device = _get_device()
-                print(f"[whisper] Loading align model '{ALIGN_MODEL_SIZE}' on {device.upper()} …")
+                device = _get_device(ENGINE_PREF)
+                CONSOLE.print(f"[cyan]→[/cyan] Loading align model [bold]{ALIGN_MODEL_SIZE}[/bold] with {ENGINE_PREF} on {device.upper()}")
                 loop = asyncio.get_running_loop()
                 _align_model = await loop.run_in_executor(
-                    None, lambda: stable_whisper.load_model(ALIGN_MODEL_SIZE, device=device))
-                print(f"[whisper] Align model ready.")
+                    None, lambda: _load_whisper_model(ALIGN_MODEL_SIZE))
+                CONSOLE.print("[green]✓[/green] Align model ready")
     return _align_model
 
 
 async def get_verify_model():
     global _verify_model
+    # If both slots use the same model, share the loaded instance instead of
+    # loading a duplicate copy into VRAM/RAM. Inference is serialized anyway.
+    if _verify_model is None and VERIFY_MODEL_SIZE == ALIGN_MODEL_SIZE:
+        _verify_model = await get_align_model()
+        return _verify_model
     if _verify_model is None:
         async with _model_lock:
             if _verify_model is None:
-                device = _get_device()
-                print(f"[whisper] Loading verify model '{VERIFY_MODEL_SIZE}' on {device.upper()} …")
+                device = _get_device(ENGINE_PREF)
+                CONSOLE.print(f"[cyan]→[/cyan] Loading verify model [bold]{VERIFY_MODEL_SIZE}[/bold] with {ENGINE_PREF} on {device.upper()}")
                 loop = asyncio.get_running_loop()
                 _verify_model = await loop.run_in_executor(
-                    None, lambda: stable_whisper.load_model(VERIFY_MODEL_SIZE, device=device))
-                print(f"[whisper] Verify model ready.")
+                    None, lambda: _load_whisper_model(VERIFY_MODEL_SIZE))
+                CONSOLE.print("[green]✓[/green] Verify model ready")
     return _verify_model
 
 
@@ -297,12 +641,20 @@ class QueueTask:
     song_name: str
     lyrics: str         # may be empty
     local_path: str = ""  # non-empty → use this file instead of fetching from API
+    local_hash: str = ""  # SHA-256 of decoded audio for local files
+    fast_auto: bool = False  # legacy compatibility only; Auto is always a full transcription
+    word_timing: bool = True
+    detect_interludes: bool = True
+    inline_parenthetical_background: bool = True
+    allow_overlapping_lyrics: bool = False
+    interlude_threshold: float = 2.0
     status: str = "pending"   # pending|running|done|error|cancelled
     progress: dict = dc_field(default_factory=dict)
     error: str = ""
     created_at: float = dc_field(default_factory=time.time)
     cancel_requested: bool = False
     result: dict | None = None
+    live_lines: list[dict] = dc_field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -310,13 +662,24 @@ class QueueTask:
             "type": self.type,
             "song_id": self.song_id,
             "song_name": self.song_name,
+            "local_hash": self.local_hash,
             "status": self.status,
             "progress": self.progress,
             "error": self.error,
             "created_at": self.created_at,
+            "settings": {
+                "fast_auto": self.fast_auto,
+                "word_timing": self.word_timing,
+                "detect_interludes": self.detect_interludes,
+                "inline_parenthetical_background": self.inline_parenthetical_background,
+                "allow_overlapping_lyrics": self.allow_overlapping_lyrics,
+                "interlude_threshold": self.interlude_threshold,
+            },
         }
         if self.result and self.status in ("done", "error"):
             d["result"] = self.result
+        if self.status in ("running", "cancelling") and self.live_lines:
+            d["live_lines"] = self.live_lines
         return d
 
 
@@ -343,161 +706,381 @@ async def _q_broadcast() -> None:
 
 # ── Shared whisper helpers ────────────────────────────────────────────────
 
-def _align(model_obj, tmp_path: str, lyrics: str):
-    # original_split=True keeps one output segment per input lyric line
-    # (rather than re-splitting by punctuation lyrics usually lack), which
-    # lets stable-ts's per-segment gap_padding actually line up with our
-    # real line boundaries and reduces its tendency to predict a line's
-    # start too early. nonspeech_skip lower than the 5s default catches the
-    # shorter pauses/breaths between song lines too, so word timestamps
-    # don't get stretched across them.
+def _align(model_obj, tmp_path: str, lyrics: str, fast_mode: bool = False):
+    # original_split=True keeps one output segment per input lyric line.
+    # Optional fast alignment remains available internally for compatibility.
+    # The UI Auto action now performs a full transcription instead; Sync uses
+    # the normal alignment path for the raw Lyrics text.
     return model_obj.align(
         tmp_path, lyrics, language="en",
         original_split=True,
-        nonspeech_skip=1.0,
+        # Let stable-ts keep real silence between words/lines. The optional
+        # internal fast path uses a 2-second skip threshold; normal Sync uses 5s.
+        nonspeech_skip=2.0 if fast_mode else 5.0,
+        fast_mode=fast_mode,
+        token_step=200 if fast_mode else 100,
+        suppress_silence=True,
+        suppress_word_ts=True,
+        verbose=False,
     )
 
 
+def _word_dict(word) -> dict | None:
+    raw = str(getattr(word, "word", ""))
+    clean = raw.strip()
+    if not clean:
+        return None
+    item = {
+        "word": clean,
+        "text": raw,
+        "start": round(float(word.start), 3),
+        "end": round(float(word.end), 3),
+    }
+    probability = getattr(word, "probability", None)
+    if probability is not None:
+        try:
+            item["probability"] = round(float(probability), 4)
+        except (TypeError, ValueError):
+            pass
+    return item
+
+
 def _lines_from_alignment(result, lyrics: str) -> list[dict]:
-    """Turn a stable-ts alignment/transcription result into {line, start, end} dicts."""
-    words: list[dict] = []
-    for seg in result.segments:
+    """Preserve line start/end plus stable-ts's real per-word timing."""
+    segments = list(result.segments or [])
+    all_words: list[dict] = []
+    segment_words: list[list[dict]] = []
+
+    for seg in segments:
+        words = []
         for w in (seg.words or []):
-            wt = w.word.strip()
-            if wt:
-                words.append({"word": wt, "start": round(w.start, 3), "end": round(w.end, 3)})
-    if not words:
-        for seg in result.segments:
-            words.append({"word": seg.text.strip(), "start": round(seg.start, 3), "end": round(seg.end, 3)})
+            item = _word_dict(w)
+            if item:
+                words.append(item)
+                all_words.append(item)
+        segment_words.append(words)
+
+    if not all_words:
+        for seg in segments:
+            text = seg.text.strip()
+            if text:
+                all_words.append({
+                    "word": text,
+                    "text": text,
+                    "start": round(float(seg.start), 3),
+                    "end": round(float(seg.end), 3),
+                })
 
     lines: list[dict] = []
-    if lyrics and words:
-        lyric_lines = [l.strip() for l in lyrics.split("\n") if l.strip()]
-        if len(result.segments) == len(lyric_lines):
-            # original_split=True guarantees this 1:1 correspondence -- use the
-            # segment's own timing directly instead of the word-count slicing
-            # below, which can drift if naive whitespace-splitting doesn't
-            # match Whisper's own word boundaries (contractions, punctuation).
-            for line_text, seg in zip(lyric_lines, result.segments):
-                lines.append({"line": line_text, "start": round(seg.start, 3), "end": round(seg.end, 3)})
+    if lyrics and segments:
+        lyric_lines = [line.strip() for line in lyrics.split("\n") if line.strip()]
+        if len(segments) == len(lyric_lines):
+            for i, (line_text, seg) in enumerate(zip(lyric_lines, segments)):
+                lines.append({
+                    "line": line_text,
+                    "start": round(float(seg.start), 3),
+                    "end": round(float(seg.end), 3),
+                    "words": segment_words[i],
+                })
         else:
+            # Compatibility fallback for backends that don't preserve the input
+            # split exactly. Slice the aligned word stream by lyric word count.
             ptr = 0
             for line_text in lyric_lines:
-                n = len(line_text.split())
-                chunk = words[ptr:ptr + n]
+                n = max(1, len(line_text.split()))
+                chunk = all_words[ptr:ptr + n]
                 if chunk:
-                    lines.append({"line": line_text, "start": chunk[0]["start"], "end": chunk[-1]["end"]})
+                    lines.append({
+                        "line": line_text,
+                        "start": chunk[0]["start"],
+                        "end": chunk[-1]["end"],
+                        "words": chunk,
+                    })
                 ptr += n
-                if ptr >= len(words):
+                if ptr >= len(all_words):
                     break
     else:
-        for seg in result.segments:
-            lines.append({"line": seg.text.strip(), "start": round(seg.start, 3), "end": round(seg.end, 3)})
+        for i, seg in enumerate(segments):
+            text = seg.text.strip()
+            if text:
+                lines.append({
+                    "line": text,
+                    "start": round(float(seg.start), 3),
+                    "end": round(float(seg.end), 3),
+                    "words": segment_words[i],
+                })
     return lines
 
 
-async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
-    """Run align/transcribe in executor. Returns lines."""
-    label     = "Aligning" if lyrics else "Transcribing"
-    spy       = _ProgressSpy()
-    loop      = asyncio.get_running_loop()
+def _line_from_faster_segment(segment) -> dict | None:
+    """Convert one faster-whisper segment into the app's timed-line shape."""
+    text = str(getattr(segment, "text", "") or "").strip()
+    if not text:
+        return None
+    words = []
+    for raw_word in (getattr(segment, "words", None) or []):
+        item = _word_dict(raw_word)
+        if item:
+            words.append(item)
+    return {
+        "line": text,
+        "start": round(float(getattr(segment, "start", 0.0)), 3),
+        "end": round(float(getattr(segment, "end", 0.0)), 3),
+        "words": words,
+    }
+
+
+async def _faster_stream_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dict] | None:
+    """Stream faster-whisper segments into QueueTask.live_lines as they decode.
+
+    Returns None when the loaded model is not a faster-whisper model, allowing
+    the caller to fall back to stable-ts/PyTorch transcription.
+    """
     model_obj = await get_align_model()
+    transcribe_original = getattr(model_obj, "transcribe_original", None)
+    if not callable(transcribe_original):
+        return None
+
+    loop = asyncio.get_running_loop()
+    updates: thread_queue.Queue = thread_queue.Queue()
+
+    def _run():
+        try:
+            segments, info = transcribe_original(
+                tmp_path,
+                language="en",
+                word_timestamps=True,
+            )
+            updates.put(("meta", float(getattr(info, "duration", 0.0) or 0.0)))
+            for segment in segments:
+                if task.cancel_requested:
+                    break
+                line = _line_from_faster_segment(segment)
+                if line:
+                    updates.put(("line", line))
+            updates.put(("done", None))
+        except BaseException as exc:
+            updates.put(("error", exc))
+
+    lines: list[dict] = []
+    total_duration = 0.0
+    finished = False
+
+    async with _inference_lock:
+        future = loop.run_in_executor(None, _run)
+        while not finished:
+            changed = False
+            while True:
+                try:
+                    kind, payload = updates.get_nowait()
+                except thread_queue.Empty:
+                    break
+
+                if kind == "meta":
+                    total_duration = float(payload or 0.0)
+                elif kind == "line":
+                    lines.append(payload)
+                    task.live_lines = list(lines)
+                    changed = True
+                elif kind == "error":
+                    await future
+                    raise payload
+                elif kind == "done":
+                    finished = True
+                    break
+
+            if task.cancel_requested:
+                task.progress = {
+                    "stage": "transcribing", "msg": "Cancelling…", "pct": 0,
+                    "step": "transcribing",
+                }
+                await _q_broadcast()
+
+            if changed:
+                end = lines[-1]["end"] if lines else 0.0
+                pct = 30 + ((min(1.0, end / total_duration) * 68) if total_duration else 0)
+                task.progress = {
+                    "stage": "transcribing",
+                    "msg": f"Transcribing live… {len(lines)} lines",
+                    "pct": pct,
+                    "step": "transcribing",
+                    "live": True,
+                }
+                await _q_broadcast()
+
+            if not finished:
+                if future.done() and updates.empty():
+                    await future
+                    finished = True
+                    break
+                await asyncio.sleep(0.06)
+
+        await future
+
+    if task.cancel_requested:
+        raise asyncio.CancelledError()
+
+    # Raw faster-whisper segments already include real word timestamps, including
+    # natural silence between words. Preserve those timings for TTML/rendering.
+    return _sanitize_timed_lines(
+        lines, inline_parenthetical_background=task.inline_parenthetical_background
+    )
+
+
+def _new_terminal_progress() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=24),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=CONSOLE,
+        transient=True,
+        disable=not CONSOLE.is_terminal,
+    )
+
+
+async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast_mode: bool = False) -> list[dict]:
+    """Run align/transcribe in executor. Returns lines."""
+    label = "Aligning" if lyrics else "Transcribing"
+    spy = _ProgressSpy()
+    spy.silent = True  # capture stable-ts tqdm instead of dumping raw progress into uvicorn logs
+    loop = asyncio.get_running_loop()
+    model_obj = await get_align_model()
+    started = time.perf_counter()
+    display = _display_name(task.song_name) or f"song {task.song_id}"
 
     def _run():
         orig = sys.stderr
         sys.stderr = _TeeStderr(spy, orig)
         try:
             if lyrics:
-                return _align(model_obj, tmp_path, lyrics)
-            else:
-                return model_obj.transcribe(tmp_path, word_timestamps=True, verbose=False)
+                return _align(model_obj, tmp_path, lyrics, fast_mode=fast_mode)
+            return model_obj.transcribe(tmp_path, word_timestamps=True, verbose=False)
         finally:
             sys.stderr = orig
 
-    async with _inference_lock:
-        fut = loop.run_in_executor(None, _run)
-        cancelled = False
-        elapsed = 0
-        while not fut.done():
-            if task.cancel_requested:
-                cancelled = True
-                spy.silent = True          # silence tqdm in terminal immediately
-                task.progress = {"stage": "aligning", "msg": "Cancelling…", "pct": 0, "step": "aligning"}
+    terminal = _new_terminal_progress()
+    terminal_id = terminal.add_task(f"[cyan]{label}[/cyan] {display}", total=100)
+    terminal.start()
+    try:
+        async with _inference_lock:
+            fut = loop.run_in_executor(None, _run)
+            cancelled = False
+            elapsed = 0
+            while not fut.done():
+                if task.cancel_requested:
+                    cancelled = True
+                    task.progress = {"stage": "aligning", "msg": "Cancelling…", "pct": 0, "step": "aligning"}
+                    await _q_broadcast()
+                    await asyncio.shield(fut)
+                    break
+                prog = spy.latest()
+                if prog:
+                    terminal.update(terminal_id, completed=prog["pct"])
+                    pct = 55 + prog["pct"] * 0.44
+                    msg = (f"{label}: {prog['pct']}%  "
+                           f"{prog['done']:.1f}/{prog['total']:.1f}s  "
+                           f"[{prog['elapsed']}<{prog['eta']}, {prog['speed']:.2f}s/sec]")
+                else:
+                    terminal.update(terminal_id, completed=min(95, (elapsed / 180) ** 0.5 * 100))
+                    pct = min(54, int((elapsed / 180) ** 0.5 * 54))
+                    msg = f"{label}… {elapsed}s"
+                task.progress = {
+                    "stage": "aligning", "pct": pct, "msg": msg, "step": "aligning",
+                    **({"progress": prog} if prog else {}),
+                }
                 await _q_broadcast()
-                await asyncio.shield(fut)  # wait for thread (lock held — prevents concurrent model use)
-                break
-            prog = spy.latest()
-            if prog:
-                pct = 55 + prog["pct"] * 0.44
-                msg = (f"{label}: {prog['pct']}%  "
-                       f"{prog['done']:.1f}/{prog['total']:.1f}s  "
-                       f"[{prog['elapsed']}<{prog['eta']}, {prog['speed']:.2f}s/sec]")
-            else:
-                pct = min(54, int((elapsed / 180) ** 0.5 * 54))
-                msg = f"{label}… {elapsed}s"
-            task.progress = {"stage": "aligning", "pct": pct, "msg": msg, "step": "aligning",
-                             **({"progress": prog} if prog else {})}
-            await _q_broadcast()
-            await asyncio.sleep(0.5)
-            elapsed += 1
-        if not cancelled:
-            result = await fut
+                await asyncio.sleep(0.5)
+                elapsed += 1
+            if not cancelled:
+                result = await fut
+    finally:
+        terminal.stop()
 
     if cancelled:
         raise asyncio.CancelledError()
 
-    return _lines_from_alignment(result, lyrics)
+    lines = _sanitize_timed_lines(
+        _lines_from_alignment(result, lyrics),
+        inline_parenthetical_background=task.inline_parenthetical_background,
+    )
+    CONSOLE.print(
+        f"[green]✓[/green] {'Aligned' if lyrics else 'Transcribed'} [bold]{display}[/bold] "
+        f"[dim]({len(lines)} lines, {time.perf_counter() - started:.1f}s)[/dim]"
+    )
+    return lines
 
 
 async def _whisper_verify_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
     """Free-transcribe + compare. Returns verify_results list."""
-    spy      = _ProgressSpy()
-    loop     = asyncio.get_running_loop()
-    model_v  = await get_verify_model()
+    spy = _ProgressSpy()
+    spy.silent = True
+    loop = asyncio.get_running_loop()
+    model_v = await get_verify_model()
+    started = time.perf_counter()
+    display = _display_name(task.song_name) or f"song {task.song_id}"
 
     def _run():
         orig = sys.stderr
         sys.stderr = _TeeStderr(spy, orig)
         try:
-            return model_v.transcribe(tmp_path, verbose=False)
+            return model_v.transcribe(
+                tmp_path, verbose=False, word_timestamps=False,
+                suppress_silence=False, regroup=False,
+            )
         finally:
             sys.stderr = orig
 
-    async with _inference_lock:
-        fut = loop.run_in_executor(None, _run)
-        cancelled = False
-        elapsed = 0
-        while not fut.done():
-            if task.cancel_requested:
-                cancelled = True
-                spy.silent = True          # silence tqdm in terminal immediately
-                task.progress = {"stage": "transcribing", "msg": "Cancelling…", "pct": 0, "step": "verifying"}
+    terminal = _new_terminal_progress()
+    terminal_id = terminal.add_task(f"[cyan]Verifying[/cyan] {display}", total=100)
+    terminal.start()
+    try:
+        async with _inference_lock:
+            fut = loop.run_in_executor(None, _run)
+            cancelled = False
+            elapsed = 0
+            while not fut.done():
+                if task.cancel_requested:
+                    cancelled = True
+                    task.progress = {"stage": "transcribing", "msg": "Cancelling…", "pct": 0, "step": "verifying"}
+                    await _q_broadcast()
+                    await asyncio.shield(fut)
+                    break
+                prog = spy.latest()
+                if prog:
+                    terminal.update(terminal_id, completed=prog["pct"])
+                    pct = 42 + prog["pct"] * 0.53
+                    msg = (f"Transcribing: {prog['pct']}%  "
+                           f"{prog['done']:.1f}/{prog['total']:.1f}s  "
+                           f"[{prog['elapsed']}<{prog['eta']}, {prog['speed']:.2f}s/sec]")
+                else:
+                    terminal.update(terminal_id, completed=min(95, (elapsed / 180) ** 0.5 * 100))
+                    pct = min(41, int((elapsed / 180) ** 0.5 * 41))
+                    msg = f"Transcribing… {elapsed}s"
+                task.progress = {
+                    "stage": "transcribing", "pct": pct, "msg": msg, "step": "verifying",
+                    **({"progress": prog} if prog else {}),
+                }
                 await _q_broadcast()
-                await asyncio.shield(fut)  # wait for thread (lock held)
-                break
-            prog = spy.latest()
-            if prog:
-                pct = 42 + prog["pct"] * 0.53
-                msg = (f"Transcribing: {prog['pct']}%  "
-                       f"{prog['done']:.1f}/{prog['total']:.1f}s  "
-                       f"[{prog['elapsed']}<{prog['eta']}, {prog['speed']:.2f}s/sec]")
-            else:
-                pct = min(41, int((elapsed / 180) ** 0.5 * 41))
-                msg = f"Transcribing… {elapsed}s"
-            task.progress = {"stage": "transcribing", "pct": pct, "msg": msg, "step": "verifying",
-                             **({"progress": prog} if prog else {})}
-            await _q_broadcast()
-            await asyncio.sleep(0.5)
-            elapsed += 1
-        if not cancelled:
-            result = await fut
+                await asyncio.sleep(0.5)
+                elapsed += 1
+            if not cancelled:
+                result = await fut
+    finally:
+        terminal.stop()
 
     if cancelled:
         raise asyncio.CancelledError()
 
     transcription = result.text or ""
-    lyric_lines   = [l for l in lyrics.split("\n") if l.strip()]
-    return _verify_lines(lyric_lines, transcription)
+    lyric_lines = [l for l in lyrics.split("\n") if l.strip()]
+    verified = _verify_lines(lyric_lines, transcription)
+    CONSOLE.print(
+        f"[green]✓[/green] Verified [bold]{display}[/bold] "
+        f"[dim]({len(verified)} lines, {time.perf_counter() - started:.1f}s)[/dim]"
+    )
+    return verified
 
 
 async def _download_audio(task: QueueTask, song: dict) -> str:
@@ -530,6 +1113,7 @@ async def _run_sync_task(task: QueueTask) -> None:
             raise ValueError("No audio file for this song.")
         lyrics   = task.lyrics or song.get("lyrics", "") or ""
         tmp_path = await _download_audio(task, song)
+    task.lyrics = lyrics
     if task.cancel_requested:
         raise asyncio.CancelledError()
     task.progress = {"stage": "loading", "msg": "Loading Whisper model…", "step": "loading", "pct": 52}
@@ -582,88 +1166,69 @@ async def _run_transcribe_task(task: QueueTask) -> None:
         raise asyncio.CancelledError()
     task.progress = {"stage": "loading", "msg": "Loading Whisper model…", "step": "loading", "pct": 30}
     await _q_broadcast()
-    # Run with empty lyrics → transcription mode
-    lines = await _whisper_sync_worker(task, tmp_path, "")
+
+    # Faster-Whisper exposes its decoded segments as a generator, so publish
+    # them to the UI immediately instead of waiting for the whole song. The
+    # PyTorch backend has no equivalent segment-yielding API here and falls
+    # back to the normal stable-ts transcription path.
+    lines = await _faster_stream_transcribe_worker(task, tmp_path)
+    if lines is None:
+        task.progress = {
+            "stage": "transcribing",
+            "msg": "Transcribing… live preview requires Faster-Whisper",
+            "step": "transcribing",
+            "pct": 31,
+            "live": False,
+        }
+        await _q_broadcast()
+        lines = await _whisper_sync_worker(task, tmp_path, "")
+
     plain_text = "\n".join(l["line"] for l in lines)
+    task.live_lines = []
     task.result   = {"lines": lines, "text": plain_text}
     task.progress = {"stage": "done", "msg": f"Transcribed — {len(lines)} lines", "step": "done", "pct": 100}
 
 
 async def _run_auto_task(task: QueueTask) -> None:
-    """Genius → verify → sync pipeline."""
+    """Run a full Whisper transcription and keep both raw + timed lyrics."""
     if task.local_path:
         tmp_path = task.local_path
-        lyrics   = task.lyrics
-        song     = {"path": task.local_path}  # minimal stub so later code stays happy
     else:
         task.progress = {"stage": "fetching", "msg": "Fetching song info…", "step": "fetching", "pct": 2}
         await _q_broadcast()
-        song   = await jw_get(f"/songs/{task.song_id}/")
-        lyrics = task.lyrics or song.get("lyrics", "") or ""
-
-    # Step 1: Genius if no lyrics
-    if not lyrics:
-        task.progress = {"stage": "genius", "msg": "Searching Genius for lyrics…", "step": "genius", "pct": 5}
-        await _q_broadcast()
-        title = re.sub(r'\s*[\[({].*?[\])}]\s*', '', task.song_name).strip()
-        try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                r = await client.get(
-                    "https://genius.com/api/search/song",
-                    params={"q": f"Juice WRLD {title}"},
-                    headers=GENIUS_HEADERS,
-                )
-                r.raise_for_status()
-                sections = r.json().get("response", {}).get("sections", [])
-                hits = sections[0].get("hits", []) if sections else []
-                if hits:
-                    r2 = await client.get(hits[0]["result"]["url"], headers=GENIUS_HEADERS)
-                    r2.raise_for_status()
-                    lyrics = _parse_genius_page(r2.text)
-        except Exception as exc:
-            print(f"[queue/auto] Genius error: {exc}")
-        if not lyrics:
-            raise ValueError("No lyrics found on Genius — add lyrics manually first.")
-
-    if not song.get("path"):
-        raise ValueError("No audio file for this song.")
-    if task.cancel_requested:
-        raise asyncio.CancelledError()
-
-    # Step 2: Download (skipped for local files) + Verify
-    if not task.local_path:
-        task.progress = {"stage": "verifying", "msg": "Downloading audio for verify…", "step": "verifying", "pct": 10}
-        await _q_broadcast()
+        song = await jw_get(f"/songs/{task.song_id}/")
+        if not song.get("path"):
+            raise ValueError("No audio file for this song.")
         tmp_path = await _download_audio(task, song)
-    if task.cancel_requested:
-        raise asyncio.CancelledError()
-    task.progress = {"stage": "loading", "msg": "Loading Whisper model…", "step": "loading", "pct": 25}
-    await _q_broadcast()
-    verify_results = await _whisper_verify_worker(task, tmp_path, lyrics)
-
-    counts      = {"present": 0, "uncertain": 0, "absent": 0}
-    for r in verify_results:
-        counts[r["status"]] += 1
-    total        = len(verify_results)
-    absent_ratio = counts["absent"] / total if total > 0 else 0
-
-    if absent_ratio > 0.2:
-        task.result = {"verify": verify_results, "counts": counts}
-        raise ValueError(
-            f"{counts['absent']} absent lines ({round(absent_ratio * 100)}%) "
-            f"— too many to auto-sync. Review verify results manually."
-        )
 
     if task.cancel_requested:
         raise asyncio.CancelledError()
 
-    # Step 3: Clean + Sync
-    cleaned = "\n".join(r["line"] for r in verify_results if r["status"] != "absent")
-    task.progress = {"stage": "syncing", "msg": "Syncing cleaned lyrics…", "step": "syncing", "pct": 50}
+    task.progress = {"stage": "loading", "msg": "Loading Whisper model…", "step": "loading", "pct": 28}
     await _q_broadcast()
-    lines = await _whisper_sync_worker(task, tmp_path, cleaned)
-    task.result   = {"lines": lines, "verify": verify_results, "counts": counts}
-    task.progress = {"stage": "done", "msg": f"Auto done — {len(lines)} lines", "step": "done", "pct": 100}
+
+    # Prefer Faster-Whisper because it can stream decoded segments to the UI.
+    lines = await _faster_stream_transcribe_worker(task, tmp_path)
+    if lines is None:
+        task.progress = {"stage": "transcribing", "msg": "Running full Whisper transcription…", "step": "transcribing", "pct": 30}
+        await _q_broadcast()
+        lines = await _whisper_sync_worker(task, tmp_path, "")
+
+    plain_text = "\n".join(line.get("line", "") for line in lines).strip()
+    task.lyrics = plain_text
+    task.live_lines = []
+    task.result = {
+        "lines": lines,
+        "text": plain_text,
+        "auto_mode": "full-transcription",
+        "word_timing": any(line.get("words") for line in lines),
+    }
+    task.progress = {
+        "stage": "done",
+        "msg": f"Auto complete — transcribed {len(lines)} lines",
+        "step": "done",
+        "pct": 100,
+    }
 
 
 # ── Background processor ──────────────────────────────────────────────────
@@ -693,12 +1258,17 @@ async def _queue_processor() -> None:
                 await _run_transcribe_task(task)
             if task.status in ("running", "cancelling"):   # runner didn't set error/cancelled
                 task.status = "done"
+            if task.status == "done" and task.result and task.result.get("lines"):
+                try:
+                    _store_processed_lyrics(task)
+                except sqlite3.Error as exc:
+                    CONSOLE.print(f"[yellow]Could not save processed lyrics for {task.song_id}: {exc}[/yellow]")
         except asyncio.CancelledError:
             task.status = "cancelled"
         except Exception as exc:
             task.status = "error"
             task.error  = str(exc)
-            print(f"[queue] Task {task.id} failed: {exc}")
+            CONSOLE.print(f"[red]Task {task.id} failed:[/red] {exc}")
         finally:
             _active_task = None
             _task_queue.task_done()
@@ -714,31 +1284,41 @@ async def _queue_processor() -> None:
 # App
 # ---------------------------------------------------------------------------
 def _log_startup_diagnostics() -> None:
-    print(f"[startup] Python: {sys.executable}")
-    print(f"[startup] Device preference: {DEVICE_PREF}")
+    resolved = _get_device(ENGINE_PREF)
+    table = Table(show_header=False, box=None, padding=(0, 2), expand=False)
+    table.add_column(style="dim")
+    table.add_column()
+    table.add_row("Python", sys.executable)
+    table.add_row("Whisper", f"{ENGINE_PREF} · align {ALIGN_MODEL_SIZE} · verify {VERIFY_MODEL_SIZE}")
+    table.add_row("Device", f"{DEVICE_PREF} → {resolved}")
+
     try:
         import torch
-        cuda_available = torch.cuda.is_available()
-        print(f"[startup] torch {torch.__version__} (CUDA build: {torch.version.cuda or 'none — CPU-only wheel'})")
-        print(f"[startup] torch.cuda.is_available(): {cuda_available}")
-        if cuda_available:
-            print(f"[startup] GPU: {torch.cuda.get_device_name(0)}")
-            if not _cuda_usable():
-                print("[startup] This GPU's compute capability isn't supported by the installed "
-                      "PyTorch build, so Whisper will run on CPU instead. This usually means the "
-                      "GPU is too old for the CUDA build launch.py installed — no fix available "
-                      "besides using CPU or a newer GPU.")
-        elif DEVICE_PREF == "cuda":
-            print("[startup] Device preference is 'cuda' but CUDA isn't available from this "
-                  "interpreter — Whisper will fall back to CPU. If you expected GPU here, "
-                  "make sure the server was started via start.bat / launch.py so it's using "
-                  "the project's .venv (not some other Python on PATH).")
-    except Exception as e:
-        print(f"[startup] Could not inspect torch/CUDA: {e}")
+        torch_cuda = torch.version.cuda or "CPU-only"
+        torch_ok = _torch_cuda_usable()
+        table.add_row("PyTorch", f"{torch.__version__} · CUDA build {torch_cuda} · usable: {'yes' if torch_ok else 'no'}")
+        if torch.cuda.is_available():
+            table.add_row("Torch GPU", torch.cuda.get_device_name(0))
+    except Exception as exc:
+        table.add_row("PyTorch", f"unavailable ({exc})")
+
+    try:
+        import ctranslate2
+        ct2_count = ctranslate2.get_cuda_device_count()
+        table.add_row("CTranslate2", f"{ctranslate2.__version__} · CUDA GPUs: {ct2_count}")
+    except Exception as exc:
+        table.add_row("CTranslate2", f"unavailable ({exc})")
+
+    table.add_row("Lyrics DB", str(DB_PATH))
+    CONSOLE.print("[bold magenta]WRLD Sync backend[/bold magenta]")
+    CONSOLE.print(table)
+
+
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _init_db()
     _log_startup_diagnostics()
     global _q_cond
     _q_cond = asyncio.Condition()
@@ -783,7 +1363,142 @@ async def search(q: str, page_size: int = 20):
 
 @app.get("/api/song/{song_id}")
 async def get_song(song_id: int):
-    return await jw_get(f"/songs/{song_id}/")
+    song = await jw_get(f"/songs/{song_id}/")
+    cached = _get_processed_lyrics(song_id)
+    if cached:
+        song["_local_processed"] = cached
+    return song
+
+
+@app.get("/api/processed/{song_id}")
+async def get_processed(song_id: int):
+    cached = _get_processed_lyrics(song_id)
+    if not cached:
+        raise HTTPException(404, "No locally processed lyrics stored for this song.")
+    return cached
+
+
+@app.delete("/api/processed/{song_id}")
+async def delete_processed(song_id: int):
+    with _db_connect() as conn:
+        cur = conn.execute("DELETE FROM processed_lyrics WHERE song_id = ?", (int(song_id),))
+    return {"deleted": cur.rowcount > 0}
+
+
+class ProcessedSaveRequest(BaseModel):
+    song_name: str = ""
+    source_type: str = "manual"
+    lyrics: str = ""
+    lines: list[dict]
+    ttml: str = ""
+    settings: dict = Field(default_factory=dict)
+
+
+@app.post("/api/processed/{song_id}")
+async def save_processed(song_id: int, req: ProcessedSaveRequest):
+    if song_id <= 0:
+        raise HTTPException(400, "A catalog song ID is required for persistent processed lyrics.")
+    lines = _sanitize_timed_lines(req.lines)
+    if not lines:
+        raise HTTPException(400, "No timed lyric lines to save.")
+    ttml = req.ttml.strip()
+    if not ttml:
+        ttml, _ = _build_ttml(
+            lines,
+            word_timing=bool(req.settings.get("word_timing", True)),
+            detect_interludes=bool(req.settings.get("detect_interludes", True)),
+            inline_parenthetical_background=bool(req.settings.get("inline_parenthetical_background", True)),
+        )
+    settings = {
+        "task_type": req.source_type or "manual",
+        "engine": ENGINE_PREF,
+        "device_pref": DEVICE_PREF,
+        "resolved_device": _get_device(ENGINE_PREF),
+        "align_model": ALIGN_MODEL_SIZE,
+        "verify_model": VERIFY_MODEL_SIZE,
+        **dict(req.settings or {}),
+    }
+    now = time.time()
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO processed_lyrics (
+                song_id, song_name, source_type, lyrics_text, synced_lines_json,
+                ttml, settings_json, processed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(song_id) DO UPDATE SET
+                song_name=excluded.song_name, source_type=excluded.source_type,
+                lyrics_text=excluded.lyrics_text, synced_lines_json=excluded.synced_lines_json,
+                ttml=excluded.ttml, settings_json=excluded.settings_json, updated_at=excluded.updated_at
+            """,
+            (int(song_id), req.song_name, req.source_type, req.lyrics,
+             json.dumps(lines, ensure_ascii=False), ttml, json.dumps(settings, ensure_ascii=False), now, now),
+        )
+    return _get_processed_lyrics(song_id)
+
+
+@app.get("/api/local/processed/{track_hash}")
+async def get_local_processed(track_hash: str):
+    cached = _get_local_processed(track_hash)
+    if not cached:
+        raise HTTPException(404, "No processed lyrics stored for this local track.")
+    return cached
+
+
+@app.delete("/api/local/processed/{track_hash}")
+async def delete_local_processed(track_hash: str):
+    track_hash = track_hash.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", track_hash):
+        raise HTTPException(400, "Invalid local track hash.")
+    with _db_connect() as conn:
+        cur = conn.execute("DELETE FROM local_processed_lyrics WHERE track_hash = ?", (track_hash,))
+    return {"deleted": cur.rowcount > 0}
+
+
+@app.post("/api/local/processed/{track_hash}")
+async def save_local_processed(track_hash: str, req: ProcessedSaveRequest):
+    track_hash = track_hash.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", track_hash):
+        raise HTTPException(400, "Invalid local track hash.")
+    if not _get_local_track(track_hash):
+        raise HTTPException(404, "Local track is not registered.")
+    lines = _sanitize_timed_lines(req.lines)
+    if not lines:
+        raise HTTPException(400, "No timed lyric lines to save.")
+    ttml = req.ttml.strip()
+    if not ttml:
+        ttml, _ = _build_ttml(
+            lines,
+            word_timing=bool(req.settings.get("word_timing", True)),
+            detect_interludes=bool(req.settings.get("detect_interludes", True)),
+            inline_parenthetical_background=bool(req.settings.get("inline_parenthetical_background", True)),
+        )
+    settings = {
+        "task_type": req.source_type or "manual",
+        "engine": ENGINE_PREF,
+        "device_pref": DEVICE_PREF,
+        "resolved_device": _get_device(ENGINE_PREF),
+        "align_model": ALIGN_MODEL_SIZE,
+        "verify_model": VERIFY_MODEL_SIZE,
+        **dict(req.settings or {}),
+    }
+    now = time.time()
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO local_processed_lyrics (
+                track_hash, track_name, source_type, lyrics_text, synced_lines_json,
+                ttml, settings_json, processed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(track_hash) DO UPDATE SET
+                track_name=excluded.track_name, source_type=excluded.source_type,
+                lyrics_text=excluded.lyrics_text, synced_lines_json=excluded.synced_lines_json,
+                ttml=excluded.ttml, settings_json=excluded.settings_json, updated_at=excluded.updated_at
+            """,
+            (track_hash, req.song_name, req.source_type, req.lyrics,
+             json.dumps(lines, ensure_ascii=False), ttml, json.dumps(settings, ensure_ascii=False), now, now),
+        )
+    return _get_local_processed(track_hash)
 
 
 @app.get("/api/songs/all")
@@ -886,6 +1601,8 @@ async def get_model_info():
         "align_model":   ALIGN_MODEL_SIZE,
         "verify_model":  VERIFY_MODEL_SIZE,
         "device_pref":   DEVICE_PREF,
+        "engine":        ENGINE_PREF,
+        "engines":       WHISPER_ENGINES,
         "device":        avail_device,
         "align_loaded":  _align_model is not None,
         "verify_loaded": _verify_model is not None,
@@ -895,10 +1612,19 @@ async def get_model_info():
 
 @app.post("/api/model")
 async def set_model(body: dict):
-    global ALIGN_MODEL_SIZE, VERIFY_MODEL_SIZE, DEVICE_PREF
+    global ALIGN_MODEL_SIZE, VERIFY_MODEL_SIZE, DEVICE_PREF, ENGINE_PREF
     global _align_model, _verify_model
 
     changed_device = False
+    changed_engine = False
+
+    if "engine" in body:
+        engine = str(body["engine"]).strip()
+        if engine not in WHISPER_ENGINES:
+            raise HTTPException(400, f"engine must be one of: {', '.join(WHISPER_ENGINES)}")
+        ENGINE_PREF = engine
+        _write_pref(".engine_pref", engine)
+        changed_engine = True
 
     if "device_pref" in body:
         pref = body["device_pref"].strip()
@@ -925,14 +1651,14 @@ async def set_model(body: dict):
         _verify_model = None
         _write_pref(".model_pref_verify", name)
 
-    if changed_device:
-        _align_model  = None   # force reload on new device
-        _verify_model = None
+    if changed_device or changed_engine:
+        _release_models()
 
     return {
         "align_model":   ALIGN_MODEL_SIZE,
         "verify_model":  VERIFY_MODEL_SIZE,
         "device_pref":   DEVICE_PREF,
+        "engine":        ENGINE_PREF,
         "device":        "cuda" if _cuda_usable() else "cpu",
         "align_loaded":  _align_model is not None,
         "verify_loaded": _verify_model is not None,
@@ -1037,11 +1763,273 @@ def _verify_lines(lyric_lines: list[str], transcription: str) -> list[dict]:
     return results
 
 
+TTML_NS = "http://www.w3.org/ns/ttml"
+TTM_NS = "http://www.w3.org/ns/ttml#metadata"
+ITUNES_NS = "http://music.apple.com/lyric-ttml-internal"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+
+def _ttml_time(value: float) -> str:
+    value = max(0.0, float(value))
+    hours = int(value // 3600)
+    minutes = int((value % 3600) // 60)
+    seconds = value % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _sanitize_timed_lines(
+    lines: list[dict],
+    min_duration: float = 0.001,
+    *,
+    inline_parenthetical_background: bool = True,
+) -> list[dict]:
+    """Validate timestamps without squeezing genuine silence out of them.
+
+    Stable-ts/CTranslate2 can intentionally leave short or long gaps between
+    words. Those gaps are meaningful, so TTML/Whisper timing is preserved as
+    measured instead of forcing every word to touch the next one. The 1 ms
+    non-overlap workaround is now confined to the legacy LRC parser in the UI.
+    """
+    cleaned: list[dict] = []
+    min_duration = max(0.0001, float(min_duration))
+
+    for raw in lines:
+        text = str(raw.get("line", ""))
+        start = max(0.0, _safe_float(raw.get("start")))
+        candidate_end = _safe_float(raw.get("end"), start + 0.5)
+
+        valid_words: list[dict] = []
+        in_parenthetical_bg = False
+        stripped_line = text.strip()
+        whole_line_parenthetical = len(stripped_line) >= 2 and stripped_line.startswith("(") and stripped_line.endswith(")")
+        for raw_word in list(raw.get("words") or []):
+            raw_text = str(raw_word.get("text") or raw_word.get("word") or "")
+            word_text = str(raw_word.get("word") or raw_text).strip()
+            if not word_text:
+                continue
+            word_start = max(0.0, _safe_float(raw_word.get("start"), start))
+            word_end = _safe_float(raw_word.get("end"), word_start + min_duration)
+            if word_end <= word_start:
+                word_end = word_start + min_duration
+
+            # Apple TTML supports inset background vocals with ttm:role="x-bg".
+            # Keep an explicit imported flag when present, otherwise use the
+            # common lyric convention where parenthesized ad-libs/backgrounds
+            # are background vocals. This is only presentation metadata and
+            # does not alter the model's timestamps.
+            explicit_bg = raw_word.get("background")
+            existing_source = str(raw_word.get("background_source") or "")
+            opens_bg = "(" in word_text
+            closes_bg = ")" in word_text
+
+            if existing_source == "explicit":
+                background = bool(explicit_bg)
+                background_source = "explicit" if background else ""
+            elif existing_source == "parenthetical-line":
+                background = bool(explicit_bg)
+                background_source = "parenthetical-line" if background else ""
+            elif existing_source == "parenthetical-inline":
+                background = bool(explicit_bg)
+                background_source = "parenthetical-inline" if background else ""
+            elif explicit_bg is not None:
+                # Older cached/imported words may have a boolean but no source.
+                # Inline parentheses are treated as auto-detected; standalone
+                # parenthetical lines remain background regardless of the toggle.
+                if whole_line_parenthetical:
+                    background = bool(explicit_bg)
+                    background_source = "parenthetical-line" if background else ""
+                elif "(" in text and ")" in text:
+                    background = bool(explicit_bg)
+                    background_source = "parenthetical-inline" if background else ""
+                else:
+                    background = bool(explicit_bg)
+                    background_source = "explicit" if background else ""
+            elif whole_line_parenthetical:
+                background = True
+                background_source = "parenthetical-line"
+            else:
+                background = in_parenthetical_bg or opens_bg
+                background_source = "parenthetical-inline" if background else ""
+
+            item = {
+                "word": word_text,
+                "text": raw_text or word_text,
+                "start": word_start,
+                "end": word_end,
+                "background": background,
+                "background_source": background_source,
+            }
+            if "probability" in raw_word:
+                item["probability"] = raw_word["probability"]
+            valid_words.append(item)
+
+            if explicit_bg is None and not whole_line_parenthetical:
+                if opens_bg and not closes_bg:
+                    in_parenthetical_bg = True
+                if closes_bg:
+                    in_parenthetical_bg = False
+
+        # A line must contain its timed spans. Extend the paragraph boundary if
+        # model rounding put the first/last word a few ms outside the segment.
+        if valid_words:
+            start = min(start, min(w["start"] for w in valid_words))
+            candidate_end = max(candidate_end, max(w["end"] for w in valid_words))
+
+        end = candidate_end if candidate_end > start else start + min_duration
+        cleaned.append({
+            "line": text,
+            "start": start,
+            "end": end,
+            "words": valid_words,
+        })
+
+    return cleaned
+
+
+def _build_ttml(
+    lines: list[dict],
+    *,
+    word_timing: bool = False,
+    detect_interludes: bool = True,
+    inline_parenthetical_background: bool = True,
+    interlude_threshold: float = 2.0,
+    language: str = "en",
+) -> tuple[str, bool]:
+    lines = _sanitize_timed_lines(
+        lines, inline_parenthetical_background=inline_parenthetical_background
+    )
+    if not lines:
+        raise ValueError("No timed lyric lines to encode.")
+
+    # Apple expects every lyric line to use timed spans when Word mode is
+    # declared. Imported LRC has no real word data, so remain line-timed rather
+    # than inventing fake word timing.
+    use_word_timing = bool(word_timing) and all(line["words"] for line in lines if line["line"].strip())
+
+    ET.register_namespace("", TTML_NS)
+    ET.register_namespace("itunes", ITUNES_NS)
+    ET.register_namespace("ttm", TTM_NS)
+
+    tt = ET.Element(
+        f"{{{TTML_NS}}}tt",
+        {
+            f"{{{ITUNES_NS}}}timing": "Word" if use_word_timing else "Line",
+            f"{{{XML_NS}}}lang": language or "en",
+        },
+    )
+    body = ET.SubElement(tt, f"{{{TTML_NS}}}body")
+
+    def new_lyric_div(line: dict):
+        return ET.SubElement(body, f"{{{TTML_NS}}}div", {
+            "begin": _ttml_time(line["start"]),
+            "end": _ttml_time(line["end"]),
+        })
+
+    def add_word_span(parent, word: dict):
+        span = ET.SubElement(parent, f"{{{TTML_NS}}}span", {
+            "begin": _ttml_time(word["start"]),
+            "end": _ttml_time(word["end"]),
+        })
+        span.text = word["word"]
+        return span
+
+    def effective_background(line: dict, word: dict) -> bool:
+        if not word.get("background"):
+            return False
+        source = str(word.get("background_source") or "")
+        if source == "explicit":
+            return True
+        if source == "parenthetical-line":
+            return True
+        if source == "parenthetical-inline":
+            return bool(inline_parenthetical_background)
+        line_text = str(line.get("line") or "").strip()
+        whole_line = len(line_text) >= 2 and line_text.startswith("(") and line_text.endswith(")")
+        if not whole_line and "(" in line_text and ")" in line_text:
+            return bool(inline_parenthetical_background)
+        return True
+
+    def add_line(div, line: dict, block_end: float | None = None) -> None:
+        # Overlapping lines can end out of order. A parent lyric div must remain
+        # active through the latest child end, never shrink to a shorter newer line.
+        div.set("end", _ttml_time(max(line["end"], block_end if block_end is not None else line["end"])))
+        p = ET.SubElement(div, f"{{{TTML_NS}}}p", {
+            "begin": _ttml_time(line["start"]),
+            "end": _ttml_time(line["end"]),
+        })
+        if use_word_timing and line["line"].strip():
+            i = 0
+            while i < len(line["words"]):
+                word = line["words"][i]
+                if effective_background(line, word):
+                    # Apple background vocals are represented by an untimed
+                    # x-bg wrapper containing the real timed word/beat spans.
+                    bg = ET.SubElement(p, f"{{{TTML_NS}}}span", {
+                        f"{{{TTM_NS}}}role": "x-bg",
+                    })
+                    while i < len(line["words"]) and effective_background(line, line["words"][i]):
+                        child = add_word_span(bg, line["words"][i])
+                        i += 1
+                        if i < len(line["words"]) and line["words"][i].get("background"):
+                            child.tail = " "
+                    if i < len(line["words"]):
+                        bg.tail = " "
+                    continue
+
+                span = add_word_span(p, word)
+                i += 1
+                if i < len(line["words"]):
+                    span.tail = " "
+        else:
+            p.text = line["line"]
+
+    threshold = max(0.0, float(interlude_threshold))
+    lyric_div = new_lyric_div(lines[0])
+    active_block_end = lines[0]["end"]
+    for i, line in enumerate(lines):
+        active_block_end = max(active_block_end, line["end"])
+        add_line(lyric_div, line, active_block_end)
+        if not detect_interludes or i + 1 >= len(lines):
+            continue
+
+        nxt = lines[i + 1]
+        gap_start = active_block_end
+        gap_end = nxt["start"]
+        if gap_end - gap_start >= threshold:
+            # Apple explicitly defines Instrumental as a song-part value. Start
+            # only after every overlapping foreground/background vocal has ended.
+            ET.SubElement(body, f"{{{TTML_NS}}}div", {
+                "begin": _ttml_time(gap_start),
+                "end": _ttml_time(gap_end),
+                f"{{{ITUNES_NS}}}song-part": "Instrumental",
+            })
+            lyric_div = new_lyric_div(nxt)
+            active_block_end = nxt["end"]
+
+    # Pretty indentation inside word-timed <p> elements would introduce
+    # untimed whitespace nodes between child spans, so keep Word TTML compact.
+    if not use_word_timing:
+        ET.indent(tt, space="  ")
+    return ET.tostring(tt, encoding="unicode"), use_word_timing
+
+
 class ProposeRequest(BaseModel):
     song_id: int
     lines: list[dict]
     token: str
-    plain_lyrics: str = ""   # optional; if set, included alongside synced_lyrics
+    plain_lyrics: str = ""
+    word_timing: bool = False
+    detect_interludes: bool = True
+    inline_parenthetical_background: bool = True
+    allow_overlapping_lyrics: bool = False
+    interlude_threshold: float = 2.0
 
 
 @app.post("/api/propose")
@@ -1049,14 +2037,15 @@ async def propose_lyrics(req: ProposeRequest):
     if not req.token:
         raise HTTPException(401, "No auth token provided.")
 
-    # Build LRC string from lines
-    lrc_parts = []
-    for line in req.lines:
-        start = line.get("start", 0)
-        m = int(start // 60)
-        s = start % 60
-        lrc_parts.append(f"[{m}:{s:05.2f}] {line.get('line', '')}")
-    lrc = "\n".join(lrc_parts)
+    # TTML is the canonical synced-lyrics format. It retains real line end
+    # times and, when available/enabled, stable-ts per-word timings.
+    ttml, used_word_timing = _build_ttml(
+        req.lines,
+        word_timing=req.word_timing,
+        detect_interludes=req.detect_interludes,
+        inline_parenthetical_background=req.inline_parenthetical_background,
+        interlude_threshold=req.interlude_threshold,
+    )
 
     # Fetch song name for the proposal title
     song = await jw_get(f"/songs/{req.song_id}/")
@@ -1074,9 +2063,9 @@ async def propose_lyrics(req: ProposeRequest):
                 "change_type": "update",
                 "song": req.song_id,
                 "title": song.get("name", str(req.song_id)),
-                "editor_notes": "Synced lyrics generated with WRLD Sync",
+                "editor_notes": f"Synced lyrics generated with WRLD Sync (Apple TTML, {'word' if used_word_timing else 'line'} timing)",
                 "proposed_data": {
-                    "synced_lyrics": lrc,
+                    "synced_lyrics": ttml,
                     **({"lyrics": req.plain_lyrics} if req.plain_lyrics.strip() else {}),
                 },
             },
@@ -1195,12 +2184,13 @@ async def verify_lyrics_audio(req: VerifyRequest):
             yield sse({"stage": "transcribing", "pct": 0, "msg": "Transcribing audio (free pass)…"})
             loop = asyncio.get_event_loop()
             spy = _ProgressSpy()
+            spy.silent = True
 
             def _run_verify():
                 orig = sys.stderr
                 sys.stderr = _TeeStderr(spy, orig)
                 try:
-                    return model.transcribe(tmp_path, verbose=False)
+                    return model.transcribe(tmp_path, verbose=False, word_timestamps=False, suppress_silence=False, regroup=False)
                 finally:
                     sys.stderr = orig
 
@@ -1282,6 +2272,7 @@ async def sync_lyrics(req: SyncRequest):
             label = "Aligning lyrics to audio" if lyrics else "Transcribing audio"
             loop = asyncio.get_event_loop()
             spy = _ProgressSpy()
+            spy.silent = True
 
             def _run_sync():
                 orig = sys.stderr
@@ -1328,18 +2319,243 @@ async def sync_lyrics(req: SyncRequest):
 
 
 # ---------------------------------------------------------------------------
-# Local file upload
+# Local audio files / URLs
 # ---------------------------------------------------------------------------
+
+def _duration_label(seconds: float) -> str:
+    seconds = max(0, int(round(float(seconds or 0))))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def _audio_content_hash(path: pathlib.Path) -> str:
+    """SHA-256 decoded audio only, excluding tags, artwork, and container metadata."""
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0",
+        "-vn", "-sn", "-dn", "-map_metadata", "-1",
+        "-ac", "2", "-ar", "48000", "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    digest = hashlib.sha256()
+    assert proc.stdout is not None
+    while True:
+        chunk = proc.stdout.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+    code = proc.wait()
+    if code != 0:
+        raise ValueError(f"Could not decode audio for hashing: {stderr.strip() or 'ffmpeg failed'}")
+    return digest.hexdigest()
+
+
+def _read_local_metadata(path: pathlib.Path, fallback_name: str) -> dict:
+    title = path.stem
+    artist = "Unknown artist"
+    duration = 0.0
+    cover_blob = None
+    cover_mime = ""
+    try:
+        from mutagen import File as MutagenFile
+
+        easy = MutagenFile(path, easy=True)
+        if easy is not None:
+            if getattr(easy, "info", None) is not None:
+                duration = float(getattr(easy.info, "length", 0.0) or 0.0)
+            tags = getattr(easy, "tags", None) or {}
+            raw_title = tags.get("title") or []
+            raw_artist = tags.get("artist") or []
+            if raw_title:
+                title = str(raw_title[0]).strip() or title
+            if raw_artist:
+                artist = str(raw_artist[0]).strip() or artist
+
+        raw = MutagenFile(path, easy=False)
+        if raw is not None:
+            if not duration and getattr(raw, "info", None) is not None:
+                duration = float(getattr(raw.info, "length", 0.0) or 0.0)
+            tags = getattr(raw, "tags", None)
+            if tags is not None:
+                # ID3 / MP3
+                getall = getattr(tags, "getall", None)
+                if callable(getall):
+                    pics = getall("APIC")
+                    if pics:
+                        cover_blob = bytes(pics[0].data)
+                        cover_mime = str(getattr(pics[0], "mime", "") or "image/jpeg")
+                # MP4/M4A
+                if cover_blob is None and hasattr(tags, "get"):
+                    covers = tags.get("covr") or []
+                    if covers:
+                        cover_blob = bytes(covers[0])
+                        imageformat = getattr(covers[0], "imageformat", None)
+                        cover_mime = "image/png" if imageformat == 14 else "image/jpeg"
+            # FLAC
+            pictures = getattr(raw, "pictures", None) or []
+            if cover_blob is None and pictures:
+                cover_blob = bytes(pictures[0].data)
+                cover_mime = str(getattr(pictures[0], "mime", "") or "image/jpeg")
+    except Exception as exc:
+        CONSOLE.print(f"[yellow]Could not read tags for {_display_name(fallback_name)}: {exc}[/yellow]")
+
+    if not duration:
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+                capture_output=True, text=True, timeout=15,
+            )
+            if probe.returncode == 0:
+                duration = float(probe.stdout.strip() or 0.0)
+        except Exception:
+            pass
+
+    return {
+        "title": title or pathlib.Path(fallback_name).stem or "Local audio",
+        "artist": artist or "Unknown artist",
+        "duration": max(0.0, duration),
+        "cover_blob": cover_blob,
+        "cover_mime": cover_mime,
+    }
+
+
+def _register_local_track(path: pathlib.Path, original_name: str, source_url: str = "") -> dict:
+    track_hash = _audio_content_hash(path)
+    meta = _read_local_metadata(path, original_name)
+    now = time.time()
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO local_tracks (
+                track_hash, original_name, source_url, file_path, title, artist,
+                duration, cover_mime, cover_blob, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(track_hash) DO UPDATE SET
+                original_name=excluded.original_name,
+                source_url=CASE WHEN excluded.source_url != '' THEN excluded.source_url ELSE local_tracks.source_url END,
+                file_path=excluded.file_path, title=excluded.title, artist=excluded.artist,
+                duration=excluded.duration, cover_mime=excluded.cover_mime,
+                cover_blob=COALESCE(excluded.cover_blob, local_tracks.cover_blob), updated_at=excluded.updated_at
+            """,
+            (
+                track_hash, original_name, source_url, str(path), meta["title"], meta["artist"],
+                meta["duration"], meta["cover_mime"], meta["cover_blob"], now, now,
+            ),
+        )
+    return {
+        "track_hash": track_hash,
+        "path": str(path),
+        "name": original_name,
+        "title": meta["title"],
+        "artist": meta["artist"],
+        "duration": meta["duration"],
+        "duration_label": _duration_label(meta["duration"]),
+        "category": "local_file",
+        "cover_url": f"/api/local/{track_hash}/cover" if meta["cover_blob"] else "",
+        "audio_url": f"/api/local/{track_hash}/audio",
+        "processed": _get_local_processed(track_hash),
+    }
+
 
 @app.post("/api/upload")
 async def upload_audio(file: UploadFile = File(...)):
-    """Accept a local audio file, save it to UPLOAD_DIR, return the server path."""
+    """Accept local audio, register it by decoded-audio hash, and return tags/artwork."""
     suffix = pathlib.Path(file.filename or "audio").suffix or ".mp3"
-    uid    = str(uuid.uuid4())[:8]
-    dest   = UPLOAD_DIR / f"{uid}{suffix}"
-    contents = await file.read()
-    dest.write_bytes(contents)
-    return {"path": str(dest), "name": file.filename or "local file"}
+    uid = str(uuid.uuid4())[:8]
+    dest = UPLOAD_DIR / f"{uid}{suffix}"
+    try:
+        with dest.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                out.write(chunk)
+        return await asyncio.to_thread(_register_local_track, dest, file.filename or "local file", "")
+    except ValueError as exc:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(400, str(exc))
+    except Exception:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+class LocalUrlRequest(BaseModel):
+    url: str
+
+
+@app.post("/api/local-url")
+async def load_local_url(req: LocalUrlRequest):
+    url = req.url.strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(400, "Enter a valid http:// or https:// audio URL.")
+
+    name = urllib.parse.unquote(pathlib.PurePosixPath(parsed.path).name) or "remote-audio"
+    suffix = pathlib.Path(name).suffix
+    uid = str(uuid.uuid4())[:8]
+    dest = UPLOAD_DIR / f"{uid}{suffix or '.audio'}"
+    max_bytes = 2 * 1024 * 1024 * 1024
+    downloaded = 0
+    try:
+        timeout = httpx.Timeout(30.0, read=180.0, write=30.0, pool=30.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                disposition = response.headers.get("content-disposition", "")
+                match = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", disposition, re.I)
+                if match:
+                    name = urllib.parse.unquote(match.group(1).strip())
+                content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if not suffix:
+                    suffix = mimetypes.guess_extension(content_type) or ".audio"
+                    renamed = dest.with_suffix(suffix)
+                    dest = renamed
+                with dest.open("wb") as out:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            raise HTTPException(413, "Remote audio is larger than the 2 GB local-file limit.")
+                        out.write(chunk)
+        return await asyncio.to_thread(_register_local_track, dest, name, url)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+    except httpx.HTTPStatusError as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(exc.response.status_code, f"Audio URL returned HTTP {exc.response.status_code}.")
+    except httpx.HTTPError as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(502, f"Could not download that audio URL: {exc}")
+    except ValueError as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, str(exc))
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
+
+
+@app.get("/api/local/{track_hash}/cover")
+async def local_cover(track_hash: str):
+    row = _get_local_track(track_hash, include_cover=True)
+    if not row or not row.get("cover_blob"):
+        raise HTTPException(404, "No embedded cover art for this track.")
+    return Response(content=row["cover_blob"], media_type=row.get("cover_mime") or "image/jpeg", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/api/local/{track_hash}/audio")
+async def local_audio(track_hash: str):
+    row = _get_local_track(track_hash)
+    if not row:
+        raise HTTPException(404, "Local track not found.")
+    path = pathlib.Path(row["file_path"])
+    if not path.is_file():
+        raise HTTPException(404, "The temporary local audio file is no longer available. Re-open it to restore playback.")
+    media_type = mimetypes.guess_type(row.get("original_name") or path.name)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type)
 
 
 # ---------------------------------------------------------------------------
@@ -1352,6 +2568,13 @@ class QueueAddRequest(BaseModel):
     song_name: str
     lyrics: str = ""
     local_path: str = ""  # set when syncing a local file instead of an API song
+    local_hash: str = ""  # decoded-audio SHA-256 for local persistence/task matching
+    fast_auto: bool = False  # legacy compatibility only; Auto is always a full transcription
+    word_timing: bool = True
+    detect_interludes: bool = True
+    inline_parenthetical_background: bool = True
+    allow_overlapping_lyrics: bool = False
+    interlude_threshold: float = 2.0
 
 
 @app.post("/api/queue")
@@ -1365,6 +2588,13 @@ async def queue_add(req: QueueAddRequest):
         song_name=req.song_name,
         lyrics=req.lyrics,
         local_path=req.local_path,
+        local_hash=req.local_hash.strip().lower(),
+        fast_auto=req.fast_auto,
+        word_timing=req.word_timing,
+        detect_interludes=req.detect_interludes,
+        inline_parenthetical_background=req.inline_parenthetical_background,
+        allow_overlapping_lyrics=req.allow_overlapping_lyrics,
+        interlude_threshold=max(0.0, req.interlude_threshold),
     )
     _tasks[task.id] = task
     await _task_queue.put(task)
