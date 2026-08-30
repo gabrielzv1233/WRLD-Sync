@@ -786,6 +786,28 @@
   }
   .kl:hover .kl-actions,
   .kl.primary .kl-actions { opacity: 1; }
+  .kl-source-pin {
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    flex: 0 0 auto;
+    transition: color .15s ease, background .15s ease, border-color .15s ease, transform .15s ease;
+  }
+  .kl-source-pin:hover {
+    color: #fff;
+    background: rgba(255,255,255,.07);
+    border-color: rgba(255,255,255,.1);
+    transform: translateY(-1px);
+  }
+  .kl-source-pin:active { transform: translateY(0) scale(.94); }
+  .kl-source-pin svg { width: 13px; height: 13px; pointer-events: none; }
   .kl-time {
     font-size: .65rem;
     font-family: monospace;
@@ -1178,6 +1200,7 @@
   .tc-type-sync  { background: rgba(124,58,237,.25); color: #c4b5fd; }
   .tc-type-verify{ background: rgba(245,158,11,.2);  color: #fcd34d; }
   .tc-type-auto  { background: rgba(34,197,94,.18);  color: #86efac; }
+  .tc-type-model { background: rgba(56,189,248,.16); color: #7dd3fc; }
 
   .tc-name {
     font-size: .82rem;
@@ -2247,7 +2270,7 @@
     <button class="qp-hbtn" id="closeQueueBtn" style="font-size:1rem;padding:1px 8px" type="button" aria-label="Close task queue">×</button>
   </div>
   <div id="queueContent">
-    <div class="qp-empty">No tasks yet — run Auto, Sync, Verify, or Transcribe on a song.</div>
+    <div class="qp-empty">No tasks yet — processing jobs and model downloads will appear here.</div>
   </div>
 </div>
 
@@ -2275,12 +2298,12 @@
     <section class="settings-section">
       <div class="settings-section-head">
         <div class="settings-section-icon" aria-hidden="true"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></div>
-        <div><h3>Whisper</h3><p>Choose the inference engine and models used for transcription and alignment.</p></div>
+        <div><h3>Models</h3><p>Choose separate models for lyric transcription and forced alignment. Missing local models download through the Task Queue.</p></div>
       </div>
       <div class="settings-field-grid">
         <label class="settings-field" for="engineSelect">
-          <span class="settings-field-title">Engine</span>
-          <span class="settings-field-description">Faster-Whisper is recommended for CUDA inference.</span>
+          <span class="settings-field-title">Whisper engine</span>
+          <span class="settings-field-description">Only applies when a Whisper model is selected.</span>
           <span class="settings-select-shell">
             <select id="engineSelect">
               <option value="faster" selected>Faster-Whisper</option>
@@ -2294,33 +2317,48 @@
           <span class="settings-field-description">Used to align loaded lyrics against the song.</span>
           <span class="settings-select-shell">
             <select id="alignModelSelect">
-              <option value="tiny">tiny · fastest</option><option value="base">base · fast</option><option value="small" selected>small · balanced</option><option value="medium">medium · better</option><option value="large">large · great</option><option value="large-v2">large-v2 · best</option><option value="large-v3">large-v3 · best</option>
+              <optgroup label="Whisper">
+                <option value="tiny">Whisper tiny · fastest</option><option value="base">Whisper base · fast</option><option value="small" selected>Whisper small · balanced</option><option value="medium">Whisper medium · better</option><option value="large">Whisper large</option><option value="large-v2">Whisper large-v2</option><option value="large-v3">Whisper large-v3</option>
+              </optgroup>
+              <optgroup label="Qwen">
+                <option value="qwen3-forced-aligner-0.6b" data-managed-model="qwen3-forced-aligner-0.6b" data-base-label="Qwen3 Forced Aligner 0.6B">Qwen3 Forced Aligner 0.6B · download</option>
+              </optgroup>
             </select>
             <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
           </span>
         </label>
         <label class="settings-field" for="verifyModelSelect">
-          <span class="settings-field-title">Verify model</span>
-          <span class="settings-field-description">Used for lyric-presence verification when requested.</span>
+          <span class="settings-field-title">Transcription model</span>
+          <span class="settings-field-description">Used by Auto, Transcribe, and lyric verification.</span>
           <span class="settings-select-shell">
             <select id="verifyModelSelect">
-              <option value="tiny">tiny · fastest</option><option value="base" selected>base · fast</option><option value="small">small · balanced</option><option value="medium">medium · better</option><option value="large">large · great</option><option value="large-v2">large-v2 · best</option><option value="large-v3">large-v3 · best</option>
+              <optgroup label="Whisper">
+                <option value="tiny">Whisper tiny · fastest</option><option value="base" selected>Whisper base · fast</option><option value="small">Whisper small · balanced</option><option value="medium">Whisper medium · better</option><option value="large">Whisper large</option><option value="large-v2">Whisper large-v2</option><option value="large-v3">Whisper large-v3</option>
+              </optgroup>
+              <optgroup label="Qwen · singing/BGM aware">
+                <option value="qwen3-asr-0.6b" data-managed-model="qwen3-asr-0.6b" data-base-label="Qwen3-ASR 0.6B">Qwen3-ASR 0.6B · download</option>
+                <option value="qwen3-asr-1.7b" data-managed-model="qwen3-asr-1.7b" data-base-label="Qwen3-ASR 1.7B">Qwen3-ASR 1.7B · download</option>
+              </optgroup>
+              <optgroup label="NVIDIA">
+                <option value="parakeet-tdt-0.6b-v3" data-managed-model="parakeet-tdt-0.6b-v3" data-base-label="Parakeet TDT 0.6B v3">Parakeet TDT 0.6B v3 · download</option>
+              </optgroup>
             </select>
             <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
           </span>
         </label>
       </div>
+      <div class="settings-status-line"><span id="modelInstallStatus" class="token-status" aria-live="polite"></span></div>
     </section>
 
     <section class="settings-section">
       <div class="settings-section-head settings-section-head-row">
         <div class="settings-section-head-copy">
           <div class="settings-section-icon" aria-hidden="true"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01"/><path d="M7 16h10"/></svg></div>
-          <div><h3>Compute device</h3><p>Choose where Whisper should run. Auto prefers CUDA when available.</p></div>
+          <div><h3>Compute device</h3><p>Choose where local speech models should run. Auto prefers CUDA when available.</p></div>
         </div>
         <span id="modelStatus" class="model-status" aria-live="polite"></span>
       </div>
-      <div class="device-btns" role="group" aria-label="Whisper compute device">
+      <div class="device-btns" role="group" aria-label="Speech model compute device">
         <button class="dev-btn active" data-dev="auto" type="button" aria-pressed="true"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9z"/></svg><span><strong>Auto</strong><small>Best available</small></span></button>
         <button class="dev-btn" data-dev="cuda" type="button" aria-pressed="false"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 9h8v6H8z"/></svg><span><strong>GPU</strong><small>CUDA</small></span></button>
         <button class="dev-btn" data-dev="cpu" type="button" aria-pressed="false"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg><span><strong>CPU</strong><small>Compatibility</small></span></button>
@@ -2470,7 +2508,7 @@
             <button class="tab-btn active" data-tab="karaoke" type="button" role="tab" aria-selected="true" aria-controls="karaokeView">Preview</button>
             <button class="tab-btn" data-tab="plain" type="button" role="tab" aria-selected="false" aria-controls="plainLyricsView">Lyrics</button>
             <button class="tab-btn" data-tab="ttml" type="button" role="tab" aria-selected="false" aria-controls="ttmlView">TTML</button>
-            <span class="shortcuts-hint">↑ ↓ lyrics &nbsp;← → ±1s &nbsp;Space play/pause</span>
+            <span class="shortcuts-hint">↑ ↓ lyrics &nbsp;← → ±1s &nbsp;Space play/pause &nbsp;` auto-scroll</span>
             <div class="shortcuts-info-wrap">
               <button class="icon-btn-sm" id="shortcutsInfoBtn" title="Keyboard shortcuts" type="button" aria-label="Keyboard shortcuts" aria-expanded="false" aria-controls="shortcutsPopover">
                 <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -2485,6 +2523,7 @@
                 <div class="shortcuts-row"><kbd>Shift</kbd>+<kbd>←</kbd><span>Jump to current line start</span></div>
                 <div class="shortcuts-row"><kbd>Shift</kbd>+<kbd>→</kbd><span>Jump to current line end</span></div>
                 <div class="shortcuts-row"><kbd>Space</kbd><span>Play / pause</span></div>
+                <div class="shortcuts-row"><kbd>`</kbd><span>Toggle lyric auto-scroll</span></div>
               </div>
             </div>
           </div>
@@ -2760,6 +2799,7 @@ const inlineParentheticalBgToggle = document.getElementById('inlineParenthetical
 const overlapLyricsToggle = document.getElementById('overlapLyricsToggle');
 const deviceBtns        = document.querySelectorAll('.dev-btn');
 const modelStatus       = document.getElementById('modelStatus');
+const modelInstallStatus = document.getElementById('modelInstallStatus');
 const collapseSidebarBtn = document.getElementById('collapseSidebarBtn');
 const expandSidebarBtn   = document.getElementById('expandSidebarBtn');
 const mainEl             = document.querySelector('main');
@@ -2834,25 +2874,30 @@ emptyFileBtn.addEventListener('click', () => showLocalLanding());
     if (activeTab !== 'karaoke') return;
     if (_lyricsScrollRaf) { cancelAnimationFrame(_lyricsScrollRaf); _lyricsScrollRaf = 0; }
     _lyricsScrollTargetTop = null;
-    if (autoFollow) {
-      autoFollow = false;
-      stopLyricsFollowLoop();
-      resumeFollowBtn.classList.add('visible');
-    }
+    if (autoFollow) setLyricAutoFollow(false);
   }, { passive: true })
 );
-resumeFollowBtn.addEventListener('click', () => {
-  autoFollow = true;
-  resumeFollowBtn.classList.remove('visible');
+function setLyricAutoFollow(enabled, { reanchor = false } = {}) {
+  autoFollow = !!enabled;
+  resumeFollowBtn.classList.toggle('visible', !autoFollow);
+  if (!autoFollow) {
+    if (_lyricsScrollRaf) { cancelAnimationFrame(_lyricsScrollRaf); _lyricsScrollRaf = 0; }
+    _lyricsScrollTargetTop = null;
+    stopLyricsFollowLoop();
+    return;
+  }
   _lyricsFollowKey = '';
   _lyricsFollowHoldKey = '';
   _lyricsFollowHoldUntil = 0;
   startLyricsFollowLoop();
-  // Resume is an explicit request to get the camera back onto playback. Use the
-  // lyric interval closest to the current time and animate there, never teleport.
-  paintKaraokeFrame({ scroll: false });
-  ensureLyricsAutoFollow({ force: true, preferNearest: true });
-});
+  if (reanchor && activeTab === 'karaoke' && syncedLines.length) {
+    // Re-enabling follow is an explicit camera request. Animate to the active or
+    // closest timed lyric rather than snapping there.
+    paintKaraokeFrame({ scroll: false });
+    ensureLyricsAutoFollow({ force: true, preferNearest: true });
+  }
+}
+resumeFollowBtn.addEventListener('click', () => setLyricAutoFollow(true, { reanchor: true }));
 
 // ── Random filter popover ─────────────────────────────────────────────────
 randomFilterBtn.addEventListener('click', (e) => {
@@ -3244,7 +3289,195 @@ function effectiveWordBackground(line, word) {
   return true;
 }
 
+function normalizeLyricReference(text) {
+  return String(text ?? '')
+    .toLowerCase()
+    .replace(/[’‘]/g, "'")
+    .replace(/[^a-z0-9' ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function rawLyricEntries(text = plainLyricsText.value) {
+  let offset = 0;
+  return String(text ?? '').split('\n').map((raw, index) => {
+    const entry = { index, raw, text: raw.trim(), offset };
+    offset += raw.length + 1;
+    return entry;
+  });
+}
+
+function attachMissingLyricSourceReferences(lines, rawText = plainLyricsText.value) {
+  const raw = rawLyricEntries(rawText).filter(x => x.text);
+  if (!raw.length || !Array.isArray(lines) || !lines.length) return lines;
+
+  // If the two views have the same non-empty line count and still resemble one
+  // another, ordinal mapping is the strongest signal. This is the common
+  // Auto/Sync case and survives later Preview edits because refs are fill-once.
+  if (raw.length === lines.length) {
+    const exact = lines.reduce((n, line, i) =>
+      n + (normalizeLyricReference(line.line) === normalizeLyricReference(raw[i].text) ? 1 : 0), 0);
+    const avgSimilarity = lines.reduce((sum, line, i) =>
+      sum + lyricReferenceSimilarity(line.line, raw[i].text), 0) / Math.max(1, lines.length);
+    if (exact >= Math.max(1, Math.ceil(lines.length * .45)) || avgSimilarity >= .62) {
+      lines.forEach((line, i) => {
+        if (!Number.isInteger(line.source_line_index)) line.source_line_index = raw[i].index;
+        if (!line.source_line_text) line.source_line_text = raw[i].text;
+      });
+      return lines;
+    }
+  }
+
+  let cursor = 0;
+  lines.forEach((line, i) => {
+    if (Number.isInteger(line.source_line_index) && line.source_line_text) return;
+    const wanted = normalizeLyricReference(line.line);
+    if (!wanted) return;
+
+    let match = -1;
+    for (let j = cursor; j < raw.length; j++) {
+      if (normalizeLyricReference(raw[j].text) === wanted) { match = j; break; }
+    }
+    if (match < 0) match = raw.findIndex(x => normalizeLyricReference(x.text) === wanted);
+    if (match < 0) return;
+    line.source_line_index = raw[match].index;
+    line.source_line_text = raw[match].text;
+    cursor = Math.max(cursor, match + 1);
+  });
+  return lines;
+}
+
+function lyricReferenceSimilarity(a, b) {
+  a = normalizeLyricReference(a); b = normalizeLyricReference(b);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const aa = new Set(a.split(' ').filter(Boolean));
+  const bb = new Set(b.split(' ').filter(Boolean));
+  let common = 0;
+  aa.forEach(x => { if (bb.has(x)) common++; });
+  const union = new Set([...aa, ...bb]).size || 1;
+  const tokenScore = common / union;
+  const prefix = (() => {
+    const n = Math.min(a.length, b.length); let i = 0;
+    while (i < n && a[i] === b[i]) i++;
+    return i / Math.max(a.length, b.length);
+  })();
+  return tokenScore * .82 + prefix * .18;
+}
+
+function resolveRawLyricReference(previewIndex) {
+  const line = syncedLines[previewIndex];
+  if (!line) return null;
+  const entries = rawLyricEntries();
+  if (!entries.length) return null;
+  const nonempty = entries.filter(x => x.text);
+  const storedIndex = Number.isInteger(line.source_line_index) ? line.source_line_index : -1;
+  const storedText = String(line.source_line_text ?? '').trim();
+  const previewText = String(line.line ?? '').trim();
+
+  // Best case: the originally referenced line is still there and still looks
+  // like the source text we recorded.
+  if (storedIndex >= 0 && entries[storedIndex]?.text) {
+    const now = normalizeLyricReference(entries[storedIndex].text);
+    if (!storedText || now === normalizeLyricReference(storedText)) return entries[storedIndex];
+  }
+
+  // Raw Lyrics may have had lines inserted/deleted. Find the original text in
+  // its new location, preferring the occurrence nearest the old index.
+  const exactNeedles = [storedText, previewText].map(normalizeLyricReference).filter(Boolean);
+  for (const needle of exactNeedles) {
+    const matches = nonempty.filter(x => normalizeLyricReference(x.text) === needle);
+    if (matches.length) {
+      matches.sort((a, b) => Math.abs(a.index - storedIndex) - Math.abs(b.index - storedIndex));
+      return matches[0];
+    }
+  }
+
+  // Last resort for edited text: fuzzy word overlap, with a small positional
+  // bias so repeated choruses resolve near the line they originally belonged to.
+  let best = null, bestScore = 0;
+  for (const entry of nonempty) {
+    const textScore = Math.max(
+      lyricReferenceSimilarity(storedText, entry.text),
+      lyricReferenceSimilarity(previewText, entry.text),
+    );
+    const distancePenalty = storedIndex >= 0 ? Math.min(.12, Math.abs(entry.index - storedIndex) * .003) : 0;
+    const score = textScore - distancePenalty;
+    if (score > bestScore) { bestScore = score; best = entry; }
+  }
+  if (best && bestScore >= .34) return best;
+
+  // If everything was rewritten beyond recognition, retain a useful ordinal
+  // fallback rather than making the pin a dead button.
+  const ordinal = Math.max(0, Math.min(nonempty.length - 1, previewIndex));
+  return nonempty[ordinal] ?? null;
+}
+
+function scrollTextareaCaretIntoView(textarea, caretOffset) {
+  const style = getComputedStyle(textarea);
+  const mirror = document.createElement('div');
+  mirror.setAttribute('aria-hidden', 'true');
+  Object.assign(mirror.style, {
+    position: 'fixed',
+    left: '-100000px',
+    top: '0',
+    visibility: 'hidden',
+    whiteSpace: 'pre-wrap',
+    overflowWrap: 'break-word',
+    wordBreak: style.wordBreak,
+    boxSizing: style.boxSizing,
+    width: `${textarea.clientWidth}px`,
+    paddingTop: style.paddingTop,
+    paddingRight: style.paddingRight,
+    paddingBottom: style.paddingBottom,
+    paddingLeft: style.paddingLeft,
+    borderTopWidth: style.borderTopWidth,
+    borderRightWidth: style.borderRightWidth,
+    borderBottomWidth: style.borderBottomWidth,
+    borderLeftWidth: style.borderLeftWidth,
+    borderStyle: 'solid',
+    fontFamily: style.fontFamily,
+    fontSize: style.fontSize,
+    fontWeight: style.fontWeight,
+    fontStyle: style.fontStyle,
+    letterSpacing: style.letterSpacing,
+    lineHeight: style.lineHeight,
+    tabSize: style.tabSize,
+  });
+  mirror.textContent = textarea.value.slice(0, caretOffset);
+  const marker = document.createElement('span');
+  marker.textContent = '\u200b';
+  mirror.appendChild(marker);
+  document.body.appendChild(mirror);
+  const lineHeight = Number.parseFloat(style.lineHeight) || Number.parseFloat(style.fontSize) * 1.35 || 20;
+  const target = marker.offsetTop - textarea.clientHeight * .42 + lineHeight;
+  textarea.scrollTop = Math.max(0, Math.min(textarea.scrollHeight - textarea.clientHeight, target));
+  mirror.remove();
+}
+
+function jumpPreviewLineToRawLyrics(previewIndex) {
+  attachMissingLyricSourceReferences(syncedLines);
+  const ref = resolveRawLyricReference(previewIndex);
+  if (!ref) {
+    setSyncStatus('No raw Lyrics line could be matched to this Preview line.', 'error');
+    return;
+  }
+  // Verification temporarily replaces the textarea with annotated rows. The pin
+  // is explicitly asking for the editable raw source, so restore that view.
+  if (plainLyricsText.style.display === 'none') _closeVerifyView();
+  setTab('plain');
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const freshEntries = rawLyricEntries();
+    const fresh = freshEntries[ref.index] ?? ref;
+    const caret = Math.max(0, Math.min(plainLyricsText.value.length, fresh.offset));
+    plainLyricsText.focus({ preventScroll: true });
+    plainLyricsText.setSelectionRange(caret, caret);
+    scrollTextareaCaretIntoView(plainLyricsText, caret);
+  }));
+}
+
 function renderKaraoke(lines, { live = false } = {}) {
+  attachMissingLyricSourceReferences(lines);
   const html = [];
   lines.forEach((l, i) => {
     const words = Array.isArray(l.words)
@@ -3273,6 +3506,9 @@ function renderKaraoke(lines, { live = false } = {}) {
     html.push(`<div class="kl future" data-i="${i}" role="button" tabindex="0" aria-label="Seek to ${esc(l.line ?? l.word)}">
        <span class="kl-content">${textHtml}${liveDot}</span>
        <span class="kl-actions">
+         <button class="kl-source-pin" data-source-i="${i}" type="button" title="Find this line in Lyrics" aria-label="Find line ${i + 1} in raw Lyrics">
+           <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 1 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+         </button>
          <button class="kl-time" data-time-i="${i}" type="button" title="Adjust timing" aria-label="Adjust timestamp for line ${i + 1}">${fmtTime(l.start)}</button>
          <button class="kl-delete" data-del-i="${i}" type="button" title="Remove this line" aria-label="Remove line ${i + 1}">×</button>
        </span>
@@ -3819,6 +4055,12 @@ window.addEventListener('resize', () => {
 
 // Click to seek / edit time chip / delete line
 karaokeLines.addEventListener('click', (e) => {
+  const sourcePin = e.target.closest('.kl-source-pin');
+  if (sourcePin) {
+    e.stopPropagation();
+    jumpPreviewLineToRawLyrics(Number(sourcePin.dataset.sourceI));
+    return;
+  }
   const delBtn = e.target.closest('.kl-delete');
   if (delBtn) {
     e.stopPropagation();
@@ -3854,7 +4096,7 @@ karaokeLines.addEventListener('click', (e) => {
 
 // Double-click to edit line text
 karaokeLines.addEventListener('dblclick', (e) => {
-  if (e.target.closest('.kl-time')) return;
+  if (e.target.closest('.kl-time, .kl-source-pin, .kl-delete')) return;
   const div = e.target.closest('.kl');
   if (!div) return;
   const idx = Number(div.dataset.i);
@@ -3994,7 +4236,7 @@ dismissVerifyBtn.addEventListener('click', () => {
 
 // ── Lyrics editing ────────────────────────────────────────────────────────
 function updateLyricsSrc(src, hasContent) {
-  const labels = { api: 'API', genius: 'Genius', manual: 'Manual', edited: 'Edited', whisper: 'Whisper', local: 'Local cache' };
+  const labels = { api: 'API', genius: 'Genius', manual: 'Manual', edited: 'Edited', whisper: 'Whisper', model: 'Local model', local: 'Local cache' };
   lyricsSrcTag.textContent = hasContent ? labels[src] || src : 'No lyrics';
   lyricsSrcTag.classList.toggle('edited', src !== 'api');
   resetLyricsBtn.style.display = (src !== 'api' && currentSong?.lyrics) ? '' : 'none';
@@ -4323,11 +4565,12 @@ function sanitizeTimedLines(input, { lrcCompat = false } = {}) {
 }
 
 // ── Keyboard shortcuts (Preview tab only) ─────────────────────────────────
-const OUR_KEYS = new Set(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' ']);
+const OUR_KEYS = new Set(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' ','`']);
 document.addEventListener('keydown', (e) => {
-  if (activeTab !== 'karaoke') return;
+  if (activeTab !== 'karaoke' || settingsPanel.classList.contains('visible')) return;
   if (e.target.closest?.('input, textarea, select, button, a, [contenteditable="true"]')) return;
   if (OUR_KEYS.has(e.key)) e.preventDefault();
+  if (e.key === '`') { setLyricAutoFollow(!autoFollow, { reanchor: !autoFollow }); return; }
   if (e.key === ' ') { audioPlayer.paused ? audioPlayer.play() : audioPlayer.pause(); return; }
   if (!syncedLines.length) return;
 
@@ -4385,6 +4628,7 @@ _qEvt.onmessage = (e) => {
     const state = JSON.parse(e.data);
     _queueState = state;
     renderQueue(state);
+    updateManagedModelQueueState(state);
     applyLiveTask(state);
     applyCompletedTasks(state);
   } catch {}
@@ -4435,13 +4679,22 @@ async function cancelTask(taskId) {
 
 // Render helpers
 function tcTypeBadge(type) {
-  const labels = { sync: '↔ Sync', verify: '✓ Verify', auto: '⚡ Auto', transcribe: '● Transcribe' };
-  const cls    = { sync: 'tc-type-sync', verify: 'tc-type-verify', auto: 'tc-type-auto', transcribe: 'tc-type-sync' };
+  const labels = { sync: '↔ Sync', verify: '✓ Verify', auto: '⚡ Auto', transcribe: '● Transcribe', model_download: '↓ Model' };
+  const cls    = { sync: 'tc-type-sync', verify: 'tc-type-verify', auto: 'tc-type-auto', transcribe: 'tc-type-sync', model_download: 'tc-type-model' };
   return `<span class="tc-type-badge ${cls[type] ?? ''}">${labels[type] ?? type}</span>`;
 }
 
+function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  const units = ['KB','MB','GB','TB'];
+  let value = n / 1024, i = 0;
+  while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[i]}`;
+}
+
 function renderTask(task, isActive) {
-  const canCancel = task.status === 'pending' || task.status === 'running' || task.status === 'cancelling';
+  const canCancel = task.type !== 'model_download' && (task.status === 'pending' || task.status === 'running' || task.status === 'cancelling');
   const pct       = task.progress?.pct ?? 0;
   const msg       = task.progress?.msg ?? (task.status === 'pending' ? 'Waiting in queue…' : '');
   const prog      = task.progress?.progress ?? null;
@@ -4456,7 +4709,9 @@ function renderTask(task, isActive) {
            <span>ETA ${prog.eta}</span>
            <span>${prog.speed.toFixed(2)} s/sec</span>
          </div>`
-      : '';
+      : (task.type === 'model_download' && task.progress?.total_bytes
+          ? `<div class="tc-rich"><span>${formatBytes(task.progress.done_bytes)} / ${formatBytes(task.progress.total_bytes)}</span><span>SHA-256 verified before install</span></div>`
+          : '');
     bodyHtml = `
       <div class="tc-msg">${esc(msg)}</div>
       ${richHtml}
@@ -4493,7 +4748,7 @@ function renderQueue(state) {
   queueBadge.style.display = totalBusy > 0 ? '' : 'none';
 
   if (!active && !pending?.length && !history?.length) {
-    queueContent.innerHTML = '<div class="qp-empty">No tasks yet — run Auto, Sync, Verify, or Transcribe on a song.</div>';
+    queueContent.innerHTML = '<div class="qp-empty">No tasks yet — processing jobs and model downloads will appear here.</div>';
     return;
   }
 
@@ -4569,9 +4824,12 @@ function applyCompletedTasks(state) {
       _appliedTaskIds.add(task.id);
       syncedLines = task.result.lines; currentTtmlSource = '';
       const text = task.result.text || syncedLines.map(l => l.line ?? '').join('\n');
-      plainLyricsText.value = text; customLyrics = text; updateLyricsSrc('whisper', true);
+      const transcribeModel = task.settings?.transcribe_model || 'whisper';
+      const isWhisper = !['qwen3-asr-0.6b','qwen3-asr-1.7b','parakeet-tdt-0.6b-v3'].includes(transcribeModel);
+      plainLyricsText.value = text; customLyrics = text; updateLyricsSrc(isWhisper ? 'whisper' : 'model', true);
       renderKaraoke(syncedLines); setTab('karaoke'); maybeShowPropose();
-      setSyncStatus(`Auto transcribed ${syncedLines.length} lines with Whisper ✓`, 'ok');
+      const modelLabel = document.querySelector(`#verifyModelSelect option[value="${CSS.escape(transcribeModel)}"]`)?.dataset.baseLabel || transcribeModel;
+      setSyncStatus(`Auto transcribed ${syncedLines.length} lines with ${modelLabel} ✓`, 'ok');
     }
 
     // Transcribe — fill lyrics textarea with plain text + apply as synced lines
@@ -4579,7 +4837,8 @@ function applyCompletedTasks(state) {
       _appliedTaskIds.add(task.id);
       plainLyricsText.value = task.result.text;
       customLyrics = task.result.text;
-      updateLyricsSrc('whisper', true);
+      const transcribeModel = task.settings?.transcribe_model || 'whisper';
+      updateLyricsSrc(['qwen3-asr-0.6b','qwen3-asr-1.7b','parakeet-tdt-0.6b-v3'].includes(transcribeModel) ? 'model' : 'whisper', true);
       if (task.result.lines?.length) {
         syncedLines = task.result.lines; currentTtmlSource = '';
         renderKaraoke(syncedLines);
@@ -4626,7 +4885,51 @@ showTokenBtn.addEventListener('click', () => {
 });
 
 // ── Model / device settings ──────────────────────────────────────────────
+let _managedModelInfo = new Map();
 let _currentDevicePref = 'auto';
+
+function updateManagedModelOptions(models = []) {
+  _managedModelInfo = new Map((models || []).map(m => [m.id, m]));
+  document.querySelectorAll('option[data-managed-model]').forEach(opt => {
+    const id = opt.dataset.managedModel;
+    const base = opt.dataset.baseLabel || opt.textContent.split(' · ')[0];
+    const info = _managedModelInfo.get(id);
+    const busy = [...(_queueState.pending || []), _queueState.active].filter(Boolean)
+      .some(t => t.type === 'model_download' && t.model_id === id && ['pending','running','cancelling'].includes(t.status));
+    opt.textContent = `${base} · ${busy ? 'downloading…' : info?.installed ? 'installed' : 'download'}`;
+  });
+}
+
+function updateManagedModelQueueState(state) {
+  const busy = [...(state.pending || []), state.active].filter(Boolean)
+    .filter(t => t.type === 'model_download' && ['pending','running','cancelling'].includes(t.status));
+  const completed = (state.history || []).filter(t => t.type === 'model_download' && t.status === 'done');
+  if (modelInstallStatus) {
+    modelInstallStatus.textContent = busy.length
+      ? `${busy.length} model ${busy.length === 1 ? 'download' : 'downloads'} in Task Queue`
+      : '';
+  }
+  updateManagedModelOptions([..._managedModelInfo.values()]);
+  const newestDone = completed.at(-1);
+  if (newestDone && !newestDone._uiRefreshed && !_appliedTaskIds.has(`model:${newestDone.id}`)) {
+    _appliedTaskIds.add(`model:${newestDone.id}`);
+    api('/api/model').then(applyModelInfo).catch(() => {});
+  }
+}
+
+function applyModelInfo(info) {
+  if (alignModelSelect.querySelector(`option[value="${info.align_model}"]`)) alignModelSelect.value = info.align_model;
+  if (verifyModelSelect.querySelector(`option[value="${info.verify_model}"]`)) verifyModelSelect.value = info.verify_model;
+  if (engineSelect.querySelector(`option[value="${info.engine}"]`)) engineSelect.value = info.engine;
+  _setDeviceBtn(info.device_pref ?? 'auto');
+  updateManagedModelOptions(info.managed_models || []);
+  const loadedOn = info.device?.toUpperCase() ?? '';
+  if (info.align_loaded || info.verify_loaded) {
+    modelStatus.style.color = '';
+    modelStatus.textContent = `Model loaded on ${loadedOn}`;
+  }
+}
+
 
 function _setDeviceBtn(pref) {
   _currentDevicePref = pref;
@@ -4645,13 +4948,19 @@ async function _saveModelSettings(patch) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
+    applyModelInfo(info);
     const dev = info.device_pref === 'auto'
       ? `Auto (${info.device?.toUpperCase()})`
       : info.device_pref.toUpperCase();
-    const engine = info.engine === 'faster' ? 'Faster-Whisper' : 'PyTorch';
     modelStatus.style.color = '';
-    modelStatus.textContent = `Saved · ${engine}, ${dev}`;
-    setTimeout(() => { modelStatus.textContent = ''; }, 3000);
+    modelStatus.textContent = `Saved · ${dev}`;
+    if (info.queued_models?.length) {
+      queuePanel.classList.add('visible');
+      queueBtn.classList.add('active');
+      queueBtn.setAttribute('aria-expanded', 'true');
+      modelInstallStatus.textContent = 'Model download added to Task Queue';
+    }
+    setTimeout(() => { if (!info.queued_models?.length) modelStatus.textContent = ''; }, 3000);
   } catch (e) {
     modelStatus.textContent = 'Error: ' + (e.message ?? e);
     modelStatus.style.color = 'var(--danger)';
@@ -4659,20 +4968,7 @@ async function _saveModelSettings(patch) {
 }
 
 // Init from backend
-api('/api/model').then(info => {
-  if (alignModelSelect.querySelector(`option[value="${info.align_model}"]`))
-    alignModelSelect.value = info.align_model;
-  if (verifyModelSelect.querySelector(`option[value="${info.verify_model}"]`))
-    verifyModelSelect.value = info.verify_model;
-  if (engineSelect.querySelector(`option[value="${info.engine}"]`))
-    engineSelect.value = info.engine;
-  _setDeviceBtn(info.device_pref ?? 'auto');
-  const loadedOn = info.device?.toUpperCase() ?? '';
-  if (info.align_loaded || info.verify_loaded) {
-    modelStatus.style.color = '';
-    modelStatus.textContent = `${info.engine === 'faster' ? 'Faster-Whisper' : 'PyTorch'} loaded on ${loadedOn}`;
-  }
-}).catch(() => {});
+api('/api/model').then(applyModelInfo).catch(() => {});
 
 alignModelSelect.addEventListener('change', () =>
   _saveModelSettings({ align_model: alignModelSelect.value }));

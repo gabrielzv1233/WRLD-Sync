@@ -35,3 +35,6 @@ Thumbs.db
 data/*.sqlite3
 data/*.sqlite3-shm
 data/*.sqlite3-wal
+
+# Project-local managed ASR / alignment weights
+models/

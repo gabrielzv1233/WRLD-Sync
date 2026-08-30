@@ -1,6 +1,6 @@
 # WRLD Sync
 
-A music player that pulls songs from [juicewrldapi.com](https://juicewrldapi.com), streams audio, and generates karaoke-style synced lyrics using local Whisper, with Apple TTML as the primary synced-lyrics format.
+A music player that pulls songs from [juicewrldapi.com](https://juicewrldapi.com), streams audio, and generates karaoke-style synced lyrics using local ASR/alignment models, with Apple TTML as the primary synced-lyrics format.
 
 ## Setup
 
@@ -39,7 +39,7 @@ On Windows, the backend also exposes the CUDA PyTorch wheel's bundled `torch/lib
 
 1. Type a song name in the search box (or click the `#` button next to it to switch to loading a song directly by its ID, then press Enter)
 2. Click a result to load it — audio streams immediately
-3. Hit **Auto** to run a full Whisper transcription, or **Sync** to align the current raw Lyrics text without retranscribing
+3. Hit **Auto** to run a full transcription with the selected transcription model, or **Sync** to align the current raw Lyrics text without retranscribing
 4. Copy or propose **Apple TTML** with real line start/end times and optional per-word timing. Legacy LRC import/export remains available.
 
 For your own audio, click the Local Audio button. It opens a dedicated landing view where you can either browse/upload a file or paste a direct HTTP(S) audio URL. Local files use embedded title/artist/cover tags when available and are identified by a SHA-256 hash of decoded audio rather than filename or metadata.
@@ -52,13 +52,21 @@ A separate tools page (linked from the main header) for maintaining the song dat
 
 ## Config
 
-Whisper uses two model slots — an **align** model (does the actual sync) and a **verify** model (used by manual verification and Strict Auto) — plus a **device** preference (auto / CPU / CUDA) and engine preference. **faster-whisper** is the default engine, with the original PyTorch Whisper backend available as a compatibility option.
+Settings has separate **Sync model** and **Transcription model** slots plus a **device** preference (auto / CPU / CUDA). Whisper remains available through **faster-whisper** (default) or the original PyTorch backend. Sync can also use **Qwen3 Forced Aligner 0.6B**. Auto/Transcribe can use **Qwen3-ASR 0.6B**, **Qwen3-ASR 1.7B**, or **NVIDIA Parakeet TDT 0.6B v3** in addition to the existing Whisper family.
 
-**Auto** now runs a full Whisper transcription of the audio and produces both raw lyrics and timed Preview/TTML data. **Sync** is alignment-only and uses the current raw Lyrics text without performing a free transcription pass. Faster-Whisper can stream Auto/Transcribe segments into the UI while decoding.
+**Auto** runs a full transcription with the selected transcription model and produces both raw lyrics and timed Preview/TTML data. **Sync** is alignment-only and uses the current raw Lyrics text without performing a free transcription pass. Faster-Whisper can stream Auto/Transcribe segments into the UI while decoding; Qwen and Parakeet currently publish their result when model inference completes.
 
 TTML settings include **per-word timing** and **interlude detection**. Word timing uses stable-ts word timestamps when present; imported LRC remains line-timed rather than inventing fake word timestamps. Whisper/TTML timings preserve real silence between words and lines. The old 1 ms separation workaround is only used when reconstructing missing line ends from legacy LRC.
 
 Detected 2+ second instrumental gaps are exported as Apple `itunes:song-part="Instrumental"` sections and rendered in the player with a three-dot interlude animation. Parenthesized/background-vocal word runs can be exported/imported as Apple `ttm:role="x-bg"` spans and are rendered in a smaller, inset background-vocal style.
+
+### Managed Qwen / Parakeet models
+
+Large non-Whisper checkpoints are stored under the project's `models/` directory rather than hidden in a global cache. Selecting a missing managed model adds a **Model** job to Task Queue. Qwen ASR automatically queues its forced-aligner dependency first because that aligner supplies the word timestamps used by Preview/TTML.
+
+Before downloading anything, WRLD Sync looks for an existing matching checkpoint in normal Hugging Face cache locations, `~/Models`, `~/models`, `~/AI`, `~/Downloads`, `~/Documents`, common Windows `Models`/`AI/models` folders, and any directories listed in `WRLD_MODEL_SEARCH_PATHS`. A candidate is only reused after its required files are checked against Hugging Face metadata: LFS/Xet weights must match the repository SHA-256 and normal Git-tracked config/tokenizer files must match their Git blob hash. The copied project-local model is verified again before it is published into `models/`. Fresh downloads go through the same verification before use.
+
+Managed checkpoints use the native Hugging Face Transformers versions of Qwen3-ASR / Qwen3 Forced Aligner and Parakeet. Qwen's `-hf` checkpoints require Transformers 5.13+, which avoids pulling the separate `qwen-asr` package and its unrelated language-tokenizer dependencies for English-only use.
 
 `WHISPER_MODEL` env var sets the initial align model on first run only, before any in-app preference exists:
 
@@ -66,16 +74,17 @@ Detected 2+ second instrumental gaps are exported as Apple `itunes:song-part="In
 WHISPER_MODEL=small uvicorn app:app --reload
 ```
 
-| Model  | Speed  | Accuracy |
-|--------|--------|----------|
-| tiny   | fastest | lowest  |
-| base   | fast   | good     |
-| small  | medium | better   |
-| medium | slow   | best     |
+| Model | Role | Rough trade-off |
+|---|---|---|
+| Whisper tiny/base/small/medium/large-v3 | Transcribe + legacy Sync | Proven compatibility; Faster-Whisper can stream |
+| Qwen3-ASR 0.6B | Transcribe | Smaller/faster Qwen option, singing/BGM aware |
+| Qwen3-ASR 1.7B | Transcribe | Higher-accuracy Qwen option |
+| Qwen3 Forced Aligner 0.6B | Sync / word timing | Dedicated forced alignment of existing lyrics |
+| Parakeet TDT 0.6B v3 | Transcribe | Fast alternative with native duration timestamps |
 
 ## Notes
 
-- First sync call downloads the Whisper model (~150 MB for `base`) if not cached
+- First use of a model may prepare/download its weights. Managed Qwen/Parakeet downloads appear in Task Queue and live under `models/`; Whisper keeps its normal cache behavior.
 - Existing synced lyrics can be loaded from either Apple TTML or legacy LRC data from the API (no Whisper needed)
 - Audio proxied through `/api/stream` to handle range requests for seeking
 
@@ -106,7 +115,9 @@ Settings includes **Inline (…) as background vocals**. Leave it enabled to tre
 ### Overlapping lyric playback
 
 Settings includes **Allow overlapping lyrics**, off by default. When enabled, Preview keeps every lyric line whose real timestamp range is still active highlighted and animates word timing on all of them at once. This is useful when a sustained last word continues after the next line starts, or when a separately timed background/ad-lib line overlaps the foreground vocal. The option does not invent or stretch timestamps; it only renders overlap that already exists in Whisper output, imported/edited TTML, or manual timing. TTML parent sections and interlude boundaries also account for the latest overlapping vocal end.
+### Preview source navigation
 
+Each timed Preview line has a Feather `map-pin` action beside its timestamp. It jumps to the best matching raw Lyrics line, focuses the raw editor, and places the caret at that line start. The mapping keeps source-index/text hints when available, then falls back through exact and fuzzy matching so inserted, deleted, edited, or repeated lyric lines do not immediately break navigation. In Preview, the backquote key (`` ` ``) toggles lyric auto-scroll; enabling it smoothly re-anchors to the active/nearest timed line.
 
 btw these are the settings i use:
 ![my settings](readmeimgs/image.png)

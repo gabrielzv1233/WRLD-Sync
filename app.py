@@ -53,6 +53,8 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
+from model_manager import MODEL_SPECS, catalog_status, ensure_model as ensure_managed_model, get_spec as get_managed_spec, is_installed as managed_model_installed
+
 BASE = "https://juicewrldapi.com/juicewrld"
 CONSOLE = Console(highlight=False)
 
@@ -351,9 +353,11 @@ def _store_processed_lyrics(task) -> None:
         "task_type": getattr(task, "type", ""),
         "engine": ENGINE_PREF,
         "device_pref": DEVICE_PREF,
-        "resolved_device": _get_device(ENGINE_PREF),
-        "align_model": ALIGN_MODEL_SIZE,
-        "verify_model": VERIFY_MODEL_SIZE,
+        "resolved_device": _get_device("torch") if ((getattr(task, "sync_model", "") or ALIGN_MODEL_SIZE) in MODEL_SPECS or (getattr(task, "transcribe_model", "") or VERIFY_MODEL_SIZE) in MODEL_SPECS) else _get_device(ENGINE_PREF),
+        "align_model": getattr(task, "sync_model", "") or ALIGN_MODEL_SIZE,
+        "verify_model": getattr(task, "transcribe_model", "") or VERIFY_MODEL_SIZE,
+        "sync_model": getattr(task, "sync_model", "") or ALIGN_MODEL_SIZE,
+        "transcribe_model": getattr(task, "transcribe_model", "") or VERIFY_MODEL_SIZE,
         "auto_mode": result.get("auto_mode", ""),
         "fast_auto": False,  # legacy field retained for older cache readers
         "word_timing_requested": bool(getattr(task, "word_timing", True)),
@@ -473,6 +477,8 @@ async def ensure_audio(song_path: str):
 # ---------------------------------------------------------------------------
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
 WHISPER_ENGINES = ["faster", "torch"]
+SYNC_MODELS = WHISPER_MODELS + ["qwen3-forced-aligner-0.6b"]
+TRANSCRIBE_MODELS = WHISPER_MODELS + ["qwen3-asr-0.6b", "qwen3-asr-1.7b", "parakeet-tdt-0.6b-v3"]
 _PREF_DIR = pathlib.Path(__file__).parent
 
 def _read_pref(filename: str, choices: list, default: str) -> str:
@@ -490,139 +496,181 @@ def _write_pref(filename: str, value: str) -> None:
     except OSError:
         pass
 
-# Device preference: "auto" | "cpu" | "cuda"
 DEVICE_PREF: str = _read_pref(".device_pref", ["auto", "cpu", "cuda"], "auto")
-# Faster-Whisper/CTranslate2 is the default because this app is inference-only and
-# it is substantially faster on modern NVIDIA GPUs. "torch" keeps the original
-# OpenAI Whisper backend available for compatibility/debugging.
 ENGINE_PREF: str = _read_pref(".engine_pref", WHISPER_ENGINES, "faster")
 
 def _torch_cuda_usable() -> bool:
-    """Whether this PyTorch build can actually execute on the visible NVIDIA GPU."""
     try:
         import torch
-        if not torch.cuda.is_available():
-            return False
+        if not torch.cuda.is_available(): return False
         major, minor = torch.cuda.get_device_capability()
         cap = major + minor / 10
         arch_caps = []
         for arch in torch.cuda.get_arch_list():
             digits = "".join(ch for ch in arch if ch.isdigit())
-            if len(digits) >= 2:
-                arch_caps.append(int(digits[:-1]) + int(digits[-1]) / 10)
+            if len(digits) >= 2: arch_caps.append(int(digits[:-1]) + int(digits[-1]) / 10)
         return not arch_caps or cap >= min(arch_caps)
     except Exception:
         return False
 
-
 def _faster_cuda_usable() -> bool:
-    """CTranslate2 owns Faster-Whisper inference, so do not gate it on Torch CUDA."""
     try:
         import ctranslate2
         return ctranslate2.get_cuda_device_count() > 0
     except Exception:
         return False
 
-
 def _cuda_usable(engine: str | None = None) -> bool:
     engine = engine or ENGINE_PREF
-    if engine == "faster":
-        return _faster_cuda_usable()
-    return _torch_cuda_usable()
-
+    return _faster_cuda_usable() if engine == "faster" else _torch_cuda_usable()
 
 _device_fallback_warned: set[str] = set()
-
 def _get_device(engine: str | None = None) -> str:
     engine = engine or ENGINE_PREF
-    if DEVICE_PREF == "cpu":
-        return "cpu"
-    if _cuda_usable(engine):
-        return "cuda"
+    if DEVICE_PREF == "cpu": return "cpu"
+    if _cuda_usable(engine): return "cuda"
     if DEVICE_PREF == "cuda" and engine not in _device_fallback_warned:
         _device_fallback_warned.add(engine)
         CONSOLE.print(f"[yellow]CUDA was requested for {engine}, but that backend cannot use it. Falling back to CPU.[/yellow]")
     return "cpu"
 
-
 def _release_models() -> None:
-    """Drop model references and release cached accelerator memory after a setting change."""
-    global _align_model, _verify_model
-    _align_model = None
-    _verify_model = None
+    global _align_model, _verify_model, _align_model_id, _verify_model_id, _qwen_aligner_runtime
+    _align_model = None; _verify_model = None
+    _qwen_aligner_runtime = None
+    _align_model_id = None; _verify_model_id = None
     gc.collect()
     try:
         import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+    except Exception: pass
 
 def _load_whisper_model(size: str):
     if ENGINE_PREF == "faster":
         faster_device = _get_device("faster")
         try:
             compute_type = "float16" if faster_device == "cuda" else "int8"
-            return stable_whisper.load_faster_whisper(
-                size, device=faster_device, compute_type=compute_type
-            )
+            return stable_whisper.load_faster_whisper(size, device=faster_device, compute_type=compute_type)
         except Exception as exc:
-            # A visible NVIDIA GPU does not guarantee the CUDA runtime libraries
-            # CTranslate2 needs are usable. Fall back cleanly rather than trying
-            # PyTorch on a CUDA device that its own wheel cannot support.
             CONSOLE.print(f"[yellow]Faster-Whisper could not initialize on {faster_device.upper()}: {exc}[/yellow]")
             CONSOLE.print("[yellow]Falling back to PyTorch Whisper for this model load.[/yellow]")
+    return stable_whisper.load_model(size, device=_get_device("torch"))
 
-    torch_device = _get_device("torch")
-    return stable_whisper.load_model(size, device=torch_device)
+def _managed_torch_args() -> tuple[str, object]:
+    import torch
+    device = "cuda:0" if _get_device("torch") == "cuda" else "cpu"
+    # RTX 40/50 series handles BF16 well, and it avoids the numerical edge cases
+    # some newer speech models can hit in FP16. CPU stays FP32.
+    dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    return device, dtype
 
-# Align model (used for sync / alignment tasks)
-ALIGN_MODEL_SIZE: str = _read_pref(".model_pref_align", WHISPER_MODELS,
-                                    _read_pref(".model_pref", WHISPER_MODELS,
-                                               os.getenv("WHISPER_MODEL", "small")))
+class _QwenAlignerRuntime:
+    def __init__(self, model, processor):
+        self.model, self.processor = model, processor
+
+class _QwenASRRuntime:
+    def __init__(self, model, processor, aligner):
+        self.model, self.processor, self.aligner = model, processor, aligner
+
+_qwen_aligner_runtime = None
+_qwen_aligner_load_lock = threading.Lock()
+
+def _load_qwen_aligner(model_id: str):
+    global _qwen_aligner_runtime
+    if not managed_model_installed(model_id):
+        raise RuntimeError(f"{get_managed_spec(model_id).label} is not installed yet. Wait for its model-download queue task.")
+    with _qwen_aligner_load_lock:
+        if _qwen_aligner_runtime is not None:
+            return _qwen_aligner_runtime
+        import torch
+        from transformers import AutoModelForTokenClassification, AutoProcessor
+        device, dtype = _managed_torch_args()
+        path = str(get_managed_spec(model_id).path)
+        processor = AutoProcessor.from_pretrained(path, local_files_only=True)
+        model = AutoModelForTokenClassification.from_pretrained(
+            path, local_files_only=True, dtype=dtype,
+        ).to(device).eval()
+        _qwen_aligner_runtime = _QwenAlignerRuntime(model, processor)
+        return _qwen_aligner_runtime
+
+def _load_qwen_asr(model_id: str):
+    if not managed_model_installed(model_id):
+        raise RuntimeError(f"{get_managed_spec(model_id).label} is not installed yet. Wait for its model-download queue task.")
+    align_id = "qwen3-forced-aligner-0.6b"
+    if not managed_model_installed(align_id):
+        raise RuntimeError("Qwen3 Forced Aligner is required for timestamped Qwen transcription and is not installed yet.")
+    from transformers import AutoModelForMultimodalLM, AutoProcessor
+    device, dtype = _managed_torch_args()
+    path = str(get_managed_spec(model_id).path)
+    processor = AutoProcessor.from_pretrained(path, local_files_only=True)
+    model = AutoModelForMultimodalLM.from_pretrained(
+        path, local_files_only=True, dtype=dtype,
+    ).to(device).eval()
+    # Share one aligner instance between Sync and Qwen ASR so a 1.8 GB model
+    # is not needlessly loaded into VRAM twice.
+    aligner = _load_qwen_aligner(align_id)
+    return _QwenASRRuntime(model, processor, aligner)
+
+class _ParakeetRuntime:
+    def __init__(self, model, processor): self.model, self.processor = model, processor
+
+def _load_parakeet(model_id: str):
+    if not managed_model_installed(model_id):
+        raise RuntimeError(f"{get_managed_spec(model_id).label} is not installed yet. Wait for its model-download queue task.")
+    import torch
+    from transformers import AutoProcessor, ParakeetForTDT
+    path = str(get_managed_spec(model_id).path)
+    device = "cuda" if _get_device("torch") == "cuda" else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    processor = AutoProcessor.from_pretrained(path, local_files_only=True)
+    model = ParakeetForTDT.from_pretrained(path, local_files_only=True, dtype=dtype).to(device).eval()
+    return _ParakeetRuntime(model, processor)
+
+# Existing variable names are retained for cache/backward compatibility.
+ALIGN_MODEL_SIZE: str = _read_pref(".model_pref_align", SYNC_MODELS, _read_pref(".model_pref", SYNC_MODELS, os.getenv("WHISPER_MODEL", "small")))
+VERIFY_MODEL_SIZE: str = _read_pref(".model_pref_verify", TRANSCRIBE_MODELS, "base")
 _align_model = None
-
-# Verify model (used for free-transcription / verify tasks)
-VERIFY_MODEL_SIZE: str = _read_pref(".model_pref_verify", WHISPER_MODELS, "base")
 _verify_model = None
+_align_model_id: str | None = None
+_verify_model_id: str | None = None
+_model_lock = asyncio.Lock()
+_inference_lock = asyncio.Lock()
 
-_model_lock     = asyncio.Lock()   # serialises model loads (one at a time)
-_inference_lock = asyncio.Lock()   # one whisper inference at a time (model is not thread-safe for concurrent calls)
-
-
-async def get_align_model():
-    global _align_model
-    if _align_model is None:
+async def get_align_model(model_id: str | None = None):
+    global _align_model, _align_model_id
+    model_id = model_id or ALIGN_MODEL_SIZE
+    if _align_model is None or _align_model_id != model_id:
         async with _model_lock:
-            if _align_model is None:
-                device = _get_device(ENGINE_PREF)
-                CONSOLE.print(f"[cyan]→[/cyan] Loading align model [bold]{ALIGN_MODEL_SIZE}[/bold] with {ENGINE_PREF} on {device.upper()}")
+            if _align_model is None or _align_model_id != model_id:
+                label = get_managed_spec(model_id).label if model_id in MODEL_SPECS else f"Whisper {model_id}"
+                CONSOLE.print(f"[cyan]→[/cyan] Loading sync model [bold]{label}[/bold]")
                 loop = asyncio.get_running_loop()
-                _align_model = await loop.run_in_executor(
-                    None, lambda: _load_whisper_model(ALIGN_MODEL_SIZE))
-                CONSOLE.print("[green]✓[/green] Align model ready")
+                if model_id == "qwen3-forced-aligner-0.6b":
+                    loaded = await loop.run_in_executor(None, lambda: _load_qwen_aligner(model_id))
+                else:
+                    loaded = await loop.run_in_executor(None, lambda: _load_whisper_model(model_id))
+                _align_model, _align_model_id = loaded, model_id
+                CONSOLE.print("[green]✓[/green] Sync model ready")
     return _align_model
 
-
-async def get_verify_model():
-    global _verify_model
-    # If both slots use the same model, share the loaded instance instead of
-    # loading a duplicate copy into VRAM/RAM. Inference is serialized anyway.
-    if _verify_model is None and VERIFY_MODEL_SIZE == ALIGN_MODEL_SIZE:
-        _verify_model = await get_align_model()
-        return _verify_model
-    if _verify_model is None:
+async def get_verify_model(model_id: str | None = None):
+    global _verify_model, _verify_model_id
+    model_id = model_id or VERIFY_MODEL_SIZE
+    if _verify_model is None or _verify_model_id != model_id:
         async with _model_lock:
-            if _verify_model is None:
-                device = _get_device(ENGINE_PREF)
-                CONSOLE.print(f"[cyan]→[/cyan] Loading verify model [bold]{VERIFY_MODEL_SIZE}[/bold] with {ENGINE_PREF} on {device.upper()}")
+            if _verify_model is None or _verify_model_id != model_id:
+                label = get_managed_spec(model_id).label if model_id in MODEL_SPECS else f"Whisper {model_id}"
+                CONSOLE.print(f"[cyan]→[/cyan] Loading transcription model [bold]{label}[/bold]")
                 loop = asyncio.get_running_loop()
-                _verify_model = await loop.run_in_executor(
-                    None, lambda: _load_whisper_model(VERIFY_MODEL_SIZE))
-                CONSOLE.print("[green]✓[/green] Verify model ready")
+                if model_id.startswith("qwen3-asr-"):
+                    loaded = await loop.run_in_executor(None, lambda: _load_qwen_asr(model_id))
+                elif model_id.startswith("parakeet-"):
+                    loaded = await loop.run_in_executor(None, lambda: _load_parakeet(model_id))
+                else:
+                    loaded = await loop.run_in_executor(None, lambda: _load_whisper_model(model_id))
+                _verify_model, _verify_model_id = loaded, model_id
+                CONSOLE.print("[green]✓[/green] Transcription model ready")
     return _verify_model
-
 
 # Backward-compat alias used by legacy SSE endpoints
 async def get_model():
@@ -655,6 +703,9 @@ class QueueTask:
     cancel_requested: bool = False
     result: dict | None = None
     live_lines: list[dict] = dc_field(default_factory=list)
+    model_id: str = ""
+    sync_model: str = ""
+    transcribe_model: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -667,6 +718,7 @@ class QueueTask:
             "progress": self.progress,
             "error": self.error,
             "created_at": self.created_at,
+            "model_id": self.model_id,
             "settings": {
                 "fast_auto": self.fast_auto,
                 "word_timing": self.word_timing,
@@ -674,6 +726,8 @@ class QueueTask:
                 "inline_parenthetical_background": self.inline_parenthetical_background,
                 "allow_overlapping_lyrics": self.allow_overlapping_lyrics,
                 "interlude_threshold": self.interlude_threshold,
+                "sync_model": self.sync_model or ALIGN_MODEL_SIZE,
+                "transcribe_model": self.transcribe_model or VERIFY_MODEL_SIZE,
             },
         }
         if self.result and self.status in ("done", "error"):
@@ -690,6 +744,61 @@ _active_task: QueueTask | None = None
 # SSE broadcast via asyncio.Condition — all stream generators wait on this
 _q_cond: asyncio.Condition | None = None   # initialised in lifespan
 _q_state_json: str = '{"active":null,"pending":[],"history":[]}'
+
+
+def _task_model_requirements(task_type: str, sync_model: str | None = None, transcribe_model: str | None = None) -> list[str]:
+    sync_model = sync_model or ALIGN_MODEL_SIZE
+    transcribe_model = transcribe_model or VERIFY_MODEL_SIZE
+    ids: list[str] = []
+    if task_type == "sync" and sync_model in MODEL_SPECS:
+        ids.append(sync_model)
+    if task_type in ("auto", "transcribe", "verify") and transcribe_model in MODEL_SPECS:
+        spec = get_managed_spec(transcribe_model)
+        ids.extend(spec.dependencies)
+        ids.append(transcribe_model)
+    return list(dict.fromkeys(ids))
+
+
+async def _enqueue_model_download(model_id: str) -> str | None:
+    if model_id not in MODEL_SPECS or managed_model_installed(model_id):
+        return None
+    for task in _tasks.values():
+        if task.type == "model_download" and task.model_id == model_id and task.status in ("pending", "running", "cancelling"):
+            return task.id
+    spec = get_managed_spec(model_id)
+    for dep in spec.dependencies:
+        await _enqueue_model_download(dep)
+    task = QueueTask(
+        id=str(uuid.uuid4())[:8], type="model_download", song_id=0,
+        song_name=spec.label, lyrics="", model_id=model_id,
+        sync_model=ALIGN_MODEL_SIZE, transcribe_model=VERIFY_MODEL_SIZE,
+    )
+    _tasks[task.id] = task
+    await _task_queue.put(task)
+    await _q_broadcast()
+    return task.id
+
+
+async def _run_model_download_task(task: QueueTask) -> None:
+    spec = get_managed_spec(task.model_id)
+    loop = asyncio.get_running_loop()
+    task.progress = {"stage": "checking", "msg": f"Checking {spec.label}…", "pct": 0, "step": "model"}
+    await _q_broadcast()
+
+    def progress_update(ev: dict) -> None:
+        task.progress = {**ev, "step": "model"}
+        asyncio.run_coroutine_threadsafe(_q_broadcast(), loop)
+
+    def cancelled() -> bool:
+        return bool(task.cancel_requested)
+
+    try:
+        path = await loop.run_in_executor(None, lambda: ensure_managed_model(task.model_id, progress_update, cancelled))
+    except InterruptedError:
+        raise asyncio.CancelledError()
+    task.result = {"model_id": task.model_id, "path": str(path), "installed": True}
+    task.progress = {"stage": "done", "msg": f"{spec.label} ready", "pct": 100, "step": "done"}
+
 
 
 async def _q_broadcast() -> None:
@@ -836,7 +945,7 @@ async def _faster_stream_transcribe_worker(task: QueueTask, tmp_path: str) -> li
     Returns None when the loaded model is not a faster-whisper model, allowing
     the caller to fall back to stable-ts/PyTorch transcription.
     """
-    model_obj = await get_align_model()
+    model_obj = await get_verify_model()
     transcribe_original = getattr(model_obj, "transcribe_original", None)
     if not callable(transcribe_original):
         return None
@@ -940,13 +1049,296 @@ def _new_terminal_progress() -> Progress:
     )
 
 
+def _join_word_text(parts: list[str]) -> str:
+    text = ""
+    for part in parts:
+        part = str(part or "")
+        if not part:
+            continue
+        if not text:
+            text = part.strip()
+        elif re.fullmatch(r"[,.!?;:%)\]}]+", part):
+            text += part
+        elif part.startswith(("'", "’")) and len(part) <= 3:
+            text += part
+        else:
+            text += " " + part.strip()
+    return text.strip()
+
+
+def _group_words_into_lines(words: list[dict], *, max_words: int = 10, max_chars: int = 64, pause: float = 0.75) -> list[dict]:
+    """Turn timestamped words into readable lyric-sized lines without changing timestamps."""
+    lines: list[dict] = []
+    cur: list[dict] = []
+    for word in words:
+        if not cur:
+            cur = [word]
+            continue
+        prev = cur[-1]
+        candidate = _join_word_text([x.get("word", "") for x in cur] + [word.get("word", "")])
+        gap = float(word.get("start", 0)) - float(prev.get("end", 0))
+        prev_text = str(prev.get("word", ""))
+        should_break = (
+            gap >= pause
+            or len(cur) >= max_words
+            or len(candidate) > max_chars
+            or bool(re.search(r"[.!?][\"')\]]*$", prev_text))
+        )
+        if should_break:
+            lines.append({
+                "line": _join_word_text([x.get("word", "") for x in cur]),
+                "start": cur[0]["start"], "end": cur[-1]["end"], "words": cur,
+            })
+            cur = [word]
+        else:
+            cur.append(word)
+    if cur:
+        lines.append({
+            "line": _join_word_text([x.get("word", "") for x in cur]),
+            "start": cur[0]["start"], "end": cur[-1]["end"], "words": cur,
+        })
+    return lines
+
+
+def _timed_item_value(item, key: str, default=None):
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
+def _align_items_to_lyric_lines(items, lyrics: str) -> list[dict]:
+    """Map sequential forced-aligner word spans back onto the user's original lyric lines."""
+    raw_items = list(getattr(items, "items", items) or [])
+    timed = []
+    for it in raw_items:
+        text = str(_timed_item_value(it, "text", "") or "").strip()
+        if not text:
+            continue
+        start = round(float(_timed_item_value(it, "start_time", 0.0) or 0.0), 3)
+        end = round(float(_timed_item_value(it, "end_time", start) or start), 3)
+        if end <= start:
+            end = round(start + 0.001, 3)
+        timed.append({"word": text, "start": start, "end": end})
+
+    out: list[dict] = []
+    ptr = 0
+    lyric_lines = [line.strip() for line in lyrics.splitlines() if line.strip()]
+    for line in lyric_lines:
+        original_tokens = re.findall(r"\S+", line)
+        # Qwen's English forced aligner emits one timed item per cleaned word.
+        count = max(1, len(original_tokens))
+        chunk = timed[ptr:ptr + count]
+        if not chunk:
+            break
+        words = []
+        for i, item in enumerate(chunk):
+            display = original_tokens[i] if i < len(original_tokens) else item["word"]
+            words.append({**item, "word": display})
+        out.append({"line": line, "start": words[0]["start"], "end": words[-1]["end"], "words": words})
+        ptr += count
+    if ptr < len(timed):
+        remainder = timed[ptr:]
+        out.append({
+            "line": _join_word_text([w["word"] for w in remainder]),
+            "start": remainder[0]["start"], "end": remainder[-1]["end"], "words": remainder,
+        })
+    return out
+
+
+def _qwen_timestamps_to_lines(text: str, items) -> list[dict]:
+    text = str(text or "").strip()
+    raw_items = list(getattr(items, "items", items) or [])
+    if not raw_items:
+        return [{"line": text, "start": 0.0, "end": 0.5, "words": []}] if text else []
+    text_tokens = re.findall(r"\S+", text)
+    words: list[dict] = []
+    for i, item in enumerate(raw_items):
+        raw = str(_timed_item_value(item, "text", "") or "").strip()
+        display = text_tokens[i] if i < len(text_tokens) else raw
+        start = round(float(_timed_item_value(item, "start_time", 0.0) or 0.0), 3)
+        end = round(float(_timed_item_value(item, "end_time", start) or start), 3)
+        if end <= start:
+            end = round(start + 0.001, 3)
+        words.append({"word": display or raw, "start": start, "end": end})
+    return _group_words_into_lines(words)
+
+
+def _parakeet_tokens_to_words(tokens: list[dict]) -> list[dict]:
+    words: list[dict] = []
+    cur_text = ""; cur_start = None; cur_end = None
+    def flush():
+        nonlocal cur_text, cur_start, cur_end
+        text = cur_text.strip()
+        if text and cur_start is not None:
+            words.append({"word": text, "start": round(float(cur_start), 3), "end": round(max(float(cur_end or cur_start), float(cur_start) + .001), 3)})
+        cur_text = ""; cur_start = None; cur_end = None
+    for item in tokens or []:
+        tok = str(item.get("token", "") or "")
+        start = float(item.get("start", 0.0) or 0.0)
+        end = float(item.get("end", start) or start)
+        if not tok:
+            continue
+        starts_new = bool(tok[:1].isspace())
+        stripped = tok.strip()
+        if starts_new and cur_text:
+            flush()
+        if re.fullmatch(r"[,.!?;:%)\]}]+", stripped) and cur_text:
+            cur_text += stripped
+            cur_end = max(cur_end or end, end)
+            continue
+        if cur_start is None: cur_start = start
+        cur_end = max(cur_end or end, end)
+        cur_text += tok if cur_text else stripped
+    flush()
+    return words
+
+
+async def _qwen_sync_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
+    runtime = await get_align_model(task.sync_model or ALIGN_MODEL_SIZE)
+    loop = asyncio.get_running_loop()
+    task.progress = {"stage": "aligning", "msg": "Qwen forced alignment…", "pct": 55, "step": "aligning"}
+    await _q_broadcast()
+
+    def run_alignment():
+        import torch
+        from whisper.audio import load_audio
+        processor, net = runtime.processor, runtime.model
+        audio = load_audio(tmp_path)  # ffmpeg -> mono float32 16 kHz
+        inputs, word_lists = processor.prepare_forced_aligner_inputs(
+            audio=audio, transcript=lyrics, language="English",
+        )
+        inputs = inputs.to(net.device, net.dtype)
+        with torch.inference_mode():
+            outputs = net(**inputs)
+        return processor.decode_forced_alignment(
+            logits=outputs.logits,
+            input_ids=inputs["input_ids"],
+            word_lists=word_lists,
+            timestamp_token_id=net.config.timestamp_token_id,
+        )[0]
+
+    async with _inference_lock:
+        fut = loop.run_in_executor(None, run_alignment)
+        elapsed = 0.0
+        while not fut.done():
+            if task.cancel_requested:
+                await asyncio.shield(fut)
+                raise asyncio.CancelledError()
+            pct = min(96, 55 + (elapsed / 90.0) ** 0.5 * 35)
+            task.progress = {"stage": "aligning", "msg": f"Qwen forced alignment… {elapsed:.0f}s", "pct": pct, "step": "aligning"}
+            await _q_broadcast(); await asyncio.sleep(.5); elapsed += .5
+        timestamps = await fut
+    return _sanitize_timed_lines(
+        _align_items_to_lyric_lines(timestamps, lyrics),
+        inline_parenthetical_background=task.inline_parenthetical_background,
+    )
+
+
+async def _managed_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dict] | None:
+    model_id = task.transcribe_model or VERIFY_MODEL_SIZE
+    if model_id not in MODEL_SPECS:
+        return None
+    runtime = await get_verify_model(model_id)
+    loop = asyncio.get_running_loop()
+    label = get_managed_spec(model_id).label
+    task.progress = {"stage": "transcribing", "msg": f"{label} transcription…", "pct": 30, "step": "transcribing", "live": False}
+    await _q_broadcast()
+
+    def run_qwen():
+        import torch
+        from whisper.audio import load_audio
+        asr_processor, asr_net = runtime.processor, runtime.model
+        audio = load_audio(tmp_path)  # decode once; Qwen and its aligner both consume 16 kHz PCM
+        inputs = asr_processor.apply_transcription_request(
+            audio=audio, language="English",
+        ).to(asr_net.device, asr_net.dtype)
+        with torch.inference_mode():
+            output_ids = asr_net.generate(**inputs, max_new_tokens=4096, do_sample=False)
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+        parsed = asr_processor.decode(generated_ids, return_format="parsed")[0]
+        transcript = str(parsed.get("transcription", "") or "").strip()
+        language = parsed.get("language") or "English"
+
+        aligner = runtime.aligner
+        align_processor, align_net = aligner.processor, aligner.model
+        align_inputs, word_lists = align_processor.prepare_forced_aligner_inputs(
+            audio=audio, transcript=transcript, language=language,
+        )
+        align_inputs = align_inputs.to(align_net.device, align_net.dtype)
+        with torch.inference_mode():
+            outputs = align_net(**align_inputs)
+        timestamps = align_processor.decode_forced_alignment(
+            logits=outputs.logits,
+            input_ids=align_inputs["input_ids"],
+            word_lists=word_lists,
+            timestamp_token_id=align_net.config.timestamp_token_id,
+        )[0]
+        return transcript, timestamps
+
+    def run_parakeet():
+        from whisper.audio import load_audio
+        processor = runtime.processor; net = runtime.model
+        sr = int(processor.feature_extractor.sampling_rate)
+        if sr != 16000:
+            raise RuntimeError(f"Parakeet processor expected unsupported sample rate {sr} Hz")
+        audio = load_audio(tmp_path)  # ffmpeg -> mono float32 16 kHz
+        inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
+        inputs = inputs.to(net.device, dtype=net.dtype)
+        output = net.generate(**inputs, return_dict_in_generate=True)
+        decoded, timestamps = processor.decode(output.sequences, durations=output.durations, skip_special_tokens=True)
+        text = decoded[0] if isinstance(decoded, list) else str(decoded)
+        token_items = timestamps[0] if timestamps and isinstance(timestamps[0], list) else timestamps
+        words = _parakeet_tokens_to_words(token_items or [])
+        return text, words
+
+    runner = run_qwen if model_id.startswith("qwen3-asr-") else run_parakeet
+    async with _inference_lock:
+        fut = loop.run_in_executor(None, runner)
+        elapsed = 0.0
+        while not fut.done():
+            if task.cancel_requested:
+                await asyncio.shield(fut)
+                raise asyncio.CancelledError()
+            pct = min(96, 30 + (elapsed / 150.0) ** 0.5 * 60)
+            task.progress = {"stage": "transcribing", "msg": f"{label} transcription… {elapsed:.0f}s", "pct": pct, "step": "transcribing", "live": False}
+            await _q_broadcast(); await asyncio.sleep(.5); elapsed += .5
+        raw = await fut
+
+    if model_id.startswith("qwen3-asr-"):
+        text, timestamps = raw
+        lines = _qwen_timestamps_to_lines(text, timestamps)
+    else:
+        text, words = raw
+        lines = _group_words_into_lines(words) if words else ([{"line": text, "start": 0.0, "end": 0.5, "words": []}] if text else [])
+    return _sanitize_timed_lines(lines, inline_parenthetical_background=task.inline_parenthetical_background)
+
+
+async def _selected_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dict]:
+    managed = await _managed_transcribe_worker(task, tmp_path)
+    if managed is not None:
+        return managed
+    lines = await _faster_stream_transcribe_worker(task, tmp_path)
+    if lines is not None:
+        return lines
+    return await _whisper_sync_worker(task, tmp_path, "")
+
+
+async def _selected_verify_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
+    model_id = task.transcribe_model or VERIFY_MODEL_SIZE
+    if model_id in MODEL_SPECS:
+        lines = await _managed_transcribe_worker(task, tmp_path) or []
+        transcription = " ".join(str(x.get("line", "")) for x in lines)
+        return _verify_lines([l for l in lyrics.splitlines() if l.strip()], transcription)
+    return await _whisper_verify_worker(task, tmp_path, lyrics)
+
+
 async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast_mode: bool = False) -> list[dict]:
     """Run align/transcribe in executor. Returns lines."""
     label = "Aligning" if lyrics else "Transcribing"
     spy = _ProgressSpy()
     spy.silent = True  # capture stable-ts tqdm instead of dumping raw progress into uvicorn logs
     loop = asyncio.get_running_loop()
-    model_obj = await get_align_model()
+    model_obj = await (get_align_model(task.sync_model or ALIGN_MODEL_SIZE) if lyrics else get_verify_model(task.transcribe_model or VERIFY_MODEL_SIZE))
     started = time.perf_counter()
     display = _display_name(task.song_name) or f"song {task.song_id}"
 
@@ -1116,9 +1508,14 @@ async def _run_sync_task(task: QueueTask) -> None:
     task.lyrics = lyrics
     if task.cancel_requested:
         raise asyncio.CancelledError()
-    task.progress = {"stage": "loading", "msg": "Loading Whisper model…", "step": "loading", "pct": 52}
+    sync_model = task.sync_model or ALIGN_MODEL_SIZE
+    label = get_managed_spec(sync_model).label if sync_model in MODEL_SPECS else f"Whisper {sync_model}"
+    task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 52}
     await _q_broadcast()
-    lines = await _whisper_sync_worker(task, tmp_path, lyrics)
+    if sync_model == "qwen3-forced-aligner-0.6b":
+        lines = await _qwen_sync_worker(task, tmp_path, lyrics)
+    else:
+        lines = await _whisper_sync_worker(task, tmp_path, lyrics)
     task.result   = {"lines": lines}
     task.progress = {"stage": "done", "msg": f"Done — {len(lines)} lines synced", "step": "done", "pct": 100}
 
@@ -1139,9 +1536,11 @@ async def _run_verify_task(task: QueueTask) -> None:
         raise ValueError("No lyrics to verify against.")
     if task.cancel_requested:
         raise asyncio.CancelledError()
-    task.progress = {"stage": "loading", "msg": "Loading Whisper model…", "step": "loading", "pct": 38}
+    transcribe_model = task.transcribe_model or VERIFY_MODEL_SIZE
+    label = get_managed_spec(transcribe_model).label if transcribe_model in MODEL_SPECS else f"Whisper {transcribe_model}"
+    task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 38}
     await _q_broadcast()
-    verify_results = await _whisper_verify_worker(task, tmp_path, lyrics)
+    verify_results = await _selected_verify_worker(task, tmp_path, lyrics)
     counts = {"present": 0, "uncertain": 0, "absent": 0}
     for r in verify_results:
         counts[r["status"]] += 1
@@ -1164,24 +1563,12 @@ async def _run_transcribe_task(task: QueueTask) -> None:
         tmp_path = await _download_audio(task, song)
     if task.cancel_requested:
         raise asyncio.CancelledError()
-    task.progress = {"stage": "loading", "msg": "Loading Whisper model…", "step": "loading", "pct": 30}
+    transcribe_model = task.transcribe_model or VERIFY_MODEL_SIZE
+    label = get_managed_spec(transcribe_model).label if transcribe_model in MODEL_SPECS else f"Whisper {transcribe_model}"
+    task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 30}
     await _q_broadcast()
 
-    # Faster-Whisper exposes its decoded segments as a generator, so publish
-    # them to the UI immediately instead of waiting for the whole song. The
-    # PyTorch backend has no equivalent segment-yielding API here and falls
-    # back to the normal stable-ts transcription path.
-    lines = await _faster_stream_transcribe_worker(task, tmp_path)
-    if lines is None:
-        task.progress = {
-            "stage": "transcribing",
-            "msg": "Transcribing… live preview requires Faster-Whisper",
-            "step": "transcribing",
-            "pct": 31,
-            "live": False,
-        }
-        await _q_broadcast()
-        lines = await _whisper_sync_worker(task, tmp_path, "")
+    lines = await _selected_transcribe_worker(task, tmp_path)
 
     plain_text = "\n".join(l["line"] for l in lines)
     task.live_lines = []
@@ -1204,15 +1591,12 @@ async def _run_auto_task(task: QueueTask) -> None:
     if task.cancel_requested:
         raise asyncio.CancelledError()
 
-    task.progress = {"stage": "loading", "msg": "Loading Whisper model…", "step": "loading", "pct": 28}
+    transcribe_model = task.transcribe_model or VERIFY_MODEL_SIZE
+    label = get_managed_spec(transcribe_model).label if transcribe_model in MODEL_SPECS else f"Whisper {transcribe_model}"
+    task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 28}
     await _q_broadcast()
 
-    # Prefer Faster-Whisper because it can stream decoded segments to the UI.
-    lines = await _faster_stream_transcribe_worker(task, tmp_path)
-    if lines is None:
-        task.progress = {"stage": "transcribing", "msg": "Running full Whisper transcription…", "step": "transcribing", "pct": 30}
-        await _q_broadcast()
-        lines = await _whisper_sync_worker(task, tmp_path, "")
+    lines = await _selected_transcribe_worker(task, tmp_path)
 
     plain_text = "\n".join(line.get("line", "") for line in lines).strip()
     task.lyrics = plain_text
@@ -1256,6 +1640,8 @@ async def _queue_processor() -> None:
                 await _run_auto_task(task)
             elif task.type == "transcribe":
                 await _run_transcribe_task(task)
+            elif task.type == "model_download":
+                await _run_model_download_task(task)
             if task.status in ("running", "cancelling"):   # runner didn't set error/cancelled
                 task.status = "done"
             if task.status == "done" and task.result and task.result.get("lines"):
@@ -1284,12 +1670,13 @@ async def _queue_processor() -> None:
 # App
 # ---------------------------------------------------------------------------
 def _log_startup_diagnostics() -> None:
-    resolved = _get_device(ENGINE_PREF)
+    managed_selected = ALIGN_MODEL_SIZE in MODEL_SPECS or VERIFY_MODEL_SIZE in MODEL_SPECS
+    resolved = _get_device("torch") if managed_selected else _get_device(ENGINE_PREF)
     table = Table(show_header=False, box=None, padding=(0, 2), expand=False)
     table.add_column(style="dim")
     table.add_column()
     table.add_row("Python", sys.executable)
-    table.add_row("Whisper", f"{ENGINE_PREF} · align {ALIGN_MODEL_SIZE} · verify {VERIFY_MODEL_SIZE}")
+    table.add_row("Models", f"sync {ALIGN_MODEL_SIZE} · transcribe {VERIFY_MODEL_SIZE} · Whisper engine {ENGINE_PREF}")
     table.add_row("Device", f"{DEVICE_PREF} → {resolved}")
 
     try:
@@ -1413,9 +1800,11 @@ async def save_processed(song_id: int, req: ProcessedSaveRequest):
         "task_type": req.source_type or "manual",
         "engine": ENGINE_PREF,
         "device_pref": DEVICE_PREF,
-        "resolved_device": _get_device(ENGINE_PREF),
+        "resolved_device": _get_device("torch") if (ALIGN_MODEL_SIZE in MODEL_SPECS or VERIFY_MODEL_SIZE in MODEL_SPECS) else _get_device(ENGINE_PREF),
         "align_model": ALIGN_MODEL_SIZE,
         "verify_model": VERIFY_MODEL_SIZE,
+        "sync_model": ALIGN_MODEL_SIZE,
+        "transcribe_model": VERIFY_MODEL_SIZE,
         **dict(req.settings or {}),
     }
     now = time.time()
@@ -1477,9 +1866,11 @@ async def save_local_processed(track_hash: str, req: ProcessedSaveRequest):
         "task_type": req.source_type or "manual",
         "engine": ENGINE_PREF,
         "device_pref": DEVICE_PREF,
-        "resolved_device": _get_device(ENGINE_PREF),
+        "resolved_device": _get_device("torch") if (ALIGN_MODEL_SIZE in MODEL_SPECS or VERIFY_MODEL_SIZE in MODEL_SPECS) else _get_device(ENGINE_PREF),
         "align_model": ALIGN_MODEL_SIZE,
         "verify_model": VERIFY_MODEL_SIZE,
+        "sync_model": ALIGN_MODEL_SIZE,
+        "transcribe_model": VERIFY_MODEL_SIZE,
         **dict(req.settings or {}),
     }
     now = time.time()
@@ -1592,76 +1983,118 @@ async def update_version(song_id: int, pk: int, req: VersionSaveRequest):
 
 @app.get("/api/model")
 async def get_model_info():
-    avail_device = "cuda" if _cuda_usable() else "cpu"
+    # Managed Qwen/Parakeet models run through PyTorch; Whisper's displayed
+    # device follows the selected Whisper engine for backward compatibility.
+    managed_selected = ALIGN_MODEL_SIZE in MODEL_SPECS or VERIFY_MODEL_SIZE in MODEL_SPECS
+    avail_device = "cuda" if (_torch_cuda_usable() if managed_selected else _cuda_usable()) else "cpu"
     return {
-        # legacy field kept for backward-compat
-        "model": ALIGN_MODEL_SIZE,
+        "model": ALIGN_MODEL_SIZE,  # legacy
         "loaded": _align_model is not None,
-        # new fields
-        "align_model":   ALIGN_MODEL_SIZE,
-        "verify_model":  VERIFY_MODEL_SIZE,
-        "device_pref":   DEVICE_PREF,
-        "engine":        ENGINE_PREF,
-        "engines":       WHISPER_ENGINES,
-        "device":        avail_device,
-        "align_loaded":  _align_model is not None,
-        "verify_loaded": _verify_model is not None,
-        "models":        WHISPER_MODELS,
+        "align_model": ALIGN_MODEL_SIZE,
+        "verify_model": VERIFY_MODEL_SIZE,
+        "device_pref": DEVICE_PREF,
+        "engine": ENGINE_PREF,
+        "engines": WHISPER_ENGINES,
+        "device": avail_device,
+        "align_loaded": _align_model is not None and _align_model_id == ALIGN_MODEL_SIZE,
+        "verify_loaded": _verify_model is not None and _verify_model_id == VERIFY_MODEL_SIZE,
+        "models": WHISPER_MODELS,  # legacy
+        "sync_models": SYNC_MODELS,
+        "transcribe_models": TRANSCRIBE_MODELS,
+        "managed_models": catalog_status(),
+    }
+
+
+@app.get("/api/models")
+async def get_managed_models():
+    return {"models": catalog_status(), "models_dir": str(pathlib.Path(__file__).parent / "models")}
+
+
+@app.post("/api/models/{model_id}/download")
+async def download_managed_model(model_id: str):
+    if model_id not in MODEL_SPECS:
+        raise HTTPException(404, f"Unknown managed model '{model_id}'")
+    task_id = await _enqueue_model_download(model_id)
+    return {
+        "model_id": model_id,
+        "installed": managed_model_installed(model_id),
+        "task_id": task_id,
     }
 
 
 @app.post("/api/model")
 async def set_model(body: dict):
     global ALIGN_MODEL_SIZE, VERIFY_MODEL_SIZE, DEVICE_PREF, ENGINE_PREF
-    global _align_model, _verify_model
+    global _align_model, _verify_model, _align_model_id, _verify_model_id
 
     changed_device = False
     changed_engine = False
+    queued_models: list[dict] = []
 
     if "engine" in body:
         engine = str(body["engine"]).strip()
         if engine not in WHISPER_ENGINES:
             raise HTTPException(400, f"engine must be one of: {', '.join(WHISPER_ENGINES)}")
-        ENGINE_PREF = engine
-        _write_pref(".engine_pref", engine)
-        changed_engine = True
+        if ENGINE_PREF != engine:
+            ENGINE_PREF = engine
+            _write_pref(".engine_pref", engine)
+            changed_engine = True
 
     if "device_pref" in body:
-        pref = body["device_pref"].strip()
+        pref = str(body["device_pref"]).strip()
         if pref not in ("auto", "cpu", "cuda"):
-            raise HTTPException(400, f"device_pref must be auto | cpu | cuda")
-        DEVICE_PREF = pref
-        _write_pref(".device_pref", pref)
-        changed_device = True
+            raise HTTPException(400, "device_pref must be auto | cpu | cuda")
+        if DEVICE_PREF != pref:
+            DEVICE_PREF = pref
+            _write_pref(".device_pref", pref)
+            changed_device = True
 
-    if "align_model" in body or "model" in body:     # "model" = legacy key
-        name = (body.get("align_model") or body.get("model", "")).strip()
-        if name not in WHISPER_MODELS:
-            raise HTTPException(400, f"Unknown model '{name}'")
-        ALIGN_MODEL_SIZE = name
-        _align_model = None
-        _write_pref(".model_pref_align", name)
-        _write_pref(".model_pref", name)              # keep legacy file in sync
+    if "align_model" in body or "model" in body:
+        name = str(body.get("align_model") or body.get("model", "")).strip()
+        if name not in SYNC_MODELS:
+            raise HTTPException(400, f"Unknown sync model '{name}'")
+        if ALIGN_MODEL_SIZE != name:
+            ALIGN_MODEL_SIZE = name
+            _align_model = None
+            _align_model_id = None
+            _write_pref(".model_pref_align", name)
+            _write_pref(".model_pref", name)
+        if name in MODEL_SPECS and not managed_model_installed(name):
+            tid = await _enqueue_model_download(name)
+            if tid:
+                queued_models.append({"model_id": name, "task_id": tid})
 
-    if "verify_model" in body:
-        name = body["verify_model"].strip()
-        if name not in WHISPER_MODELS:
-            raise HTTPException(400, f"Unknown model '{name}'")
-        VERIFY_MODEL_SIZE = name
-        _verify_model = None
-        _write_pref(".model_pref_verify", name)
+    if "verify_model" in body or "transcribe_model" in body:
+        name = str(body.get("verify_model") or body.get("transcribe_model", "")).strip()
+        if name not in TRANSCRIBE_MODELS:
+            raise HTTPException(400, f"Unknown transcription model '{name}'")
+        if VERIFY_MODEL_SIZE != name:
+            VERIFY_MODEL_SIZE = name
+            _verify_model = None
+            _verify_model_id = None
+            _write_pref(".model_pref_verify", name)
+        if name in MODEL_SPECS and not managed_model_installed(name):
+            # Dependencies are enqueued first by _enqueue_model_download.
+            tid = await _enqueue_model_download(name)
+            if tid:
+                queued_models.append({"model_id": name, "task_id": tid})
 
     if changed_device or changed_engine:
         _release_models()
 
+    managed_selected = ALIGN_MODEL_SIZE in MODEL_SPECS or VERIFY_MODEL_SIZE in MODEL_SPECS
     return {
-        "align_model":   ALIGN_MODEL_SIZE,
-        "verify_model":  VERIFY_MODEL_SIZE,
-        "device_pref":   DEVICE_PREF,
-        "engine":        ENGINE_PREF,
-        "device":        "cuda" if _cuda_usable() else "cpu",
-        "align_loaded":  _align_model is not None,
-        "verify_loaded": _verify_model is not None,
+        "align_model": ALIGN_MODEL_SIZE,
+        "verify_model": VERIFY_MODEL_SIZE,
+        "device_pref": DEVICE_PREF,
+        "engine": ENGINE_PREF,
+        "device": "cuda" if (_torch_cuda_usable() if managed_selected else _cuda_usable()) else "cpu",
+        "align_loaded": _align_model is not None and _align_model_id == ALIGN_MODEL_SIZE,
+        "verify_loaded": _verify_model is not None and _verify_model_id == VERIFY_MODEL_SIZE,
+        "sync_models": SYNC_MODELS,
+        "transcribe_models": TRANSCRIBE_MODELS,
+        "managed_models": catalog_status(),
+        "queued_models": queued_models,
     }
 
 
@@ -2581,6 +3014,17 @@ class QueueAddRequest(BaseModel):
 async def queue_add(req: QueueAddRequest):
     if req.type not in ("sync", "verify", "auto", "transcribe"):
         raise HTTPException(400, f"Unknown task type '{req.type}'")
+
+    # Snapshot model choices at enqueue time so a settings change made while a
+    # task is waiting cannot silently change which model that task will use.
+    sync_model = ALIGN_MODEL_SIZE
+    transcribe_model = VERIFY_MODEL_SIZE
+    model_tasks: list[str] = []
+    for model_id in _task_model_requirements(req.type, sync_model, transcribe_model):
+        tid = await _enqueue_model_download(model_id)
+        if tid:
+            model_tasks.append(tid)
+
     task = QueueTask(
         id=str(uuid.uuid4())[:8],
         type=req.type,
@@ -2595,11 +3039,13 @@ async def queue_add(req: QueueAddRequest):
         inline_parenthetical_background=req.inline_parenthetical_background,
         allow_overlapping_lyrics=req.allow_overlapping_lyrics,
         interlude_threshold=max(0.0, req.interlude_threshold),
+        sync_model=sync_model,
+        transcribe_model=transcribe_model,
     )
     _tasks[task.id] = task
     await _task_queue.put(task)
     await _q_broadcast()
-    return {"task_id": task.id}
+    return {"task_id": task.id, "model_tasks": model_tasks}
 
 
 @app.get("/api/queue")

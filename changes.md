@@ -1,6 +1,30 @@
 this file lists changes I have made whilest you (codex) have been inactive
 > one thing I actually want u to add is the project storing already processed lyrics in a database, than storing its processing settings in it aswell, using the song ID as the database ID/key
 
+## 2026-08-29 Preview → Lyrics source pin / auto-scroll shortcut
+
+- Added a Feather `map-pin` action immediately to the left of each Preview line timestamp. Clicking it switches to the raw Lyrics tab, finds the raw line that best corresponds to that Preview line, scrolls the textarea to it, focuses the textarea, and places the caret at the first character of the matched line.
+- Preview lines now keep lightweight `source_line_index` / `source_line_text` hints when the raw Lyrics and timed Preview can be confidently mapped. These hints are preserved with the timed-line objects when the normal processed-state save path runs.
+- The source-pin resolver is edit-tolerant instead of trusting a stale array index: it first validates the original index, then searches for the original/current line text, prefers the nearest duplicate occurrence for repeated choruses, and finally uses fuzzy word-overlap plus positional bias. If the source was rewritten beyond recognition it falls back to the nearest sensible raw-line ordinal instead of becoming a dead control.
+- Raw Lyrics scrolling uses a temporary textarea mirror so wrapped lines are positioned correctly; the destination line is brought into view and the caret is placed at its exact starting offset. If Verify is currently replacing the textarea, the pin restores the editable raw Lyrics view first.
+- Added the Preview shortcut `` ` `` (Backquote) to toggle lyric auto-scroll. Turning it back on performs the same smooth active/nearest-line re-anchor as the Resume control; turning it off immediately cancels an in-flight follow animation and shows Resume. The shortcut is also listed in the compact shortcut hint/popover and is ignored while Settings or a text/control field has focus.
+
+## 2026-08-29 Qwen / Parakeet model manager
+
+- Added Qwen3-ASR 0.6B and 1.7B as alternative Auto/Transcribe models, Qwen3 Forced Aligner 0.6B as a Sync model, and NVIDIA Parakeet TDT 0.6B v3 as another transcription option. Existing Whisper choices remain available.
+- Uses the native Hugging Face Transformers `-hf` Qwen checkpoints (`Qwen3-ASR-0.6B-hf`, `Qwen3-ASR-1.7B-hf`, and `Qwen3-ForcedAligner-0.6B-hf`) with Transformers 5.13+ instead of the separate `qwen-asr` package. This keeps the runtime cleaner on the project's current Python version and still provides Qwen's native transcription/forced-alignment APIs.
+- Qwen Auto/Transcribe performs ASR first and then runs the Qwen forced aligner on that transcript so the normal Preview/Apple TTML path still receives real word start/end timestamps. Sync with Qwen skips ASR entirely and only aligns the raw Lyrics text.
+- Qwen ASR and Sync share one loaded forced-aligner runtime when possible so the aligner is not needlessly duplicated in VRAM. Managed Torch models use CUDA/BF16 when available and CPU/FP32 otherwise.
+- Parakeet uses its native Transformers TDT checkpoint and predicted token durations; those token timestamps are merged into normal timed words/lines without inventing back-to-back timing.
+- Added project-local managed model storage under `models/` and ignored that directory in git. Multi-gigabyte weights are not bundled into the repository/project archive.
+- Added model-download jobs to Task Queue. Selecting a missing managed model queues preparation automatically, displays download/copy/hash-verification progress in the existing queue UI, and Qwen ASR queues the forced aligner dependency before its own weights.
+- Before downloading, the model manager searches Hugging Face caches plus common user model folders (`Models`, `models`, `AI`, `Downloads`, `Documents`), sibling project `models/` directories, common Windows drive model folders, and optional `WRLD_MODEL_SEARCH_PATHS`. It prefers the exact cached repository revision when available.
+- Existing model candidates are never blindly copied. Required file sizes are checked, every Hugging Face LFS/Xet weight is SHA-256 verified against repository metadata, and ordinary Git-tracked config/tokenizer files are checked against their Git blob hashes. The project-local copy is verified a second time after copying. Fresh downloads go through the same verification before becoming active.
+- Verified models receive a `.wrld-model.json` manifest containing repository/revision/file sizes/hashes/mtimes. Normal status polling uses that manifest rather than re-hashing several gigabytes every frame, while changed files invalidate the quick installed check.
+- Model downloads resolve the exact remote commit SHA before transfer so the metadata used for verification and the downloaded checkpoint cannot race against a moving `main` branch. Interrupted temporary model directories are cleaned before retrying. Hugging Face's own progress bars are suppressed because Task Queue now owns progress presentation.
+- Added `/api/models` model catalog/status and `/api/models/{model_id}/download` endpoints, while `/api/model` now exposes separate Sync and Transcription model choices plus managed-model installation state.
+- Processing tasks snapshot their selected Sync/Transcription model when queued, so changing Settings while work is waiting cannot silently switch the model halfway through the queue. Model choice is also included with stored processing settings.
+
 ## 2026-08-29 Auto-follow root-cause / hard shutdown fix
 
 - Fixed the actual reason Preview auto-scroll could do nothing in Chromium/Opera GX. The horizontal-overflow guard applied `overflow-x:hidden` to `.lyrics-body`; per CSS overflow-axis rules that implicitly computed its `overflow-y` to `auto`, making `.lyrics-body` a second hidden vertical scroller. All camera code was correctly moving `#lyricsSection`, but `#lyricsSection` had no scroll range. Descendant lyric containers now use `overflow-x:clip` / visible Y overflow so `#lyricsSection` is the one and only lyric scroller.

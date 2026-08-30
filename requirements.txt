@@ -8,3 +8,6 @@ python-multipart>=0.0.9
 beautifulsoup4>=4.12
 rich>=13.7
 mutagen>=1.47
+huggingface-hub[hf_xet]>=0.34
+transformers>=5.13.0,<6
+rich
