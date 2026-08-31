@@ -529,7 +529,7 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
-    padding-bottom: calc(var(--controls-height, 120px) + 12px); /* measured so wrapped controls never cover the last lyric */
+    padding-bottom: 12px;
   }
 
   /* Auto-follow resume bar — lives OUTSIDE lyricsSection so it doesn't scroll away */
@@ -958,21 +958,63 @@
   #plainLyricsText:focus { border-color: var(--accent2); }
   #plainLyricsText::placeholder { color: var(--muted); font-style: italic; }
 
-  /* ── Controls bar — floats over lyrics inside .lyrics-controls-area ── */
+  /* ── Controls bar — normal document flow, never overlays lyrics ── */
   .controls {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    padding: 13px 20px;
+    position: relative;
+    flex: 0 0 auto;
+    padding: 11px 18px 13px;
     background: rgba(13,13,20,.82);
     backdrop-filter: blur(22px) saturate(1.2);
-    -webkit-backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(22px) saturate(1.2);
     border-top: 1px solid var(--border);
-    box-shadow: 0 -6px 28px rgba(0,0,0,.55);
-    z-index: 10;
+    box-shadow: 0 -4px 24px rgba(0,0,0,.32);
+    z-index: 3;
   }
-  audio { width: 100%; accent-color: var(--accent2); }
+  #audioPlayer { display: none; }
+  .player-transport {
+    display: grid;
+    grid-template-columns: 34px auto minmax(80px,1fr) auto auto;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+  .player-icon-btn {
+    width: 32px; height: 32px; display: grid; place-items: center; padding: 0;
+    border: 0; border-radius: 8px; background: transparent; color: rgba(255,255,255,.9);
+    cursor: pointer; transition: color .15s, background .15s, transform .12s;
+  }
+  .player-icon-btn:hover { color: #fff; background: rgba(255,255,255,.055); }
+  .player-icon-btn:active { transform: scale(.94); }
+  .player-time { color: rgba(255,255,255,.5); font-size: .69rem; font-variant-numeric: tabular-nums; min-width: 35px; }
+  .player-time.total { text-align: right; }
+  .player-range {
+    --seek-pct: 0%;
+    width: 100%; height: 14px; margin: 0; appearance: none; background: transparent; cursor: pointer;
+  }
+  .player-range::-webkit-slider-runnable-track {
+    height: 3px; border-radius: 99px;
+    background: linear-gradient(90deg, rgba(175,136,255,.95) 0 var(--seek-pct), rgba(255,255,255,.14) var(--seek-pct) 100%);
+  }
+  .player-range::-webkit-slider-thumb {
+    appearance: none; width: 10px; height: 10px; margin-top: -3.5px; border-radius: 50%; border: 0; background: rgba(255,255,255,.94);
+    box-shadow: 0 1px 5px rgba(0,0,0,.45); opacity: 0; transform: scale(.75); transition: opacity .13s, transform .13s;
+  }
+  .player-range:hover::-webkit-slider-thumb, .player-range:focus-visible::-webkit-slider-thumb { opacity: 1; transform: scale(1); }
+  .player-range::-moz-range-track { height: 3px; border-radius: 99px; background: rgba(255,255,255,.14); }
+  .player-range::-moz-range-progress { height: 3px; border-radius: 99px; background: rgba(175,136,255,.95); }
+  .player-range::-moz-range-thumb { width: 10px; height: 10px; border: 0; border-radius: 50%; background: rgba(255,255,255,.94); }
+  .player-volume { display: flex; align-items: center; gap: 4px; width: 128px; }
+  #volumeRange { --volume-pct: 100%; width: 86px; }
+  #volumeRange::-webkit-slider-runnable-track {
+    background: linear-gradient(90deg, rgba(255,255,255,.72) 0 var(--volume-pct), rgba(255,255,255,.13) var(--volume-pct) 100%);
+  }
+  #volumeRange.is-muted::-webkit-slider-runnable-track {
+    background: linear-gradient(90deg, rgba(255,255,255,.25) 0 var(--volume-pct), rgba(255,255,255,.1) var(--volume-pct) 100%);
+  }
+  #volumeWave1, #volumeWave2 { transition: opacity .16s; }
+  #volumeMuteX { display: none; }
+  .player-icon-btn.is-muted #volumeMuteX { display: block; }
+  .player-icon-btn.is-muted #volumeWave1, .player-icon-btn.is-muted #volumeWave2 { display: none; }
 
   .sync-row {
     display: flex;
@@ -984,6 +1026,27 @@
   }
   .btn-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .btn-divider { width: 1px; height: 22px; background: var(--border); margin: 0 2px; flex-shrink: 0; }
+  .vocal-ref-wrap { position: relative; display: flex; align-items: center; }
+  #uploadVocalsBtn.has-reference {
+    color: #89e5ad; border-color: rgba(74,222,128,.28); background: rgba(34,197,94,.08); padding-right: 20px;
+  }
+  .vocal-ref-remove {
+    display: none; position: absolute; right: -5px; top: -6px; width: 17px; height: 17px; padding: 0; place-items: center;
+    border: 1px solid rgba(255,255,255,.16); border-radius: 50%; background: #202028; color: rgba(255,255,255,.72);
+    font-size: 12px; line-height: 1; cursor: pointer; box-shadow: 0 2px 7px rgba(0,0,0,.38);
+  }
+  .vocal-ref-wrap.has-reference .vocal-ref-remove { display: grid; }
+  .vocal-ref-menu {
+    display: none; position: absolute; left: 0; bottom: calc(100% + 7px); z-index: 40; min-width: 155px; padding: 5px;
+    border: 1px solid rgba(255,255,255,.1); border-radius: 10px; background: rgba(25,25,34,.96); box-shadow: 0 12px 30px rgba(0,0,0,.45);
+    backdrop-filter: blur(18px);
+  }
+  .vocal-ref-menu.visible { display: grid; }
+  .vocal-ref-menu button {
+    padding: 7px 9px; border: 0; border-radius: 7px; background: transparent; color: rgba(255,255,255,.78); text-align: left;
+    font: inherit; font-size: .73rem; cursor: pointer;
+  }
+  .vocal-ref-menu button:hover { background: rgba(255,255,255,.065); color: #fff; }
 
   /* Shared control-button base — replaces the old one-off per-button styles */
   .ctrl-btn {
@@ -1606,7 +1669,7 @@
     .kl.primary .kl-content { transform: translateX(2px) scale(1.018); }
     .kl.overlap-current .kl-content { transform: translateX(1px) scale(1.008); }
     .kl-actions { opacity: 1; }
-    #lyricsSection { padding-bottom: calc(var(--controls-height, 116px) + 10px); }
+    #lyricsSection { padding-bottom: 10px; }
     .controls { padding: 9px 10px 10px; }
     .sync-row { flex-wrap: nowrap; overflow-x: auto; padding: 1px 1px 5px; scrollbar-width: thin; }
     .btn-group { flex-wrap: nowrap; }
@@ -2205,6 +2268,89 @@
     .settings-switch-row { gap: 11px; }
   }
 
+
+  .settings-tabs { display:flex; align-items:center; gap:4px; padding:9px 12px 8px; border-bottom:1px solid rgba(255,255,255,.065); flex:0 0 auto; }
+  .settings-tab { position:relative; padding:7px 11px; border:0; background:transparent; color:rgba(255,255,255,.44); font:inherit; font-size:.76rem; font-weight:620; cursor:pointer; }
+  .settings-tab:hover { color:rgba(255,255,255,.75); }
+  .settings-tab.active { color:#c9adff; }
+  .settings-tab.active::after { content:""; position:absolute; left:9px; right:9px; bottom:-9px; height:2px; border-radius:99px; background:#9f74f5; }
+  .settings-close-btn { margin-left:auto; width:28px; height:28px; border:0; border-radius:8px; background:transparent; color:rgba(255,255,255,.46); font-size:18px; cursor:pointer; }
+  .settings-close-btn:hover { color:#fff; background:rgba(255,255,255,.055); }
+  .settings-scroll [data-settings-page] { display:none; }
+  .settings-scroll[data-page="general"] [data-settings-page="general"],
+  .settings-scroll[data-page="models"] [data-settings-page="models"],
+  .settings-scroll[data-page="advanced"] [data-settings-page="advanced"] { display:block; }
+  .settings-scroll[data-page="models"], .settings-scroll[data-page="advanced"] { grid-template-columns:1fr; }
+  .settings-scroll[data-page="models"] [data-settings-page="models"], .settings-scroll[data-page="advanced"] [data-settings-page="advanced"] { grid-column:1/-1; }
+  .model-catalog-tools { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }
+  .model-filter-group { display:flex; gap:2px; padding:2px; border:1px solid rgba(255,255,255,.07); border-radius:8px; background:rgba(255,255,255,.025); }
+  .model-filter-group button { border:0; border-radius:6px; padding:5px 8px; background:transparent; color:rgba(255,255,255,.4); font:inherit; font-size:.65rem; cursor:pointer; }
+  .model-filter-group button.active { color:#fff; background:rgba(255,255,255,.08); }
+  .model-search-shell { margin-left:auto; display:flex; align-items:center; gap:6px; min-width:180px; padding:0 9px; border:1px solid rgba(255,255,255,.08); border-radius:8px; background:rgba(0,0,0,.16); color:rgba(255,255,255,.3); }
+  .model-search-shell input { width:100%; padding:7px 0; border:0; outline:0; background:transparent; color:#fff; font:inherit; font-size:.7rem; }
+  .model-catalog-cards { display:grid; gap:8px; margin-top:10px; }
+  .model-card { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px 14px; padding:11px 12px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:rgba(255,255,255,.018); }
+  .model-card-title { display:flex; gap:7px; align-items:center; flex-wrap:wrap; }
+  .model-card-title strong { font-size:.75rem; color:rgba(255,255,255,.88); }
+  .model-tag { padding:2px 5px; border-radius:5px; background:rgba(124,58,237,.11); color:rgba(206,180,255,.76); font-size:.55rem; }
+  .model-card-desc { margin-top:3px; color:rgba(255,255,255,.35); font-size:.61rem; line-height:1.4; }
+  .model-card-stats { display:flex; gap:10px; flex-wrap:wrap; color:rgba(255,255,255,.43); font-size:.58rem; }
+  .model-card-action { align-self:center; min-width:32px; height:30px; padding:0 9px; border:1px solid rgba(255,255,255,.09); border-radius:8px; background:rgba(255,255,255,.035); color:rgba(255,255,255,.7); cursor:pointer; }
+  .model-card-action:hover:not(:disabled) { color:#fff; border-color:rgba(160,112,255,.45); }
+  .model-card-action:disabled { opacity:.38; cursor:not-allowed; }
+  .model-card-progress { grid-column:1/-1; display:none; height:3px; border-radius:99px; overflow:hidden; background:rgba(255,255,255,.08); }
+  .model-card.is-downloading .model-card-progress { display:block; }
+  .model-card-progress > span { display:block; width:0; height:100%; background:#9567ef; transition:width .18s linear; }
+  .model-catalog-heading { display:flex; align-items:flex-start; gap:10px; }
+  .model-catalog-heading > div:first-child { flex:1; }
+  .model-guide-btn, .model-guide-back { flex:0 0 auto; display:grid; place-items:center; border:1px solid rgba(255,255,255,.075); background:rgba(255,255,255,.025); color:rgba(255,255,255,.48); cursor:pointer; transition:color .16s ease,border-color .16s ease,background .16s ease; }
+  .model-guide-btn { width:28px; height:28px; border-radius:8px; }
+  .model-guide-btn:hover, .model-guide-back:hover { color:#fff; border-color:rgba(159,116,245,.32); background:rgba(159,116,245,.08); }
+  .model-search-symbol { font-family:'Material Symbols Rounded'; font-size:16px; font-weight:300; line-height:1; flex:0 0 auto; }
+  .model-catalog-main[hidden], .model-guide-page[hidden] { display:none; }
+  .model-guide-head { display:flex; align-items:flex-start; gap:10px; margin-bottom:12px; }
+  .model-guide-back { width:29px; height:29px; border-radius:8px; }
+  .model-guide-head-copy h3 { color:rgba(255,255,255,.9); font-size:.82rem; }
+  .model-guide-head-copy p { margin-top:3px; color:rgba(255,255,255,.38); font-size:.64rem; line-height:1.45; }
+  .model-guide-catalog { display:grid; gap:9px; }
+  .model-guide-card { padding:12px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:rgba(255,255,255,.018); }
+  .model-guide-title { display:flex; align-items:center; flex-wrap:wrap; gap:7px; }
+  .model-guide-title strong { color:rgba(255,255,255,.88); font-size:.76rem; }
+  .model-guide-desc { margin-top:5px; color:rgba(255,255,255,.38); font-size:.62rem; line-height:1.45; }
+  .model-guide-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin-top:10px; }
+  .model-guide-stat { min-width:0; padding:8px; border-radius:8px; background:rgba(0,0,0,.14); }
+  .model-guide-stat small { display:block; color:rgba(255,255,255,.31); font-size:.54rem; }
+  .model-guide-stat strong { display:block; margin-top:3px; color:rgba(255,255,255,.69); font-size:.62rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .model-rating-dots { display:flex; gap:3px; margin-top:5px; }
+  .model-rating-dots i { width:5px; height:5px; border-radius:50%; background:rgba(255,255,255,.12); }
+  .model-rating-dots i.on { background:rgba(180,142,255,.78); }
+  .model-details-toggle { width:100%; margin-top:9px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:7px 0 1px; border:0; background:transparent; color:rgba(255,255,255,.4); font:inherit; font-size:.58rem; cursor:pointer; text-align:left; }
+  .model-details-toggle svg { transition:transform .24s var(--ease); }
+  .model-details-toggle.open svg { transform:rotate(180deg); }
+  .model-details-body { display:grid; grid-template-rows:0fr; opacity:0; transition:grid-template-rows .24s var(--ease),opacity .18s ease; }
+  .model-details-body.open { grid-template-rows:1fr; opacity:1; }
+  .model-details-body > div { min-height:0; overflow:hidden; }
+  .model-details-body dl { display:grid; grid-template-columns:max-content 1fr; gap:5px 9px; padding-top:8px; color:rgba(255,255,255,.42); font-size:.57rem; line-height:1.4; }
+  .model-details-body dt { color:rgba(255,255,255,.27); }
+  .model-tooltip { position:fixed; z-index:1200; max-width:260px; padding:6px 8px; border:1px solid rgba(255,255,255,.08); border-radius:7px; background:rgba(15,15,22,.97); color:rgba(255,255,255,.72); box-shadow:0 10px 28px rgba(0,0,0,.4); font-size:.58rem; line-height:1.4; pointer-events:none; opacity:0; transform:translateY(3px); transition:opacity .12s ease,transform .12s ease; }
+  .model-tooltip.visible { opacity:1; transform:translateY(0); }
+  @media (max-width:700px) { .model-guide-stats { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .pipeline-row { display:flex; align-items:stretch; gap:7px; overflow-x:auto; margin-top:10px; }
+  .pipeline-row > span { min-width:120px; flex:1; display:flex; flex-direction:column; gap:3px; padding:9px 10px; border:1px solid rgba(255,255,255,.06); border-radius:9px; background:rgba(255,255,255,.02); }
+  .pipeline-row small { color:rgba(255,255,255,.32); font-size:.57rem; }
+  .pipeline-row strong { color:rgba(255,255,255,.76); font-size:.65rem; font-weight:620; }
+  .pipeline-row b { align-self:center; color:rgba(255,255,255,.2); font-weight:400; }
+  .advanced-fields { margin-top:10px; }
+  .settings-disabled-control { align-self:end; min-height:42px; border:1px solid rgba(255,255,255,.055); border-radius:9px; background:rgba(255,255,255,.018); color:rgba(255,255,255,.2); cursor:not-allowed; }
+
+  .confirm-backdrop { position:fixed; inset:0; z-index:900; display:grid; place-items:center; padding:18px; background:rgba(0,0,0,.58); backdrop-filter:blur(7px); }
+  .confirm-backdrop[hidden] { display:none; }
+  .confirm-dialog { width:min(360px,100%); padding:16px; border:1px solid rgba(255,255,255,.1); border-radius:14px; background:#17171f; box-shadow:0 20px 60px rgba(0,0,0,.55); }
+  .confirm-dialog strong { color:rgba(255,255,255,.92); font-size:.88rem; }
+  .confirm-dialog p { margin:7px 0 15px; color:rgba(255,255,255,.46); font-size:.72rem; line-height:1.45; }
+  .confirm-dialog > div { display:flex; justify-content:flex-end; gap:7px; }
+  .confirm-dialog button { padding:7px 11px; border:1px solid rgba(255,255,255,.09); border-radius:8px; background:rgba(255,255,255,.04); color:rgba(255,255,255,.72); cursor:pointer; }
+  .confirm-dialog button.danger { border-color:rgba(239,68,68,.35); background:rgba(239,68,68,.12); color:#fca5a5; }
 </style>
 </head>
 <body>
@@ -2276,8 +2422,14 @@
 
 <div id="settingsBackdrop" aria-hidden="true"></div>
 <div id="settingsPanel" aria-label="Settings" role="dialog" aria-modal="true" tabindex="-1">
-  <div class="settings-scroll">
-    <section class="settings-section settings-account-section">
+  <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+    <button class="settings-tab active" data-settings-tab="general" type="button" role="tab" aria-selected="true">General</button>
+    <button class="settings-tab" data-settings-tab="models" type="button" role="tab" aria-selected="false">Models</button>
+    <button class="settings-tab" data-settings-tab="advanced" type="button" role="tab" aria-selected="false">Advanced</button>
+    <button id="settingsCloseBtn" class="settings-close-btn" type="button" aria-label="Close settings">×</button>
+  </div>
+  <div class="settings-scroll" data-page="general">
+    <section class="settings-section settings-account-section" data-settings-page="general">
       <div class="settings-section-head">
         <div class="settings-section-icon" aria-hidden="true"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg></div>
         <div><h3>API access</h3><p>Used when submitting synced lyrics back to the Juice WRLD API.</p></div>
@@ -2295,7 +2447,7 @@
       <div class="settings-status-line"><span id="tokenStatus" class="token-status" aria-live="polite"></span></div>
     </section>
 
-    <section class="settings-section">
+    <section class="settings-section" data-settings-page="models">
       <div class="settings-section-head">
         <div class="settings-section-icon" aria-hidden="true"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></div>
         <div><h3>Models</h3><p>Choose separate models for lyric transcription and forced alignment. Missing local models download through the Task Queue.</p></div>
@@ -2322,6 +2474,9 @@
               </optgroup>
               <optgroup label="Qwen">
                 <option value="qwen3-forced-aligner-0.6b" data-managed-model="qwen3-forced-aligner-0.6b" data-base-label="Qwen3 Forced Aligner 0.6B">Qwen3 Forced Aligner 0.6B · download</option>
+              </optgroup>
+              <optgroup label="HuBERT FA · experimental">
+                <option value="hubert-fa-combined" data-managed-model="hubert-fa-combined" data-base-label="HuBERT FA combined">HuBERT FA combined · download</option>
               </optgroup>
             </select>
             <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
@@ -2350,7 +2505,7 @@
       <div class="settings-status-line"><span id="modelInstallStatus" class="token-status" aria-live="polite"></span></div>
     </section>
 
-    <section class="settings-section">
+    <section class="settings-section" data-settings-page="general">
       <div class="settings-section-head settings-section-head-row">
         <div class="settings-section-head-copy">
           <div class="settings-section-icon" aria-hidden="true"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01"/><path d="M7 16h10"/></svg></div>
@@ -2365,7 +2520,7 @@
       </div>
     </section>
 
-    <section class="settings-section">
+    <section class="settings-section" data-settings-page="general">
       <div class="settings-section-head">
         <div class="settings-section-icon" aria-hidden="true"><svg width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h5M8 16h8"/></svg></div>
         <div><h3>Apple TTML</h3><p>Control how synced lyrics are interpreted and exported.</p></div>
@@ -2393,11 +2548,79 @@
         </label>
       </div>
     </section>
+
+    <section class="settings-section settings-model-catalog" data-settings-page="models">
+      <div id="modelCatalogMain" class="model-catalog-main">
+        <div class="settings-section-head model-catalog-heading">
+          <div><h3>Model catalog</h3><p>Install state and model selection are separate. Ratings are comparative estimates from public model information, not local benchmarks.</p></div>
+          <button id="modelGuideBtn" class="model-guide-btn" type="button" title="Model guide" aria-label="Open model guide">
+            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          </button>
+        </div>
+        <div class="model-catalog-tools">
+          <div class="model-filter-group" id="catalogScopeFilter"><button class="active" data-catalog-scope="curated" type="button">Curated</button><button data-catalog-scope="all" type="button">All models</button></div>
+          <div class="model-filter-group" id="catalogTaskFilter"><button class="active" data-catalog-task="all" type="button">All</button><button data-catalog-task="transcription" type="button">Transcription</button><button data-catalog-task="alignment" type="button">Alignment</button><button data-catalog-task="separation" type="button">Separation</button></div>
+          <label class="model-search-shell"><span class="material-symbols-rounded model-search-symbol" aria-hidden="true">search</span><input id="modelCatalogSearch" type="search" placeholder="Search models" autocomplete="off" /></label>
+        </div>
+        <div id="modelCatalogCards" class="model-catalog-cards"></div>
+      </div>
+      <div id="modelGuidePage" class="model-guide-page" hidden>
+        <div class="model-guide-head">
+          <button id="modelGuideBack" class="model-guide-back" type="button" aria-label="Back to model catalog" title="Back to model catalog">
+            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+          </button>
+          <div class="model-guide-head-copy"><h3>Model guide</h3><p>These ratings compare the available models using public model information, architecture, size, and stated capabilities. They are not measured benchmarks on this computer.</p></div>
+        </div>
+        <div id="modelGuideCatalog" class="model-guide-catalog"></div>
+      </div>
+    </section>
+    <div id="modelTooltip" class="model-tooltip" role="tooltip"></div>
+
+    <section class="settings-section settings-advanced-section" data-settings-page="advanced">
+      <div class="settings-section-head"><div><h3>Processing Pipeline</h3><p>The stages below reflect the currently selected models and vocal source.</p></div></div>
+      <div class="pipeline-row" id="advancedPipeline">
+        <span><small>Vocal source</small><strong id="pipelineVocalSource">Original mix</strong></span><b>→</b>
+        <span><small>Transcription</small><strong id="pipelineTranscription">Whisper base</strong></span><b>→</b>
+        <span><small>Alignment</small><strong id="pipelineAlignment">Whisper small</strong></span><b>→</b>
+        <span><small>Output</small><strong>Apple TTML</strong></span>
+      </div>
+    </section>
+
+    <section class="settings-section" data-settings-page="advanced">
+      <div class="settings-section-head"><div><h3>Vocal isolation</h3><p>Optionally cache an all-vocals stem. Manual Upload Vocals references override this stage.</p></div></div>
+      <div class="settings-switch-list">
+        <label class="settings-switch-row"><span class="settings-switch-copy"><strong>Isolate vocals with UVR</strong><small>Use a cached all-vocals stem for transcription/alignment.</small></span><input id="advancedPreprocessVocals" class="settings-switch-input" type="checkbox" /><span class="settings-switch-track" aria-hidden="true"><span></span></span></label>
+      </div>
+      <div class="settings-field-grid advanced-fields">
+        <label class="settings-field"><span class="settings-field-title">Separator model</span><span class="settings-select-shell"><select id="advancedSeparatorModel"></select><svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></span></label>
+        <label class="settings-field"><span class="settings-field-title">Target</span><span class="settings-select-shell"><select disabled><option>All vocals</option></select></span></label>
+      </div>
+    </section>
+
+    <section class="settings-section" data-settings-page="advanced">
+      <div class="settings-section-head"><div><h3>URL extraction</h3><p>yt-dlp handles YouTube, YouTube Music, SoundCloud, and webpage-backed media URLs.</p></div></div>
+      <div class="settings-switch-list">
+        <label class="settings-switch-row"><span class="settings-switch-copy"><strong>Enable yt-dlp extraction</strong><small>Direct audio URLs continue to use the lightweight HTTP path.</small></span><input id="advancedYtDlpEnabled" class="settings-switch-input" type="checkbox" checked /><span class="settings-switch-track" aria-hidden="true"><span></span></span></label>
+      </div>
+      <div class="settings-field-grid advanced-fields">
+        <label class="settings-field"><span class="settings-field-title">Audio quality</span><span class="settings-select-shell"><select id="advancedYtDlpQuality"><option value="high">High · best available</option><option value="medium">Medium · prefer ≤192 kbps</option><option value="small">Small · prefer ≤96 kbps</option></select><svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></span></label>
+        <button id="advancedCookiesBtn" class="settings-disabled-control" type="button" disabled title="Cookie/auth import is intentionally not implemented yet.">Cookies · not available yet</button>
+      </div>
+      <div id="advancedStatus" class="settings-status-line token-status" aria-live="polite"></div>
+    </section>
   </div>
 
   <div class="settings-modal-foot">
     <span><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg> Model and TTML changes save automatically.</span>
     <span>API token saves when you press <strong>Save token</strong>.</span>
+  </div>
+</div>
+
+<div id="confirmBackdrop" class="confirm-backdrop" hidden>
+  <div id="confirmDialog" class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMessage">
+    <strong id="confirmTitle">Confirm</strong>
+    <p id="confirmMessage"></p>
+    <div><button id="confirmCancelBtn" type="button">Cancel</button><button id="confirmOkBtn" class="danger" type="button">Remove</button></div>
   </div>
 </div>
 
@@ -2596,9 +2819,28 @@
           </div>
         </div><!-- /lyricsSection -->
 
-        <!-- Controls bar — position:absolute so it floats over lyrics -->
+        <!-- Controls bar — normal flow, below lyrics -->
         <div class="controls">
-          <audio id="audioPlayer" controls></audio>
+          <audio id="audioPlayer" preload="metadata"></audio>
+          <div class="player-transport" aria-label="Audio player controls">
+            <button id="playerPlayBtn" class="player-icon-btn" type="button" aria-label="Play" title="Play / pause">
+              <svg id="playerPlayIcon" width="18" height="18" fill="currentColor" stroke="none" viewBox="0 0 24 24" aria-hidden="true"><polygon points="7 4 20 12 7 20 7 4"/></svg>
+            </button>
+            <span id="playerCurrentTime" class="player-time">0:00</span>
+            <input id="seekRange" class="player-range" type="range" min="0" max="1000" value="0" step="1" aria-label="Seek" />
+            <span id="playerDuration" class="player-time total">0:00</span>
+            <div class="player-volume">
+              <button id="volumeBtn" class="player-icon-btn" type="button" aria-label="Mute" title="Mute / unmute">
+                <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                  <path id="volumeWave1" d="M15.5 8.5a5 5 0 0 1 0 7"/>
+                  <path id="volumeWave2" d="M18.5 5.5a9 9 0 0 1 0 13"/>
+                  <g id="volumeMuteX"><path d="M16 9l6 6"/><path d="M22 9l-6 6"/></g>
+                </svg>
+              </button>
+              <input id="volumeRange" class="player-range" type="range" min="0" max="100" value="100" step="1" aria-label="Volume" />
+            </div>
+          </div>
           <div class="sync-row">
             <div class="btn-group">
               <button id="autoWhisperBtn" class="ctrl-btn ctrl-btn-auto" title="Auto: run a full Whisper transcription with timestamps">
@@ -2623,6 +2865,22 @@
 
             <div class="btn-divider"></div>
 
+            <div id="vocalRefWrap" class="vocal-ref-wrap">
+              <button id="uploadVocalsBtn" class="ctrl-btn ctrl-btn-ghost" type="button" title="Attach a vocal-only reference for alignment" aria-expanded="false">
+                <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
+                Upload Vocals
+              </button>
+              <button id="removeVocalRefBtn" class="vocal-ref-remove" type="button" aria-label="Remove vocal reference" title="Remove vocal reference">×</button>
+              <input id="vocalFileInput" type="file" accept="audio/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus" hidden />
+              <div id="vocalRefMenu" class="vocal-ref-menu" role="menu">
+                <button id="vocalSelectFileBtn" type="button" role="menuitem">Select file</button>
+                <button id="vocalLoadUrlBtn" type="button" role="menuitem">Load from URL</button>
+                <button id="vocalMenuCancelBtn" type="button" role="menuitem">Cancel</button>
+              </div>
+            </div>
+
+            <div class="btn-divider"></div>
+
             <div class="btn-group">
               <button id="pasteLrcBtn" class="ctrl-btn ctrl-btn-ghost" title="Import existing LRC or Apple TTML synced lyrics">
                 <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -2635,13 +2893,13 @@
                 <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                   <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
                 </svg>
-                Copy TTML
+                TTML
               </button>
               <button id="copyLrcBtn" class="ctrl-btn ctrl-btn-ghost" title="Copy legacy synced lyrics as LRC">
                 <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                   <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
                 </svg>
-                Copy LRC
+                LRC
               </button>
               <button id="proposeBtn" class="ctrl-btn ctrl-btn-accent-outline" title="Submit this sync as a proposed edit">
                 <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -2723,17 +2981,88 @@ const npCategory       = document.getElementById('npCategory');
 const npEra            = document.getElementById('npEra');
 const npLength         = document.getElementById('npLength');
 const audioPlayer      = document.getElementById('audioPlayer');
+const playerPlayBtn    = document.getElementById('playerPlayBtn');
+const playerPlayIcon   = document.getElementById('playerPlayIcon');
+const playerCurrentTime= document.getElementById('playerCurrentTime');
+const playerDuration   = document.getElementById('playerDuration');
+const seekRange        = document.getElementById('seekRange');
+const volumeBtn        = document.getElementById('volumeBtn');
+const volumeRange      = document.getElementById('volumeRange');
+const volumeWave1      = document.getElementById('volumeWave1');
+const volumeWave2      = document.getElementById('volumeWave2');
 const savedVolumeRaw = localStorage.getItem('wrld_player_volume');
 if (savedVolumeRaw !== null) {
   const savedVolume = Number(savedVolumeRaw);
   if (Number.isFinite(savedVolume)) audioPlayer.volume = Math.max(0, Math.min(1, savedVolume));
 }
-audioPlayer.addEventListener('volumechange', () => localStorage.setItem('wrld_player_volume', String(audioPlayer.volume)));
+let _playerUiRaf = 0;
+function formatPlayerTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const total = Math.floor(seconds);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+function updatePlayerUi() {
+  const duration = Number.isFinite(audioPlayer.duration) ? audioPlayer.duration : 0;
+  const current = Number.isFinite(audioPlayer.currentTime) ? audioPlayer.currentTime : 0;
+  const pct = duration > 0 ? Math.max(0, Math.min(100, (current / duration) * 100)) : 0;
+  seekRange.value = duration > 0 ? String(Math.round((current / duration) * 1000)) : '0';
+  seekRange.style.setProperty('--seek-pct', `${pct}%`);
+  playerCurrentTime.textContent = formatPlayerTime(current);
+  playerDuration.textContent = formatPlayerTime(duration);
+  const playing = !audioPlayer.paused && !audioPlayer.ended && !!audioPlayer.src;
+  playerPlayBtn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+  playerPlayIcon.innerHTML = playing
+    ? '<rect x="6" y="5" width="4" height="14" rx="1"></rect><rect x="14" y="5" width="4" height="14" rx="1"></rect>'
+    : '<polygon points="7 4 20 12 7 20 7 4"></polygon>';
+
+  const volumePct = Math.round(audioPlayer.volume * 100);
+  volumeRange.value = String(volumePct);
+  volumeRange.style.setProperty('--volume-pct', `${volumePct}%`);
+  const muted = audioPlayer.muted;
+  volumeBtn.classList.toggle('is-muted', muted);
+  volumeRange.classList.toggle('is-muted', muted);
+  volumeBtn.setAttribute('aria-label', muted ? 'Unmute' : 'Mute');
+  volumeWave1.style.opacity = volumePct > 12 && !muted ? '1' : '.18';
+  volumeWave2.style.opacity = volumePct > 55 && !muted ? '1' : '.18';
+}
+function startPlayerUiLoop() {
+  if (_playerUiRaf) cancelAnimationFrame(_playerUiRaf);
+  const frame = () => {
+    updatePlayerUi();
+    if (!audioPlayer.paused && !audioPlayer.ended) _playerUiRaf = requestAnimationFrame(frame);
+    else _playerUiRaf = 0;
+  };
+  _playerUiRaf = requestAnimationFrame(frame);
+}
+playerPlayBtn.addEventListener('click', () => {
+  if (!audioPlayer.src) return;
+  if (audioPlayer.paused) audioPlayer.play().catch(() => {});
+  else audioPlayer.pause();
+});
+seekRange.addEventListener('input', () => {
+  if (!Number.isFinite(audioPlayer.duration) || audioPlayer.duration <= 0) return;
+  audioPlayer.currentTime = (Number(seekRange.value) / 1000) * audioPlayer.duration;
+  updatePlayerUi();
+});
+volumeBtn.addEventListener('click', () => { audioPlayer.muted = !audioPlayer.muted; updatePlayerUi(); });
+volumeRange.addEventListener('input', () => {
+  audioPlayer.muted = false;
+  audioPlayer.volume = Math.max(0, Math.min(1, Number(volumeRange.value) / 100));
+  updatePlayerUi();
+});
+audioPlayer.addEventListener('volumechange', () => {
+  localStorage.setItem('wrld_player_volume', String(audioPlayer.volume));
+  updatePlayerUi();
+});
 function updateNowPlayingTitleState() { npTitle.classList.toggle('playing', !audioPlayer.paused && !audioPlayer.ended && !!audioPlayer.src); }
-audioPlayer.addEventListener('play', updateNowPlayingTitleState);
-audioPlayer.addEventListener('pause', updateNowPlayingTitleState);
-audioPlayer.addEventListener('ended', updateNowPlayingTitleState);
-audioPlayer.addEventListener('emptied', updateNowPlayingTitleState);
+audioPlayer.addEventListener('play', () => { updateNowPlayingTitleState(); startPlayerUiLoop(); });
+audioPlayer.addEventListener('pause', () => { updateNowPlayingTitleState(); updatePlayerUi(); });
+audioPlayer.addEventListener('ended', () => { updateNowPlayingTitleState(); updatePlayerUi(); });
+audioPlayer.addEventListener('emptied', () => { updateNowPlayingTitleState(); updatePlayerUi(); });
+audioPlayer.addEventListener('loadedmetadata', updatePlayerUi);
+audioPlayer.addEventListener('durationchange', updatePlayerUi);
+audioPlayer.addEventListener('timeupdate', () => { if (audioPlayer.paused) updatePlayerUi(); });
+updatePlayerUi();
 const controlsEl       = document.querySelector('.controls');
 const syncBtn          = document.getElementById('syncBtn');
 const autoWhisperBtn   = document.getElementById('autoWhisperBtn');
@@ -2783,6 +3112,27 @@ const geniusUrlInput   = document.getElementById('geniusUrlInput');
 const settingsBtn      = document.getElementById('settingsBtn');
 const settingsPanel    = document.getElementById('settingsPanel');
 const settingsBackdrop = document.getElementById('settingsBackdrop');
+const settingsScroll    = settingsPanel.querySelector('.settings-scroll');
+const settingsTabs      = [...settingsPanel.querySelectorAll('.settings-tab')];
+const settingsCloseBtn  = document.getElementById('settingsCloseBtn');
+const modelCatalogCards = document.getElementById('modelCatalogCards');
+const modelCatalogSearch= document.getElementById('modelCatalogSearch');
+const catalogScopeFilter= document.getElementById('catalogScopeFilter');
+const catalogTaskFilter = document.getElementById('catalogTaskFilter');
+const modelCatalogMain  = document.getElementById('modelCatalogMain');
+const modelGuideBtn     = document.getElementById('modelGuideBtn');
+const modelGuidePage    = document.getElementById('modelGuidePage');
+const modelGuideBack    = document.getElementById('modelGuideBack');
+const modelGuideCatalog = document.getElementById('modelGuideCatalog');
+const modelTooltip      = document.getElementById('modelTooltip');
+const advancedPreprocessVocals = document.getElementById('advancedPreprocessVocals');
+const advancedSeparatorModel = document.getElementById('advancedSeparatorModel');
+const advancedYtDlpEnabled = document.getElementById('advancedYtDlpEnabled');
+const advancedYtDlpQuality = document.getElementById('advancedYtDlpQuality');
+const advancedStatus = document.getElementById('advancedStatus');
+const pipelineVocalSource = document.getElementById('pipelineVocalSource');
+const pipelineTranscription = document.getElementById('pipelineTranscription');
+const pipelineAlignment = document.getElementById('pipelineAlignment');
 const tokenInput       = document.getElementById('tokenInput');
 const showTokenBtn     = document.getElementById('showTokenBtn');
 const saveTokenBtn     = document.getElementById('saveTokenBtn');
@@ -2790,6 +3140,14 @@ const tokenStatus      = document.getElementById('tokenStatus');
 const proposeBtn       = document.getElementById('proposeBtn');
 const copyTtmlBtn      = document.getElementById('copyTtmlBtn');
 const copyLrcBtn       = document.getElementById('copyLrcBtn');
+const vocalRefWrap     = document.getElementById('vocalRefWrap');
+const uploadVocalsBtn  = document.getElementById('uploadVocalsBtn');
+const removeVocalRefBtn= document.getElementById('removeVocalRefBtn');
+const vocalFileInput   = document.getElementById('vocalFileInput');
+const vocalRefMenu     = document.getElementById('vocalRefMenu');
+const vocalSelectFileBtn = document.getElementById('vocalSelectFileBtn');
+const vocalLoadUrlBtn  = document.getElementById('vocalLoadUrlBtn');
+const vocalMenuCancelBtn = document.getElementById('vocalMenuCancelBtn');
 const alignModelSelect  = document.getElementById('alignModelSelect');
 const verifyModelSelect = document.getElementById('verifyModelSelect');
 const engineSelect      = document.getElementById('engineSelect');
@@ -2818,14 +3176,110 @@ npArt.addEventListener('error', () => {
   npArt.style.display = 'none';
 });
 
-// Keep enough scroll room below the lyrics for the floating controls, even
-// when progress, status text, or the LRC editor makes that bar taller.
-function updateControlsSpace() {
-  document.documentElement.style.setProperty('--controls-height', `${controlsEl.offsetHeight}px`);
+// Controls are in normal document flow, so they can grow without covering lyrics.
+function updateControlsSpace() {}
+
+function vocalReferenceQuery() {
+  const params = new URLSearchParams();
+  if (currentSong?.id) params.set('song_id', String(currentSong.id));
+  else if (currentLocalTrack?.track_hash) params.set('track_hash', currentLocalTrack.track_hash);
+  return params;
 }
-if ('ResizeObserver' in window) new ResizeObserver(updateControlsSpace).observe(controlsEl);
-else window.addEventListener('resize', updateControlsSpace);
-updateControlsSpace();
+function setVocalReferenceUi(ref = null) {
+  const attached = !!ref?.attached;
+  vocalRefWrap.classList.toggle('has-reference', attached);
+  uploadVocalsBtn.classList.toggle('has-reference', attached);
+  const detail = attached ? (ref.source_name || ref.source_url || 'Attached vocal reference') : 'Attach a vocal-only reference for alignment';
+  uploadVocalsBtn.title = detail;
+  removeVocalRefBtn.title = attached ? `Remove ${detail}` : 'Remove vocal reference';
+  updatePipelineLabels();
+}
+async function refreshVocalReference() {
+  const params = vocalReferenceQuery();
+  if (![...params.keys()].length) { setVocalReferenceUi(null); return null; }
+  try {
+    const r = await fetch(`/api/vocal-reference?${params}`);
+    if (!r.ok) throw new Error(await r.text());
+    const ref = await r.json();
+    setVocalReferenceUi(ref);
+    return ref;
+  } catch (e) {
+    setVocalReferenceUi(null);
+    return null;
+  }
+}
+function closeVocalReferenceMenu() {
+  vocalRefMenu.classList.remove('visible');
+  uploadVocalsBtn.setAttribute('aria-expanded', 'false');
+}
+uploadVocalsBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const open = vocalRefMenu.classList.toggle('visible');
+  uploadVocalsBtn.setAttribute('aria-expanded', String(open));
+});
+vocalMenuCancelBtn.addEventListener('click', closeVocalReferenceMenu);
+vocalSelectFileBtn.addEventListener('click', () => { closeVocalReferenceMenu(); vocalFileInput.click(); });
+document.addEventListener('click', (e) => {
+  if (!vocalRefWrap.contains(e.target)) closeVocalReferenceMenu();
+});
+vocalFileInput.addEventListener('change', async () => {
+  const file = vocalFileInput.files?.[0];
+  vocalFileInput.value = '';
+  if (!file) return;
+  const params = vocalReferenceQuery();
+  if (![...params.keys()].length) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  if (params.has('song_id')) fd.append('song_id', params.get('song_id'));
+  if (params.has('track_hash')) fd.append('track_hash', params.get('track_hash'));
+  uploadVocalsBtn.disabled = true;
+  setSyncStatus(`Caching vocal reference ${file.name}…`);
+  try {
+    const r = await fetch('/api/vocal-reference/upload', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error(await r.text());
+    const ref = await r.json();
+    setVocalReferenceUi(ref);
+    setSyncStatus('Vocal reference attached ✓', 'ok');
+  } catch (e) {
+    setSyncStatus(`Could not attach vocal reference: ${e.message ?? e}`, 'error');
+  } finally {
+    uploadVocalsBtn.disabled = false;
+  }
+});
+vocalLoadUrlBtn.addEventListener('click', async () => {
+  closeVocalReferenceMenu();
+  const url = window.prompt('Vocal reference URL');
+  if (!url?.trim()) return;
+  const params = vocalReferenceQuery();
+  if (![...params.keys()].length) return;
+  const body = { url: url.trim(), song_id: Number(params.get('song_id') || 0), track_hash: params.get('track_hash') || '' };
+  uploadVocalsBtn.disabled = true;
+  setSyncStatus('Downloading and caching vocal reference…');
+  try {
+    const r = await fetch('/api/vocal-reference/url', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(await r.text());
+    const ref = await r.json();
+    setVocalReferenceUi(ref);
+    setSyncStatus('Vocal reference attached ✓', 'ok');
+  } catch (e) {
+    setSyncStatus(`Could not attach vocal reference: ${e.message ?? e}`, 'error');
+  } finally {
+    uploadVocalsBtn.disabled = false;
+  }
+});
+removeVocalRefBtn.addEventListener('click', async (e) => {
+  e.stopPropagation();
+  const params = vocalReferenceQuery();
+  if (![...params.keys()].length) return;
+  try {
+    const r = await fetch(`/api/vocal-reference?${params}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error(await r.text());
+    setVocalReferenceUi(null);
+    setSyncStatus('Vocal reference removed.', 'ok');
+  } catch (err) {
+    setSyncStatus(`Could not remove vocal reference: ${err.message ?? err}`, 'error');
+  }
+});
 
 // ── Sidebar collapse / edge reveal ───────────────────────────────────────
 if (localStorage.getItem('jw_sidebar') === '0') mainEl.classList.add('sidebar-collapsed');
@@ -3226,6 +3680,7 @@ async function loadSongData(song) {
     emptyState.style.display = 'none';
     nowPlaying.classList.add('visible');
     mainEl.classList.add('song-loaded');
+    await refreshVocalReference();
     setTab('karaoke');
   } catch (e) {
     setSyncStatus('Failed to load song.', 'error');
@@ -4670,11 +5125,42 @@ async function enqueueTask(type) {
   }
 }
 
+let _confirmResolver = null;
+function askConfirm(title, message, okLabel = 'Remove') {
+  const backdrop = document.getElementById('confirmBackdrop');
+  const dialog = document.getElementById('confirmDialog');
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmMessage').textContent = message;
+  document.getElementById('confirmOkBtn').textContent = okLabel;
+  backdrop.hidden = false;
+  document.getElementById('confirmCancelBtn').focus();
+  return new Promise(resolve => { _confirmResolver = resolve; });
+}
+function finishConfirm(value) {
+  const backdrop = document.getElementById('confirmBackdrop');
+  backdrop.hidden = true;
+  const resolve = _confirmResolver; _confirmResolver = null;
+  if (resolve) resolve(!!value);
+}
+document.getElementById('confirmCancelBtn').addEventListener('click', () => finishConfirm(false));
+document.getElementById('confirmOkBtn').addEventListener('click', () => finishConfirm(true));
+document.getElementById('confirmBackdrop').addEventListener('click', e => { if (e.target.id === 'confirmBackdrop') finishConfirm(false); });
+document.getElementById('confirmDialog').addEventListener('click', e => e.stopPropagation());
+
 // Cancel a task
 async function cancelTask(taskId) {
-  try {
-    await fetch(`/api/queue/${taskId}/cancel`, { method: 'POST' });
-  } catch {}
+  const task = [_queueState.active, ...(_queueState.pending || [])].find(t => t?.id === taskId);
+  if (task?.type === 'model_download') {
+    const ok = await askConfirm(`Cancel ${task.song_name || 'model download'}?`, 'Downloaded partial bytes for this model will be removed.', 'Cancel download');
+    if (!ok) return;
+  }
+  try { await fetch(`/api/queue/${taskId}/cancel`, { method: 'POST' }); } catch {}
+}
+async function pauseTask(taskId) {
+  try { await fetch(`/api/queue/${taskId}/pause`, { method: 'POST' }); } catch {}
+}
+async function resumeTask(taskId) {
+  try { await fetch(`/api/queue/${taskId}/resume`, { method: 'POST' }); } catch {}
 }
 
 // Render helpers
@@ -4694,7 +5180,9 @@ function formatBytes(bytes) {
 }
 
 function renderTask(task, isActive) {
-  const canCancel = task.type !== 'model_download' && (task.status === 'pending' || task.status === 'running' || task.status === 'cancelling');
+  const canCancel = ['pending','running','paused'].includes(task.status);
+  const canPause = task.type === 'model_download' && ['pending','running'].includes(task.status);
+  const canResume = task.type === 'model_download' && task.status === 'paused';
   const pct       = task.progress?.pct ?? 0;
   const msg       = task.progress?.msg ?? (task.status === 'pending' ? 'Waiting in queue…' : '');
   const prog      = task.progress?.progress ?? null;
@@ -4702,7 +5190,7 @@ function renderTask(task, isActive) {
   const isCancelling  = task.status === 'cancelling';
 
   let bodyHtml = '';
-  if (isActive || isCancelling) {
+  if (isActive || isCancelling || task.status === 'paused') {
     const richHtml = prog
       ? `<div class="tc-rich">
            <span>${prog.done.toFixed(1)}/${prog.total.toFixed(1)}s</span>
@@ -4733,6 +5221,8 @@ function renderTask(task, isActive) {
     <div class="tc-row1">
       ${tcTypeBadge(task.type)}
       <span class="tc-name" title="${esc(task.song_name)}">${esc(task.song_name)}</span>
+      ${canPause ? `<button class="tc-pause-btn" data-task-id="${task.id}" title="Pause download">Ⅱ</button>` : ''}
+      ${canResume ? `<button class="tc-resume-btn" data-task-id="${task.id}" title="Resume download">▶</button>` : ''}
       ${canCancel ? `<button class="tc-cancel-btn" data-task-id="${task.id}" title="Cancel">×</button>` : ''}
     </div>
     ${bodyHtml}
@@ -4773,6 +5263,12 @@ function renderQueue(state) {
       e.stopPropagation();
       cancelTask(btn.dataset.taskId);
     })
+  );
+  queueContent.querySelectorAll('.tc-pause-btn').forEach(btn =>
+    btn.addEventListener('click', (e) => { e.stopPropagation(); pauseTask(btn.dataset.taskId); })
+  );
+  queueContent.querySelectorAll('.tc-resume-btn').forEach(btn =>
+    btn.addEventListener('click', (e) => { e.stopPropagation(); resumeTask(btn.dataset.taskId); })
   );
 }
 
@@ -4868,6 +5364,241 @@ function applyCompletedTasks(state) {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────
+let _settingsPage = 'general';
+let _catalogScope = 'curated';
+let _catalogTask = 'all';
+let _modelCatalog = [];
+let _advancedSettings = null;
+
+function setSettingsPage(page) {
+  _settingsPage = ['general','models','advanced'].includes(page) ? page : 'general';
+  settingsScroll.dataset.page = _settingsPage;
+  settingsTabs.forEach(btn => {
+    const active = btn.dataset.settingsTab === _settingsPage;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', String(active));
+  });
+  if (_settingsPage === 'models') refreshModelCatalog().catch(() => {});
+  if (_settingsPage === 'advanced') loadAdvancedSettings().catch(() => {});
+}
+settingsTabs.forEach(btn => btn.addEventListener('click', () => setSettingsPage(btn.dataset.settingsTab)));
+settingsCloseBtn.addEventListener('click', () => closeSettings());
+
+function modelRuntimeLabel(select) {
+  const opt = select?.selectedOptions?.[0];
+  return (opt?.dataset.baseLabel || opt?.textContent || select?.value || '').split(' · ')[0];
+}
+function updatePipelineLabels() {
+  pipelineTranscription.textContent = modelRuntimeLabel(verifyModelSelect) || 'Transcription';
+  pipelineAlignment.textContent = modelRuntimeLabel(alignModelSelect) || 'Alignment';
+  if (vocalRefWrap.classList.contains('has-reference')) pipelineVocalSource.textContent = 'Manual vocal reference';
+  else if (advancedPreprocessVocals.checked) pipelineVocalSource.textContent = `UVR · ${advancedSeparatorModel.selectedOptions?.[0]?.textContent || advancedSeparatorModel.value}`;
+  else pipelineVocalSource.textContent = 'Original mix';
+}
+
+async function loadAdvancedSettings() {
+  const data = await api('/api/settings/advanced');
+  _advancedSettings = data;
+  advancedPreprocessVocals.checked = !!data.preprocess_vocals;
+  advancedYtDlpEnabled.checked = data.yt_dlp_enabled !== false;
+  advancedYtDlpQuality.value = data.yt_dlp_quality || 'high';
+  const separators = data.separator_models || [];
+  advancedSeparatorModel.innerHTML = separators.map(m => `<option value="${esc(m.id)}">${esc(m.label || m.id)}${m.installed ? ' · installed' : ''}</option>`).join('');
+  if (advancedSeparatorModel.querySelector(`option[value="${CSS.escape(data.separator_model || '')}"]`)) advancedSeparatorModel.value = data.separator_model;
+  updatePipelineLabels();
+  return data;
+}
+async function saveAdvancedSettings() {
+  advancedStatus.textContent = 'Saving…';
+  try {
+    const data = await api('/api/settings/advanced', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        preprocess_vocals: advancedPreprocessVocals.checked,
+        separator_model: advancedSeparatorModel.value,
+        separator_target: 'all_vocals',
+        yt_dlp_enabled: advancedYtDlpEnabled.checked,
+        yt_dlp_quality: advancedYtDlpQuality.value,
+      }),
+    });
+    _advancedSettings = data;
+    advancedStatus.textContent = 'Saved ✓';
+    updatePipelineLabels();
+    setTimeout(() => { if (advancedStatus.textContent === 'Saved ✓') advancedStatus.textContent = ''; }, 1800);
+  } catch (e) {
+    advancedStatus.textContent = `Error: ${e.message ?? e}`;
+  }
+}
+[advancedPreprocessVocals, advancedSeparatorModel, advancedYtDlpEnabled, advancedYtDlpQuality].forEach(el => el.addEventListener('change', saveAdvancedSettings));
+
+const MODEL_TAG_TIPS = {
+  'Recommended': 'Suggested default for this workload.',
+  'Music/BGM': 'Designed to cope well with vocals mixed into music.',
+  'Accurate': 'Prioritizes accuracy over speed.',
+  'Multilingual': 'Intended to work across many languages.',
+  'Fast': 'Optimized for faster processing.',
+  'Balanced': 'Good trade-off between speed and quality.',
+  'Singing': 'Specifically relevant to sung vocals or singing alignment.',
+  'Phoneme FA': 'Aligns phonetic units before reconstructing the original lyric words.',
+  'Compact': 'Lower memory and disk footprint.',
+  'Alternative': 'Useful as a comparison or fallback.',
+  'Very fast': 'Prioritizes throughput.',
+  'Advanced': 'Intended for users who want explicit pipeline control.',
+  'Highest quality': 'Largest/highest-quality option offered for this task.',
+  'Slow': 'Expect noticeably longer processing.',
+  'Experimental': 'Implemented and selectable, but still needs broader real-song validation.'
+};
+const MODEL_STAT_TIPS = {
+  speed: 'Comparative processing speed. More dots means faster.',
+  vocal_accuracy: 'Comparative ability to recognize or align sung vocals. More dots means stronger expected vocal accuracy.',
+  vram: 'Approximate GPU-memory requirement from public/model-size information. This is not a measured local benchmark.',
+  vocal_isolation_benefit: 'How much the model is expected to benefit from feeding it an isolated all-vocals stem instead of the original mix.'
+};
+function modelTaskLabel(tasks = []) { return tasks.map(t => t[0].toUpperCase()+t.slice(1)).join(' · '); }
+function modelRatingDots(value) {
+  const n = Math.max(0, Math.min(5, Number(value) || 0));
+  return `<span class="model-rating-dots" aria-label="${n} out of 5">${[1,2,3,4,5].map(i => `<i class="${i <= n ? 'on' : ''}"></i>`).join('')}</span>`;
+}
+function modelTechnicalDetails(model) {
+  const rows = [
+    ['Tasks', modelTaskLabel(model.tasks || []) || 'Unknown'],
+    ['Runtime adapter', model.runtime_adapter || 'Runtime managed'],
+    ['Source', model.source || 'Unknown'],
+    ['Model ID', model.id],
+  ];
+  if (model.repo_id) rows.push(['Repository', model.repo_id]);
+  if (model.asset) rows.push(['Asset', model.asset]);
+  if (model.stats?.disk) rows.push(['Disk', model.stats.disk]);
+  if (model.experimental) rows.push(['Status', 'Experimental']);
+  return rows.map(([k,v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+}
+function renderModelGuide() {
+  if (!modelGuideCatalog) return;
+  const models = [..._modelCatalog].sort((a,b) => Number(!!b.curated)-Number(!!a.curated) || String(a.label || a.id).localeCompare(String(b.label || b.id)));
+  modelGuideCatalog.innerHTML = models.map(model => {
+    const stats = model.stats || {};
+    return `<article class="model-guide-card">
+      <div class="model-guide-title"><strong>${esc(model.label || model.id)}</strong>${(model.tags || []).map(tag => `<span class="model-tag" data-tip="${esc(MODEL_TAG_TIPS[tag] || tag)}">${esc(tag)}</span>`).join('')}</div>
+      <div class="model-guide-desc">${esc(model.description || '')}</div>
+      <div class="model-guide-stats">
+        <div class="model-guide-stat" data-tip="${esc(MODEL_STAT_TIPS.speed)}"><small>Speed</small><strong>${esc(stats.speed ?? '?')}/5</strong>${modelRatingDots(stats.speed)}</div>
+        <div class="model-guide-stat" data-tip="${esc(MODEL_STAT_TIPS.vocal_accuracy)}"><small>Vocal accuracy</small><strong>${esc(stats.vocal_accuracy ?? '?')}/5</strong>${modelRatingDots(stats.vocal_accuracy)}</div>
+        <div class="model-guide-stat" data-tip="${esc(MODEL_STAT_TIPS.vram)}"><small>VRAM load</small><strong>${esc(stats.vram || 'Varies')}</strong></div>
+        <div class="model-guide-stat" data-tip="${esc(MODEL_STAT_TIPS.vocal_isolation_benefit)}"><small>Vocal isolation benefit</small><strong>${esc(stats.vocal_isolation_benefit ?? '?')}/5</strong>${modelRatingDots(stats.vocal_isolation_benefit)}</div>
+      </div>
+      <button class="model-details-toggle" type="button" aria-expanded="false">Technical Details <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+      <div class="model-details-body"><div><dl>${modelTechnicalDetails(model)}</dl></div></div>
+    </article>`;
+  }).join('') || '<div class="qp-empty">No model metadata is available.</div>';
+  modelGuideCatalog.querySelectorAll('.model-details-toggle').forEach(btn => btn.addEventListener('click', () => {
+    const body = btn.nextElementSibling;
+    const open = !btn.classList.contains('open');
+    btn.classList.toggle('open', open);
+    body.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', String(open));
+  }));
+}
+function showModelGuide(show) {
+  modelCatalogMain.hidden = !!show;
+  modelGuidePage.hidden = !show;
+  if (show) renderModelGuide();
+}
+modelGuideBtn.addEventListener('click', () => showModelGuide(true));
+modelGuideBack.addEventListener('click', () => showModelGuide(false));
+
+document.addEventListener('pointerover', e => {
+  const target = e.target.closest?.('[data-tip]');
+  if (!target || !modelTooltip) return;
+  modelTooltip.textContent = target.dataset.tip || '';
+  if (!modelTooltip.textContent) return;
+  const rect = target.getBoundingClientRect();
+  modelTooltip.style.left = `${Math.max(8, Math.min(window.innerWidth - 268, rect.left))}px`;
+  modelTooltip.style.top = `${Math.min(window.innerHeight - 52, rect.bottom + 7)}px`;
+  modelTooltip.classList.add('visible');
+});
+document.addEventListener('pointerout', e => {
+  if (!modelTooltip || !e.target.closest?.('[data-tip]')) return;
+  modelTooltip.classList.remove('visible');
+});
+
+function renderModelCatalog() {
+  const query = modelCatalogSearch.value.trim().toLowerCase();
+  const filtered = _modelCatalog.filter(model => {
+    if (_catalogScope === 'curated' && !model.curated) return false;
+    if (_catalogTask !== 'all' && !(model.tasks || []).includes(_catalogTask)) return false;
+    if (query && !`${model.label} ${model.id} ${(model.tags || []).join(' ')} ${model.description || ''}`.toLowerCase().includes(query)) return false;
+    return true;
+  });
+  modelCatalogCards.innerHTML = filtered.map(model => {
+    const stats = model.stats || {};
+    const managed = ['huggingface','audio-separator','hubertfa_release'].includes(model.source);
+    const blocked = model.ready === false || (!managed && model.source !== 'whisper');
+    const action = model.installed ? 'remove' : managed ? 'download' : 'runtime';
+    const title = model.installed ? 'Installed · click to remove' : action === 'download' ? 'Download model' : (model.blocked_reason || 'Runtime-managed model');
+    const buttonText = model.installed ? '✓' : action === 'download' ? '↓' : model.ready === false ? '!' : 'Runtime';
+    return `<article class="model-card" data-model-id="${esc(model.id)}">
+      <div><div class="model-card-title"><strong>${esc(model.label || model.id)}</strong>${(model.tags || []).slice(0,5).map(tag => `<span class="model-tag" data-tip="${esc(MODEL_TAG_TIPS[tag] || tag)}">${esc(tag)}</span>`).join('')}</div>
+      <div class="model-card-desc">${esc(model.description || '')}</div></div>
+      <button class="model-card-action" data-model-action="${action}" title="${esc(title)}" ${blocked || action === 'runtime' ? 'disabled' : ''}>${buttonText}</button>
+      <div class="model-card-stats"><span>${esc(modelTaskLabel(model.tasks || []))}</span><span>Speed ${esc(stats.speed ?? '?')}/5</span><span>Vocal accuracy ${esc(stats.vocal_accuracy ?? '?')}/5</span><span>VRAM ${esc(stats.vram || 'varies')}</span><span>Isolation benefit ${esc(stats.vocal_isolation_benefit ?? '?')}/5</span></div>
+      <div class="model-card-progress"><span></span></div>
+    </article>`;
+  }).join('') || '<div class="qp-empty">No models match these filters.</div>';
+  modelCatalogCards.querySelectorAll('.model-card-action:not([disabled])').forEach(btn => btn.addEventListener('click', async () => {
+    const card = btn.closest('.model-card');
+    const modelId = card.dataset.modelId;
+    if (btn.dataset.modelAction === 'download') {
+      btn.disabled = true;
+      try {
+        await api(`/api/models/${encodeURIComponent(modelId)}/download`, {method:'POST'});
+        queuePanel.classList.add('visible'); queueBtn.classList.add('active'); queueBtn.setAttribute('aria-expanded','true');
+        updateModelCatalogProgress(_queueState);
+      } catch (e) { btn.disabled = false; modelInstallStatus.textContent = e.message ?? e; }
+    } else if (btn.dataset.modelAction === 'remove') {
+      if (!await askConfirm(`Remove ${_modelCatalog.find(m => m.id === modelId)?.label || modelId}?`, 'The project-local model files will be deleted.')) return;
+      btn.disabled = true;
+      try { await api(`/api/models/${encodeURIComponent(modelId)}`, {method:'DELETE'}); await refreshModelCatalog(); await api('/api/model').then(applyModelInfo); }
+      catch (e) { btn.disabled = false; modelInstallStatus.textContent = e.message ?? e; }
+    }
+  }));
+}
+async function refreshModelCatalog() {
+  const data = await api('/api/models');
+  _modelCatalog = data.models || [];
+  renderModelCatalog();
+  if (!modelGuidePage.hidden) renderModelGuide();
+  updateModelCatalogProgress(_queueState);
+  return data;
+}
+function updateModelCatalogProgress(state) {
+  if (!modelCatalogCards) return;
+  const tasks = [...(state.pending || []), state.active].filter(Boolean).filter(t => t.type === 'model_download');
+  modelCatalogCards.querySelectorAll('.model-card').forEach(card => {
+    const task = tasks.find(t => t.model_id === card.dataset.modelId && ['pending','running','paused','cancelling'].includes(t.status));
+    card.classList.toggle('is-downloading', !!task);
+    const fill = card.querySelector('.model-card-progress > span');
+    const action = card.querySelector('.model-card-action');
+    if (task) {
+      const pct = Number(task.progress?.pct || 0);
+      fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+      action.disabled = true;
+      action.textContent = task.status === 'paused' ? 'Ⅱ' : `${Math.round(pct)}%`;
+      action.title = task.status === 'paused' ? 'Paused · resume from Task Queue' : (task.progress?.msg || 'Downloading');
+    }
+  });
+}
+catalogScopeFilter.addEventListener('click', e => {
+  const btn = e.target.closest('[data-catalog-scope]'); if (!btn) return;
+  _catalogScope = btn.dataset.catalogScope; [...catalogScopeFilter.children].forEach(x => x.classList.toggle('active', x === btn)); renderModelCatalog(); updateModelCatalogProgress(_queueState);
+});
+catalogTaskFilter.addEventListener('click', e => {
+  const btn = e.target.closest('[data-catalog-task]'); if (!btn) return;
+  _catalogTask = btn.dataset.catalogTask; [...catalogTaskFilter.children].forEach(x => x.classList.toggle('active', x === btn)); renderModelCatalog(); updateModelCatalogProgress(_queueState);
+});
+modelCatalogSearch.addEventListener('input', () => { renderModelCatalog(); updateModelCatalogProgress(_queueState); });
+loadAdvancedSettings().catch(() => {});
+refreshModelCatalog().catch(() => {});
+
 tokenInput.value = localStorage.getItem('jw_token') || '';
 if (tokenInput.value) tokenStatus.textContent = 'Token saved ✓';
 
@@ -4895,14 +5626,14 @@ function updateManagedModelOptions(models = []) {
     const base = opt.dataset.baseLabel || opt.textContent.split(' · ')[0];
     const info = _managedModelInfo.get(id);
     const busy = [...(_queueState.pending || []), _queueState.active].filter(Boolean)
-      .some(t => t.type === 'model_download' && t.model_id === id && ['pending','running','cancelling'].includes(t.status));
+      .some(t => t.type === 'model_download' && t.model_id === id && ['pending','running','paused','cancelling'].includes(t.status));
     opt.textContent = `${base} · ${busy ? 'downloading…' : info?.installed ? 'installed' : 'download'}`;
   });
 }
 
 function updateManagedModelQueueState(state) {
   const busy = [...(state.pending || []), state.active].filter(Boolean)
-    .filter(t => t.type === 'model_download' && ['pending','running','cancelling'].includes(t.status));
+    .filter(t => t.type === 'model_download' && ['pending','running','paused','cancelling'].includes(t.status));
   const completed = (state.history || []).filter(t => t.type === 'model_download' && t.status === 'done');
   if (modelInstallStatus) {
     modelInstallStatus.textContent = busy.length
@@ -4910,10 +5641,12 @@ function updateManagedModelQueueState(state) {
       : '';
   }
   updateManagedModelOptions([..._managedModelInfo.values()]);
+  updateModelCatalogProgress(state);
   const newestDone = completed.at(-1);
   if (newestDone && !newestDone._uiRefreshed && !_appliedTaskIds.has(`model:${newestDone.id}`)) {
     _appliedTaskIds.add(`model:${newestDone.id}`);
     api('/api/model').then(applyModelInfo).catch(() => {});
+    refreshModelCatalog().catch(() => {});
   }
 }
 
@@ -4923,6 +5656,7 @@ function applyModelInfo(info) {
   if (engineSelect.querySelector(`option[value="${info.engine}"]`)) engineSelect.value = info.engine;
   _setDeviceBtn(info.device_pref ?? 'auto');
   updateManagedModelOptions(info.managed_models || []);
+  updatePipelineLabels();
   const loadedOn = info.device?.toUpperCase() ?? '';
   if (info.align_loaded || info.verify_loaded) {
     modelStatus.style.color = '';
@@ -5146,6 +5880,7 @@ async function loadLocalTrack(meta) {
   mainEl.classList.add('song-loaded', 'sidebar-collapsed');
   localStorage.setItem('jw_sidebar', '0');
   hideLocalLanding();
+  await refreshVocalReference();
   setTab('karaoke');
   setSyncStatus(restored ? 'Loaded local file + cached processed lyrics ✓' : `Loaded local file · ${meta.track_hash.slice(0, 12)}…`, 'ok');
   animateSidebarReturn();

@@ -10,4 +10,13 @@ rich>=13.7
 mutagen>=1.47
 huggingface-hub[hf_xet]>=0.34
 transformers>=5.13.0,<6
-rich
+audio-separator[gpu]>=0.35
+yt-dlp>=2025.1.0
+cmudict>=1.0.35
+pronouncing>=0.2.0
+g2p-en>=2.1.0
+textgrid>=1.6.1
+onnxruntime-gpu>=1.19,<2
+click>=8.1
+PyYAML>=6
+pandas>=2

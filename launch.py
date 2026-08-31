@@ -31,6 +31,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / ".venv"
 REQUIREMENTS = ROOT / "requirements.txt"
+VENV_PYTHON = (3, 13)
+VENV_PYTHON_LABEL = ".".join(map(str, VENV_PYTHON))
 
 
 class C:
@@ -361,17 +363,81 @@ def _install_failure_hint() -> None:
          "/v LongPathsEnabled /t REG_DWORD /d 1 /f")
 
 
-def ensure_venv() -> None:
-    step("Checking virtual environment")
-    if venv_python().exists():
-        ok(f".venv already set up ({venv_python()})")
-        return
-    warn(".venv not found, creating it...")
-    t0 = time.time()
-    result = subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)])
+def _venv_python_version() -> tuple[int, int] | None:
+    if not venv_python().exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(venv_python()), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
     if result.returncode != 0:
-        fail("Failed to create the virtual environment.")
-    ok(f"Created .venv in {human_time(time.time() - t0)}")
+        return None
+    try:
+        major, minor = result.stdout.strip().split(".", 1)
+        return int(major), int(minor)
+    except (ValueError, TypeError):
+        return None
+
+
+def _create_venv_with_target_python(uv_executable: str | None) -> subprocess.CompletedProcess:
+    if sys.version_info[:2] == VENV_PYTHON:
+        return subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], cwd=ROOT)
+
+    if platform.system() == "Windows" and shutil.which("py"):
+        try:
+            probe = subprocess.run(
+                ["py", f"-{VENV_PYTHON_LABEL}", "-c", "import sys"],
+                capture_output=True, timeout=10,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            probe = None
+        if probe is not None and probe.returncode == 0:
+            return subprocess.run(
+                ["py", f"-{VENV_PYTHON_LABEL}", "-m", "venv", str(VENV_DIR)],
+                cwd=ROOT,
+            )
+
+    if uv_executable:
+        # uv can use an installed 3.13 or fetch its managed Python automatically.
+        return subprocess.run(
+            [uv_executable, "venv", "--python", VENV_PYTHON_LABEL, str(VENV_DIR)],
+            cwd=ROOT,
+        )
+
+    return subprocess.CompletedProcess([], 1)
+
+
+def ensure_venv(uv_executable: str | None) -> None:
+    step("Checking virtual environment")
+    existing = _venv_python_version()
+    if existing == VENV_PYTHON:
+        ok(f".venv already set up with Python {VENV_PYTHON_LABEL} ({venv_python()})")
+        return
+
+    if VENV_DIR.exists():
+        found = ".".join(map(str, existing)) if existing else "an unreadable/incomplete Python"
+        warn(
+            f"Existing .venv uses {found}; WRLD Sync uses Python {VENV_PYTHON_LABEL} "
+            "for the current ML/audio dependency stack. Recreating only .venv..."
+        )
+        try:
+            shutil.rmtree(VENV_DIR)
+        except OSError as e:
+            fail(f"Couldn't replace the incompatible .venv ({e}). Close processes using it and retry.")
+    else:
+        warn(f".venv not found, creating it with Python {VENV_PYTHON_LABEL}...")
+
+    t0 = time.time()
+    result = _create_venv_with_target_python(uv_executable)
+    if result.returncode != 0 or _venv_python_version() != VENV_PYTHON:
+        fail(
+            f"Failed to create the Python {VENV_PYTHON_LABEL} virtual environment. "
+            "Install uv (recommended) or Python 3.13, then run start.bat again."
+        )
+    ok(f"Created Python {VENV_PYTHON_LABEL} .venv in {human_time(time.time() - t0)}")
 
 
 def detect_uv() -> tuple[str | None, str | None]:
@@ -959,7 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
     ensure_python_version()
 
     _try_enable_long_paths()
-    ensure_venv()
+    ensure_venv(uv_executable)
     ensure_gpu_torch(uv_executable)
     ensure_ffmpeg()
     install_requirements(uv_executable)

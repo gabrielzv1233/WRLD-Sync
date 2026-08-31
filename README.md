@@ -119,6 +119,3 @@ Settings includes **Allow overlapping lyrics**, off by default. When enabled, Pr
 
 Each timed Preview line has a Feather `map-pin` action beside its timestamp. It jumps to the best matching raw Lyrics line, focuses the raw editor, and places the caret at that line start. The mapping keeps source-index/text hints when available, then falls back through exact and fuzzy matching so inserted, deleted, edited, or repeated lyric lines do not immediately break navigation. In Preview, the backquote key (`` ` ``) toggles lyric auto-scroll; enabling it smoothly re-anchors to the active/nearest timed line.
 
-btw these are the settings i use:
-![my settings](readmeimgs/image.png)
-it works great on a 5070 Ti laptop edition, gotta love CUDA

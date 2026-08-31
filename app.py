@@ -8,6 +8,7 @@ import os
 import pathlib
 import queue as thread_queue
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -45,7 +46,7 @@ if sys.platform == "win32":
 import httpx
 import stable_whisper
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -53,7 +54,9 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
-from model_manager import MODEL_SPECS, catalog_status, ensure_model as ensure_managed_model, get_spec as get_managed_spec, is_installed as managed_model_installed
+from model_manager import DownloadPaused, MODEL_SPECS, catalog_status, ensure_model as ensure_managed_model, get_spec as get_managed_spec, is_installed as managed_model_installed, remove_model as remove_managed_model
+from model_catalog import get_catalog_model, load_catalog, model_map
+from hubert_runtime import HubertDownloadPaused, HubertFAEngine, ensure_hubertfa, get_hubert_install, hubert_installed, remove_hubertfa
 
 BASE = "https://juicewrldapi.com/juicewrld"
 CONSOLE = Console(highlight=False)
@@ -171,6 +174,44 @@ _audio_cache_lock = asyncio.Lock()
 # ---------------------------------------------------------------------------
 _DATA_DIR = pathlib.Path(__file__).parent / "data"
 DB_PATH = _DATA_DIR / "wrld_sync.sqlite3"
+_CACHE_DIR = pathlib.Path(__file__).parent / "cache"
+_STEM_CACHE_DIR = _CACHE_DIR / "stems"
+_VOCAL_REFERENCE_DIR = _CACHE_DIR / "vocal-references"
+_UVR_MODEL_DIR = pathlib.Path(__file__).parent / "models" / "uvr"
+for _dir in (_CACHE_DIR, _STEM_CACHE_DIR, _VOCAL_REFERENCE_DIR, _UVR_MODEL_DIR):
+    _dir.mkdir(parents=True, exist_ok=True)
+
+_ADVANCED_DEFAULTS = {
+    "preprocess_vocals": False,
+    "separator_model": "uvr-bs-roformer",
+    "separator_target": "all_vocals",
+    "yt_dlp_enabled": True,
+    "yt_dlp_quality": "high",
+}
+_ADVANCED_PATH = pathlib.Path(__file__).parent / ".advanced_settings.json"
+
+def _load_advanced_settings() -> dict:
+    values = dict(_ADVANCED_DEFAULTS)
+    try:
+        raw = json.loads(_ADVANCED_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            values.update({k: raw[k] for k in _ADVANCED_DEFAULTS if k in raw})
+    except (OSError, json.JSONDecodeError):
+        pass
+    values["preprocess_vocals"] = bool(values["preprocess_vocals"])
+    values["yt_dlp_enabled"] = bool(values["yt_dlp_enabled"])
+    if values["separator_model"] not in {m["id"] for m in load_catalog()["models"] if "separation" in m.get("tasks", [])}:
+        values["separator_model"] = _ADVANCED_DEFAULTS["separator_model"]
+    if values["separator_target"] != "all_vocals":
+        values["separator_target"] = "all_vocals"
+    if values["yt_dlp_quality"] not in ("high", "medium", "small"):
+        values["yt_dlp_quality"] = "high"
+    return values
+
+def _save_advanced_settings(values: dict) -> None:
+    _ADVANCED_PATH.write_text(json.dumps(values, indent=2), encoding="utf-8")
+
+ADVANCED_SETTINGS = _load_advanced_settings()
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -238,6 +279,18 @@ def _init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_local_processed_updated ON local_processed_lyrics(updated_at DESC)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vocal_references (
+                owner_key TEXT PRIMARY KEY,
+                source_name TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                cached_path TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
         )
 
 
@@ -324,6 +377,182 @@ def _get_local_track(track_hash: str, include_cover: bool = False) -> dict | Non
     return dict(row) if row is not None else None
 
 
+
+def _owner_key(song_id: int = 0, track_hash: str = "") -> str:
+    if int(song_id or 0) > 0:
+        return f"catalog:{int(song_id)}"
+    track_hash = str(track_hash or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", track_hash):
+        return f"local:{track_hash}"
+    return ""
+
+
+def _task_owner_key(task) -> str:
+    return _owner_key(getattr(task, "song_id", 0), getattr(task, "local_hash", ""))
+
+
+def _get_vocal_reference(owner_key: str) -> dict | None:
+    if not owner_key:
+        return None
+    with _db_connect() as conn:
+        row = conn.execute("SELECT * FROM vocal_references WHERE owner_key = ?", (owner_key,)).fetchone()
+    if row is None:
+        return None
+    data = dict(row)
+    cached = pathlib.Path(data.get("cached_path") or "")
+    if not cached.is_file():
+        with _db_connect() as conn:
+            conn.execute("DELETE FROM vocal_references WHERE owner_key = ?", (owner_key,))
+        return None
+    return data
+
+
+def _set_vocal_reference(owner_key: str, cached_path: pathlib.Path, source_name: str, source_url: str = "") -> dict:
+    if not owner_key:
+        raise ValueError("A catalog song or local track is required for a vocal reference.")
+    now = time.time()
+    with _db_connect() as conn:
+        conn.execute(
+            """INSERT INTO vocal_references(owner_key, source_name, source_url, cached_path, created_at, updated_at)
+               VALUES(?, ?, ?, ?, ?, ?)
+               ON CONFLICT(owner_key) DO UPDATE SET
+                 source_name=excluded.source_name, source_url=excluded.source_url,
+                 cached_path=excluded.cached_path, updated_at=excluded.updated_at""",
+            (owner_key, source_name, source_url, str(cached_path), now, now),
+        )
+    return _get_vocal_reference(owner_key) or {}
+
+
+def _delete_vocal_reference(owner_key: str) -> bool:
+    row = _get_vocal_reference(owner_key)
+    with _db_connect() as conn:
+        cur = conn.execute("DELETE FROM vocal_references WHERE owner_key = ?", (owner_key,))
+    if row:
+        try:
+            pathlib.Path(row.get("cached_path") or "").unlink(missing_ok=True)
+        except OSError:
+            pass
+    return cur.rowcount > 0
+
+
+def _normalize_audio_only(source: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp.flac")
+    cmd = [
+        "ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:a:0",
+        "-vn", "-sn", "-dn", "-map_metadata", "-1", "-c:a", "flac", str(tmp),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise ValueError(f"Could not decode vocal reference: {proc.stderr.strip() or 'ffmpeg failed'}")
+    tmp.replace(dest)
+    return dest
+
+
+def _separator_catalog_item(model_id: str) -> dict:
+    item = get_catalog_model(model_id)
+    if item.get("source") != "audio-separator":
+        raise ValueError(f"{model_id} is not an audio-separator model")
+    return item
+
+
+def _separator_model_installed(model_id: str) -> bool:
+    try:
+        item = _separator_catalog_item(model_id)
+    except ValueError:
+        return False
+    return (_UVR_MODEL_DIR / str(item.get("asset") or item.get("runtime_id") or "")).is_file()
+
+
+def _ensure_separator_model(model_id: str) -> pathlib.Path:
+    item = _separator_catalog_item(model_id)
+    asset = str(item.get("asset") or item.get("runtime_id") or "")
+    if not asset:
+        raise RuntimeError(f"No separator asset configured for {model_id}")
+    target = _UVR_MODEL_DIR / asset
+    if target.is_file():
+        return target
+    exe = shutil.which("audio-separator")
+    if exe:
+        proc = subprocess.run(
+            [exe, "--model_filename", asset, "--model_file_dir", str(_UVR_MODEL_DIR), "--download_model_only"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "audio-separator model download failed")
+    else:
+        from audio_separator.separator import Separator
+        sep = Separator(model_file_dir=str(_UVR_MODEL_DIR), output_dir=str(_CACHE_DIR), output_format="FLAC")
+        sep.load_model(model_filename=asset)
+        del sep
+    if not target.is_file():
+        raise RuntimeError(f"audio-separator did not create expected model asset {asset}")
+    return target
+
+
+def _separate_vocals(source: pathlib.Path, model_id: str, cache_path: pathlib.Path) -> pathlib.Path:
+    item = _separator_catalog_item(model_id)
+    asset = str(item.get("asset") or item.get("runtime_id") or "")
+    _ensure_separator_model(model_id)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="wrld-uvr-") as temp_dir:
+        from audio_separator.separator import Separator
+        sep = Separator(
+            model_file_dir=str(_UVR_MODEL_DIR), output_dir=temp_dir,
+            output_format="FLAC", output_single_stem="Vocals",
+        )
+        sep.load_model(model_filename=asset)
+        outputs = sep.separate(str(source))
+        del sep
+        candidates = [pathlib.Path(x) for x in (outputs or [])]
+        candidates = [x if x.is_absolute() else pathlib.Path(temp_dir) / x for x in candidates]
+        vocal = next((x for x in candidates if x.is_file() and "vocal" in x.name.lower()), None)
+        if vocal is None:
+            vocal = next((x for x in pathlib.Path(temp_dir).glob("*.flac") if x.is_file()), None)
+        if vocal is None:
+            raise RuntimeError("UVR separation completed without a vocals stem")
+        shutil.copy2(vocal, cache_path)
+    return cache_path
+
+
+async def _prepare_analysis_audio(task, source_path: str) -> str:
+    owner = _task_owner_key(task)
+    reference = _get_vocal_reference(owner)
+    if reference:
+        task.analysis_source = {
+            "type": "manual_vocal_reference",
+            "label": "Manual vocal reference",
+            "name": reference.get("source_name") or pathlib.Path(reference["cached_path"]).name,
+        }
+        return str(reference["cached_path"])
+
+    if not bool(getattr(task, "preprocess_vocals", False)):
+        task.analysis_source = {"type": "original_mix", "label": "Original mix"}
+        return source_path
+
+    separator_model = getattr(task, "separator_model", "") or ADVANCED_SETTINGS["separator_model"]
+    task.progress = {**task.progress, "stage": "separating", "step": "preprocessing", "msg": "Preparing cached all-vocals stem…"}
+    await _q_broadcast()
+    audio_hash = await asyncio.to_thread(_audio_content_hash, pathlib.Path(source_path))
+    config = {"separator_model": separator_model, "separator_target": "all_vocals"}
+    config_hash = hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    stem_dir = _STEM_CACHE_DIR / audio_hash / config_hash
+    stem_path = stem_dir / "vocals.flac"
+    metadata_path = stem_dir / "metadata.json"
+    if not stem_path.is_file():
+        await asyncio.to_thread(_separate_vocals, pathlib.Path(source_path), separator_model, stem_path)
+        metadata_path.write_text(json.dumps({"audio_hash": audio_hash, **config}, indent=2), encoding="utf-8")
+    task.analysis_source = {
+        "type": "uvr",
+        "label": f"UVR · {get_catalog_model(separator_model).get('label', separator_model)}",
+        "separator_model": separator_model,
+        "audio_hash": audio_hash,
+        "cache_path": str(stem_path),
+    }
+    return str(stem_path)
+
+
 def _store_processed_lyrics(task) -> None:
     """Persist a successful result to the catalog-song or local-track table."""
     song_id = int(getattr(task, "song_id", 0) or 0)
@@ -366,6 +595,10 @@ def _store_processed_lyrics(task) -> None:
         "inline_parenthetical_background": bool(getattr(task, "inline_parenthetical_background", True)),
         "allow_overlapping_lyrics": bool(getattr(task, "allow_overlapping_lyrics", False)),
         "interlude_threshold": float(getattr(task, "interlude_threshold", 2.0)),
+        "preprocess_vocals": bool(getattr(task, "preprocess_vocals", False)),
+        "separator_model": str(getattr(task, "separator_model", "") or ""),
+        "separator_target": str(getattr(task, "separator_target", "") or "all_vocals"),
+        "analysis_source": dict(getattr(task, "analysis_source", {}) or {}),
         "background_vocals": "parenthetical-inline-toggle",
         "alignment": {
             "original_split": True,
@@ -477,7 +710,7 @@ async def ensure_audio(song_path: str):
 # ---------------------------------------------------------------------------
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
 WHISPER_ENGINES = ["faster", "torch"]
-SYNC_MODELS = WHISPER_MODELS + ["qwen3-forced-aligner-0.6b"]
+SYNC_MODELS = WHISPER_MODELS + ["qwen3-forced-aligner-0.6b", "hubert-fa-combined"]
 TRANSCRIBE_MODELS = WHISPER_MODELS + ["qwen3-asr-0.6b", "qwen3-asr-1.7b", "parakeet-tdt-0.6b-v3"]
 _PREF_DIR = pathlib.Path(__file__).parent
 
@@ -626,6 +859,19 @@ def _load_parakeet(model_id: str):
     model = ParakeetForTDT.from_pretrained(path, local_files_only=True, dtype=dtype).to(device).eval()
     return _ParakeetRuntime(model, processor)
 
+
+def _load_hubertfa():
+    if not hubert_installed():
+        raise RuntimeError("HuBERT FA combined is not installed yet. Wait for its model-download queue task.")
+    return HubertFAEngine()
+
+
+def _runtime_model_label(model_id: str) -> str:
+    try:
+        return str(get_catalog_model(model_id).get("label") or model_id)
+    except ValueError:
+        return f"Whisper {model_id}"
+
 # Existing variable names are retained for cache/backward compatibility.
 ALIGN_MODEL_SIZE: str = _read_pref(".model_pref_align", SYNC_MODELS, _read_pref(".model_pref", SYNC_MODELS, os.getenv("WHISPER_MODEL", "small")))
 VERIFY_MODEL_SIZE: str = _read_pref(".model_pref_verify", TRANSCRIBE_MODELS, "base")
@@ -642,11 +888,13 @@ async def get_align_model(model_id: str | None = None):
     if _align_model is None or _align_model_id != model_id:
         async with _model_lock:
             if _align_model is None or _align_model_id != model_id:
-                label = get_managed_spec(model_id).label if model_id in MODEL_SPECS else f"Whisper {model_id}"
+                label = _runtime_model_label(model_id)
                 CONSOLE.print(f"[cyan]→[/cyan] Loading sync model [bold]{label}[/bold]")
                 loop = asyncio.get_running_loop()
                 if model_id == "qwen3-forced-aligner-0.6b":
                     loaded = await loop.run_in_executor(None, lambda: _load_qwen_aligner(model_id))
+                elif model_id == "hubert-fa-combined":
+                    loaded = await loop.run_in_executor(None, _load_hubertfa)
                 else:
                     loaded = await loop.run_in_executor(None, lambda: _load_whisper_model(model_id))
                 _align_model, _align_model_id = loaded, model_id
@@ -659,7 +907,7 @@ async def get_verify_model(model_id: str | None = None):
     if _verify_model is None or _verify_model_id != model_id:
         async with _model_lock:
             if _verify_model is None or _verify_model_id != model_id:
-                label = get_managed_spec(model_id).label if model_id in MODEL_SPECS else f"Whisper {model_id}"
+                label = _runtime_model_label(model_id)
                 CONSOLE.print(f"[cyan]→[/cyan] Loading transcription model [bold]{label}[/bold]")
                 loop = asyncio.get_running_loop()
                 if model_id.startswith("qwen3-asr-"):
@@ -696,11 +944,16 @@ class QueueTask:
     inline_parenthetical_background: bool = True
     allow_overlapping_lyrics: bool = False
     interlude_threshold: float = 2.0
+    preprocess_vocals: bool = False
+    separator_model: str = "uvr-bs-roformer"
+    separator_target: str = "all_vocals"
+    analysis_source: dict = dc_field(default_factory=dict)
     status: str = "pending"   # pending|running|done|error|cancelled
     progress: dict = dc_field(default_factory=dict)
     error: str = ""
     created_at: float = dc_field(default_factory=time.time)
     cancel_requested: bool = False
+    pause_requested: bool = False
     result: dict | None = None
     live_lines: list[dict] = dc_field(default_factory=list)
     model_id: str = ""
@@ -718,6 +971,7 @@ class QueueTask:
             "progress": self.progress,
             "error": self.error,
             "created_at": self.created_at,
+            "pause_requested": self.pause_requested,
             "model_id": self.model_id,
             "settings": {
                 "fast_auto": self.fast_auto,
@@ -726,6 +980,10 @@ class QueueTask:
                 "inline_parenthetical_background": self.inline_parenthetical_background,
                 "allow_overlapping_lyrics": self.allow_overlapping_lyrics,
                 "interlude_threshold": self.interlude_threshold,
+                "preprocess_vocals": self.preprocess_vocals,
+                "separator_model": self.separator_model,
+                "separator_target": self.separator_target,
+                "analysis_source": self.analysis_source,
                 "sync_model": self.sync_model or ALIGN_MODEL_SIZE,
                 "transcribe_model": self.transcribe_model or VERIFY_MODEL_SIZE,
             },
@@ -739,6 +997,7 @@ class QueueTask:
 
 _task_queue: asyncio.Queue = asyncio.Queue()
 _tasks: dict[str, QueueTask] = {}          # id → task (all states)
+_queued_task_ids: set[str] = set()         # task IDs with a live asyncio.Queue ticket
 _active_task: QueueTask | None = None
 
 # SSE broadcast via asyncio.Condition — all stream generators wait on this
@@ -746,11 +1005,59 @@ _q_cond: asyncio.Condition | None = None   # initialised in lifespan
 _q_state_json: str = '{"active":null,"pending":[],"history":[]}'
 
 
+
+async def _queue_put_once(task: QueueTask) -> bool:
+    """Put a task into the processor queue only when it has no live queue ticket."""
+    if task.id in _queued_task_ids:
+        return False
+    _queued_task_ids.add(task.id)
+    await _task_queue.put(task)
+    return True
+
+
+def _all_catalog_status() -> list[dict]:
+    managed = {item["id"]: item for item in catalog_status()}
+    out: list[dict] = []
+    for raw in load_catalog()["models"]:
+        item = dict(raw)
+        model_id = str(item["id"])
+        source = item.get("source")
+        if model_id in managed:
+            item.update(managed[model_id])
+        elif source == "audio-separator":
+            item.update({"installed": _separator_model_installed(model_id), "managed": True, "path": str(_UVR_MODEL_DIR / str(item.get("asset") or ""))})
+        elif source == "whisper":
+            # Whisper/stable-ts manages its own download cache on first load.
+            item.update({"installed": None, "managed": False, "install_state": "runtime-managed"})
+        elif source == "hubertfa_release":
+            item.update({
+                "installed": hubert_installed(),
+                "managed": True,
+                "path": str(pathlib.Path(__file__).parent / "models" / model_id),
+                "install_state": "installed" if hubert_installed() else "missing",
+            })
+        out.append(item)
+    return out
+
+
+def _catalog_model_installed(model_id: str) -> bool | None:
+    if model_id in MODEL_SPECS:
+        return managed_model_installed(model_id)
+    item = get_catalog_model(model_id)
+    if item.get("source") == "audio-separator":
+        return _separator_model_installed(model_id)
+    if item.get("source") == "whisper":
+        return None
+    if item.get("source") == "hubertfa_release":
+        return hubert_installed()
+    return False
+
+
 def _task_model_requirements(task_type: str, sync_model: str | None = None, transcribe_model: str | None = None) -> list[str]:
     sync_model = sync_model or ALIGN_MODEL_SIZE
     transcribe_model = transcribe_model or VERIFY_MODEL_SIZE
     ids: list[str] = []
-    if task_type == "sync" and sync_model in MODEL_SPECS:
+    if task_type == "sync" and (sync_model in MODEL_SPECS or sync_model == "hubert-fa-combined"):
         ids.append(sync_model)
     if task_type in ("auto", "transcribe", "verify") and transcribe_model in MODEL_SPECS:
         spec = get_managed_spec(transcribe_model)
@@ -760,30 +1067,81 @@ def _task_model_requirements(task_type: str, sync_model: str | None = None, tran
 
 
 async def _enqueue_model_download(model_id: str) -> str | None:
-    if model_id not in MODEL_SPECS or managed_model_installed(model_id):
+    try:
+        item = get_catalog_model(model_id)
+    except ValueError:
+        return None
+    if item.get("source") not in ("huggingface", "audio-separator", "hubertfa_release"):
+        return None
+    if _catalog_model_installed(model_id):
         return None
     for task in _tasks.values():
-        if task.type == "model_download" and task.model_id == model_id and task.status in ("pending", "running", "cancelling"):
+        if task.type == "model_download" and task.model_id == model_id and task.status in ("pending", "running", "cancelling", "paused"):
             return task.id
-    spec = get_managed_spec(model_id)
-    for dep in spec.dependencies:
-        await _enqueue_model_download(dep)
+    for dep in item.get("dependencies") or []:
+        await _enqueue_model_download(str(dep))
     task = QueueTask(
         id=str(uuid.uuid4())[:8], type="model_download", song_id=0,
-        song_name=spec.label, lyrics="", model_id=model_id,
+        song_name=str(item.get("label") or model_id), lyrics="", model_id=model_id,
         sync_model=ALIGN_MODEL_SIZE, transcribe_model=VERIFY_MODEL_SIZE,
     )
     _tasks[task.id] = task
-    await _task_queue.put(task)
+    await _queue_put_once(task)
     await _q_broadcast()
     return task.id
 
 
 async def _run_model_download_task(task: QueueTask) -> None:
-    spec = get_managed_spec(task.model_id)
+    item = get_catalog_model(task.model_id)
+    label = str(item.get("label") or task.model_id)
     loop = asyncio.get_running_loop()
-    task.progress = {"stage": "checking", "msg": f"Checking {spec.label}…", "pct": 0, "step": "model"}
+    task.progress = {"stage": "checking", "msg": f"Checking {label}…", "pct": 0, "step": "model"}
     await _q_broadcast()
+
+    if item.get("source") == "hubertfa_release":
+        def progress_update(ev: dict) -> None:
+            task.progress = {**ev, "step": "model"}
+            asyncio.run_coroutine_threadsafe(_q_broadcast(), loop)
+
+        def cancelled() -> bool:
+            return bool(task.cancel_requested)
+
+        def paused() -> bool:
+            return bool(task.pause_requested)
+
+        try:
+            path = await loop.run_in_executor(None, lambda: ensure_hubertfa(progress_update, cancelled, paused))
+        except HubertDownloadPaused:
+            task.status = "paused"
+            task.pause_requested = False
+            return
+        except InterruptedError:
+            raise asyncio.CancelledError()
+        task.result = {"model_id": task.model_id, "path": str(path), "installed": True}
+        task.progress = {"stage": "done", "msg": f"{label} ready", "pct": 100, "step": "done"}
+        return
+
+    if item.get("source") == "audio-separator":
+        if task.pause_requested:
+            task.status = "paused"
+            task.pause_requested = False
+            return
+        if task.cancel_requested:
+            raise asyncio.CancelledError()
+        task.progress = {"stage": "downloading", "msg": f"Downloading {label} through audio-separator…", "pct": 5, "step": "model"}
+        await _q_broadcast()
+        path = await loop.run_in_executor(None, lambda: _ensure_separator_model(task.model_id))
+        if task.cancel_requested:
+            try:
+                pathlib.Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise asyncio.CancelledError()
+        task.result = {"model_id": task.model_id, "path": str(path), "installed": True}
+        task.progress = {"stage": "done", "msg": f"{label} ready", "pct": 100, "step": "done"}
+        return
+
+    spec = get_managed_spec(task.model_id)
 
     def progress_update(ev: dict) -> None:
         task.progress = {**ev, "step": "model"}
@@ -792,8 +1150,15 @@ async def _run_model_download_task(task: QueueTask) -> None:
     def cancelled() -> bool:
         return bool(task.cancel_requested)
 
+    def paused() -> bool:
+        return bool(task.pause_requested)
+
     try:
-        path = await loop.run_in_executor(None, lambda: ensure_managed_model(task.model_id, progress_update, cancelled))
+        path = await loop.run_in_executor(None, lambda: ensure_managed_model(task.model_id, progress_update, cancelled, paused))
+    except DownloadPaused:
+        task.status = "paused"
+        task.pause_requested = False
+        return
     except InterruptedError:
         raise asyncio.CancelledError()
     task.result = {"model_id": task.model_id, "path": str(path), "installed": True}
@@ -804,7 +1169,7 @@ async def _run_model_download_task(task: QueueTask) -> None:
 async def _q_broadcast() -> None:
     global _q_state_json
     active   = _active_task.to_dict() if _active_task else None
-    pending  = [t.to_dict() for t in _tasks.values() if t.status == "pending"]
+    pending  = [t.to_dict() for t in _tasks.values() if t.status in ("pending", "paused")]
     done_list = [t for t in _tasks.values() if t.status in ("done", "error", "cancelled")]
     history  = [t.to_dict() for t in sorted(done_list, key=lambda t: t.created_at)][-20:]
     _q_state_json = json.dumps({"active": active, "pending": pending, "history": history})
@@ -1234,6 +1599,32 @@ async def _qwen_sync_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list
     )
 
 
+async def _hubertfa_sync_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
+    runtime = await get_align_model("hubert-fa-combined")
+    loop = asyncio.get_running_loop()
+    task.progress = {"stage": "aligning", "msg": "HuBERT FA phoneme alignment…", "pct": 55, "step": "aligning"}
+    await _q_broadcast()
+
+    async with _inference_lock:
+        fut = loop.run_in_executor(None, lambda: runtime.align(tmp_path, lyrics))
+        elapsed = 0.0
+        while not fut.done():
+            if task.cancel_requested:
+                await asyncio.shield(fut)
+                raise asyncio.CancelledError()
+            pct = min(96, 55 + (elapsed / 90.0) ** 0.5 * 35)
+            task.progress = {"stage": "aligning", "msg": f"HuBERT FA phoneme alignment… {elapsed:.0f}s", "pct": pct, "step": "aligning"}
+            await _q_broadcast()
+            await asyncio.sleep(.5)
+            elapsed += .5
+        timestamps = await fut
+
+    return _sanitize_timed_lines(
+        _align_items_to_lyric_lines(timestamps, lyrics),
+        inline_parenthetical_background=task.inline_parenthetical_background,
+    )
+
+
 async def _managed_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dict] | None:
     model_id = task.transcribe_model or VERIFY_MODEL_SIZE
     if model_id not in MODEL_SPECS:
@@ -1508,12 +1899,15 @@ async def _run_sync_task(task: QueueTask) -> None:
     task.lyrics = lyrics
     if task.cancel_requested:
         raise asyncio.CancelledError()
+    tmp_path = await _prepare_analysis_audio(task, tmp_path)
     sync_model = task.sync_model or ALIGN_MODEL_SIZE
     label = get_managed_spec(sync_model).label if sync_model in MODEL_SPECS else f"Whisper {sync_model}"
     task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 52}
     await _q_broadcast()
     if sync_model == "qwen3-forced-aligner-0.6b":
         lines = await _qwen_sync_worker(task, tmp_path, lyrics)
+    elif sync_model == "hubert-fa-combined":
+        lines = await _hubertfa_sync_worker(task, tmp_path, lyrics)
     else:
         lines = await _whisper_sync_worker(task, tmp_path, lyrics)
     task.result   = {"lines": lines}
@@ -1536,6 +1930,7 @@ async def _run_verify_task(task: QueueTask) -> None:
         raise ValueError("No lyrics to verify against.")
     if task.cancel_requested:
         raise asyncio.CancelledError()
+    tmp_path = await _prepare_analysis_audio(task, tmp_path)
     transcribe_model = task.transcribe_model or VERIFY_MODEL_SIZE
     label = get_managed_spec(transcribe_model).label if transcribe_model in MODEL_SPECS else f"Whisper {transcribe_model}"
     task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 38}
@@ -1563,6 +1958,7 @@ async def _run_transcribe_task(task: QueueTask) -> None:
         tmp_path = await _download_audio(task, song)
     if task.cancel_requested:
         raise asyncio.CancelledError()
+    tmp_path = await _prepare_analysis_audio(task, tmp_path)
     transcribe_model = task.transcribe_model or VERIFY_MODEL_SIZE
     label = get_managed_spec(transcribe_model).label if transcribe_model in MODEL_SPECS else f"Whisper {transcribe_model}"
     task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 30}
@@ -1591,6 +1987,7 @@ async def _run_auto_task(task: QueueTask) -> None:
     if task.cancel_requested:
         raise asyncio.CancelledError()
 
+    tmp_path = await _prepare_analysis_audio(task, tmp_path)
     transcribe_model = task.transcribe_model or VERIFY_MODEL_SIZE
     label = get_managed_spec(transcribe_model).label if transcribe_model in MODEL_SPECS else f"Whisper {transcribe_model}"
     task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 28}
@@ -1621,8 +2018,9 @@ async def _queue_processor() -> None:
     global _active_task
     while True:
         task = await _task_queue.get()
+        _queued_task_ids.discard(task.id)
 
-        if task.status in ("cancelled", "cancelling"):
+        if task.status in ("cancelled", "cancelling", "paused"):
             _task_queue.task_done()
             await _q_broadcast()
             continue
@@ -2001,25 +2399,97 @@ async def get_model_info():
         "models": WHISPER_MODELS,  # legacy
         "sync_models": SYNC_MODELS,
         "transcribe_models": TRANSCRIBE_MODELS,
-        "managed_models": catalog_status(),
+        "managed_models": _all_catalog_status(),
     }
 
 
 @app.get("/api/models")
 async def get_managed_models():
-    return {"models": catalog_status(), "models_dir": str(pathlib.Path(__file__).parent / "models")}
+    return {
+        "models": _all_catalog_status(),
+        "models_dir": str(pathlib.Path(__file__).parent / "models"),
+        "notes": load_catalog().get("notes", ""),
+    }
 
 
 @app.post("/api/models/{model_id}/download")
 async def download_managed_model(model_id: str):
-    if model_id not in MODEL_SPECS:
-        raise HTTPException(404, f"Unknown managed model '{model_id}'")
+    try:
+        item = get_catalog_model(model_id)
+    except ValueError:
+        raise HTTPException(404, f"Unknown model '{model_id}'")
+    if item.get("source") not in ("huggingface", "audio-separator", "hubertfa_release"):
+        reason = item.get("blocked_reason") or "This model is not downloaded through WRLD Sync's project-local model manager."
+        raise HTTPException(409, reason)
     task_id = await _enqueue_model_download(model_id)
+    return {"model_id": model_id, "installed": _catalog_model_installed(model_id), "task_id": task_id}
+
+
+@app.delete("/api/models/{model_id}")
+async def delete_managed_model(model_id: str):
+    global _align_model, _verify_model, _align_model_id, _verify_model_id
+    try:
+        item = get_catalog_model(model_id)
+    except ValueError:
+        raise HTTPException(404, f"Unknown model '{model_id}'")
+    if _align_model_id == model_id:
+        _align_model = None
+        _align_model_id = None
+    if _verify_model_id == model_id:
+        _verify_model = None
+        _verify_model_id = None
+    if model_id in MODEL_SPECS:
+        return await asyncio.to_thread(remove_managed_model, model_id)
+    if item.get("source") == "audio-separator":
+        asset = _UVR_MODEL_DIR / str(item.get("asset") or item.get("runtime_id") or "")
+        existed = asset.is_file()
+        asset.unlink(missing_ok=True)
+        return {"model_id": model_id, "removed": existed}
+    if item.get("source") == "hubertfa_release":
+        return await asyncio.to_thread(remove_hubertfa)
+    raise HTTPException(409, "This model is not managed by WRLD Sync's removable project-local model manager.")
+
+
+@app.get("/api/settings/advanced")
+async def get_advanced_settings():
     return {
-        "model_id": model_id,
-        "installed": managed_model_installed(model_id),
-        "task_id": task_id,
+        **ADVANCED_SETTINGS,
+        "cookies_supported": False,
+        "supported_url_services": ["YouTube", "YouTube Music", "SoundCloud"],
+        "separator_models": [m for m in _all_catalog_status() if "separation" in m.get("tasks", [])],
     }
+
+
+@app.post("/api/settings/advanced")
+async def set_advanced_settings(body: dict):
+    global ADVANCED_SETTINGS
+    values = dict(ADVANCED_SETTINGS)
+    if "preprocess_vocals" in body:
+        values["preprocess_vocals"] = bool(body["preprocess_vocals"])
+    if "separator_model" in body:
+        model_id = str(body["separator_model"] or "").strip()
+        try:
+            item = get_catalog_model(model_id)
+        except ValueError:
+            raise HTTPException(400, f"Unknown separator model '{model_id}'")
+        if "separation" not in item.get("tasks", []):
+            raise HTTPException(400, f"'{model_id}' is not a separation model")
+        values["separator_model"] = model_id
+    if "separator_target" in body:
+        target = str(body["separator_target"] or "").strip()
+        if target != "all_vocals":
+            raise HTTPException(400, "Only all_vocals is currently supported; it preserves backing vocals, echoes, and ad-libs.")
+        values["separator_target"] = target
+    if "yt_dlp_enabled" in body:
+        values["yt_dlp_enabled"] = bool(body["yt_dlp_enabled"])
+    if "yt_dlp_quality" in body:
+        quality = str(body["yt_dlp_quality"] or "").strip().lower()
+        if quality not in ("high", "medium", "small"):
+            raise HTTPException(400, "yt_dlp_quality must be high | medium | small")
+        values["yt_dlp_quality"] = quality
+    ADVANCED_SETTINGS = values
+    _save_advanced_settings(values)
+    return await get_advanced_settings()
 
 
 @app.post("/api/model")
@@ -2059,7 +2529,7 @@ async def set_model(body: dict):
             _align_model_id = None
             _write_pref(".model_pref_align", name)
             _write_pref(".model_pref", name)
-        if name in MODEL_SPECS and not managed_model_installed(name):
+        if (name in MODEL_SPECS and not managed_model_installed(name)) or (name == "hubert-fa-combined" and not hubert_installed()):
             tid = await _enqueue_model_download(name)
             if tid:
                 queued_models.append({"model_id": name, "task_id": tid})
@@ -2093,7 +2563,7 @@ async def set_model(body: dict):
         "verify_loaded": _verify_model is not None and _verify_model_id == VERIFY_MODEL_SIZE,
         "sync_models": SYNC_MODELS,
         "transcribe_models": TRANSCRIBE_MODELS,
-        "managed_models": catalog_status(),
+        "managed_models": _all_catalog_status(),
         "queued_models": queued_models,
     }
 
@@ -2916,25 +3386,73 @@ async def upload_audio(file: UploadFile = File(...)):
         raise
 
 
-class LocalUrlRequest(BaseModel):
-    url: str
-
-
-@app.post("/api/local-url")
-async def load_local_url(req: LocalUrlRequest):
-    url = req.url.strip()
-    parsed = urllib.parse.urlparse(url)
+def _valid_remote_url(url: str) -> urllib.parse.ParseResult:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise HTTPException(400, "Enter a valid http:// or https:// audio URL.")
+        raise ValueError("Enter a valid http:// or https:// audio URL.")
+    return parsed
 
+
+def _yt_dlp_service(url: str) -> str:
+    try:
+        host = (_valid_remote_url(url).hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return ""
+    if host in {"youtu.be", "youtube.com", "m.youtube.com", "music.youtube.com"} or host.endswith(".youtube.com"):
+        return "YouTube Music" if "music.youtube.com" in host else "YouTube"
+    if host == "soundcloud.com" or host.endswith(".soundcloud.com"):
+        return "SoundCloud"
+    return ""
+
+
+def _yt_dlp_format(quality: str) -> str:
+    return {
+        "high": "bestaudio/best",
+        "medium": "bestaudio[abr<=192]/bestaudio/best",
+        "small": "bestaudio[abr<=96]/bestaudio/best",
+    }.get(str(quality or "").lower(), "bestaudio/best")
+
+
+def _download_with_yt_dlp(url: str, *, quality: str = "high") -> tuple[pathlib.Path, str]:
+    _valid_remote_url(url)
+    uid = uuid.uuid4().hex[:12]
+    output_template = str(UPLOAD_DIR / f"{uid}.%(ext)s")
+    exe = shutil.which("yt-dlp")
+    cmd = [exe] if exe else [sys.executable, "-m", "yt_dlp"]
+    cmd += [
+        "--no-playlist", "--no-progress", "--no-warnings",
+        "--max-filesize", "2G",
+        "-f", _yt_dlp_format(quality),
+        "-x", "--audio-format", "flac",
+        "-o", output_template,
+        "--print", "after_move:filepath",
+        url,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        message = (proc.stderr or proc.stdout or "yt-dlp extraction failed").strip()
+        raise ValueError(message[-1200:])
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    path = pathlib.Path(lines[-1]) if lines else UPLOAD_DIR / f"{uid}.flac"
+    if not path.is_file():
+        matches = sorted(UPLOAD_DIR.glob(f"{uid}.*"), key=lambda x: x.stat().st_mtime, reverse=True)
+        path = next((x for x in matches if x.is_file()), path)
+    if not path.is_file():
+        raise ValueError("yt-dlp completed but did not leave a usable audio file.")
+    service = _yt_dlp_service(url) or "Remote media"
+    return path, f"{service} audio"
+
+
+async def _download_direct_url(url: str) -> tuple[pathlib.Path, str, str]:
+    parsed = _valid_remote_url(url)
     name = urllib.parse.unquote(pathlib.PurePosixPath(parsed.path).name) or "remote-audio"
     suffix = pathlib.Path(name).suffix
-    uid = str(uuid.uuid4())[:8]
+    uid = uuid.uuid4().hex[:12]
     dest = UPLOAD_DIR / f"{uid}{suffix or '.audio'}"
     max_bytes = 2 * 1024 * 1024 * 1024
     downloaded = 0
+    timeout = httpx.Timeout(30.0, read=180.0, write=30.0, pool=30.0)
     try:
-        timeout = httpx.Timeout(30.0, read=180.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
@@ -2943,32 +3461,147 @@ async def load_local_url(req: LocalUrlRequest):
                 if match:
                     name = urllib.parse.unquote(match.group(1).strip())
                 content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if content_type in {"text/html", "application/xhtml+xml"}:
+                    raise ValueError("URL returned a webpage instead of direct audio.")
                 if not suffix:
                     suffix = mimetypes.guess_extension(content_type) or ".audio"
-                    renamed = dest.with_suffix(suffix)
-                    dest = renamed
+                    dest = dest.with_suffix(suffix)
                 with dest.open("wb") as out:
                     async for chunk in response.aiter_bytes(1024 * 1024):
                         downloaded += len(chunk)
                         if downloaded > max_bytes:
                             raise HTTPException(413, "Remote audio is larger than the 2 GB local-file limit.")
                         out.write(chunk)
-        return await asyncio.to_thread(_register_local_track, dest, name, url)
-    except HTTPException:
-        dest.unlink(missing_ok=True)
-        raise
-    except httpx.HTTPStatusError as exc:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(exc.response.status_code, f"Audio URL returned HTTP {exc.response.status_code}.")
-    except httpx.HTTPError as exc:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(502, f"Could not download that audio URL: {exc}")
-    except ValueError as exc:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(400, str(exc))
     except Exception:
         dest.unlink(missing_ok=True)
         raise
+    return dest, name, url
+
+
+async def _fetch_remote_audio(url: str, *, quality: str | None = None, allow_ytdlp: bool | None = None) -> tuple[pathlib.Path, str, str]:
+    url = str(url or "").strip()
+    _valid_remote_url(url)
+    use_ytdlp = ADVANCED_SETTINGS["yt_dlp_enabled"] if allow_ytdlp is None else bool(allow_ytdlp)
+    quality = quality or ADVANCED_SETTINGS["yt_dlp_quality"]
+    known_service = _yt_dlp_service(url)
+    if known_service:
+        if not use_ytdlp:
+            raise ValueError(f"{known_service} links require yt-dlp extraction, which is disabled in Advanced settings.")
+        path, name = await asyncio.to_thread(_download_with_yt_dlp, url, quality=quality)
+        return path, name, url
+    try:
+        return await _download_direct_url(url)
+    except ValueError:
+        if not use_ytdlp:
+            raise
+        path, name = await asyncio.to_thread(_download_with_yt_dlp, url, quality=quality)
+        return path, name, url
+
+
+class LocalUrlRequest(BaseModel):
+    url: str
+
+
+@app.post("/api/local-url")
+async def load_local_url(req: LocalUrlRequest):
+    url = req.url.strip()
+    try:
+        path, name, source_url = await _fetch_remote_audio(url)
+        return await asyncio.to_thread(_register_local_track, path, name, source_url)
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(exc.response.status_code, f"Audio URL returned HTTP {exc.response.status_code}.")
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Could not download that audio URL: {exc}")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+def _vocal_reference_payload(song_id: int = 0, track_hash: str = "") -> dict:
+    owner = _owner_key(song_id, track_hash)
+    if not owner:
+        raise HTTPException(400, "A song_id or local track_hash is required.")
+    ref = _get_vocal_reference(owner)
+    if not ref:
+        return {"attached": False, "owner_key": owner}
+    return {
+        "attached": True,
+        "owner_key": owner,
+        "source_name": ref.get("source_name") or "Vocal reference",
+        "source_url": ref.get("source_url") or "",
+        "updated_at": ref.get("updated_at"),
+    }
+
+
+@app.get("/api/vocal-reference")
+async def get_vocal_reference(song_id: int = 0, track_hash: str = ""):
+    return _vocal_reference_payload(song_id, track_hash)
+
+
+@app.delete("/api/vocal-reference")
+async def delete_vocal_reference(song_id: int = 0, track_hash: str = ""):
+    owner = _owner_key(song_id, track_hash)
+    if not owner:
+        raise HTTPException(400, "A song_id or local track_hash is required.")
+    removed = _delete_vocal_reference(owner)
+    return {"attached": False, "owner_key": owner, "removed": removed}
+
+
+@app.post("/api/vocal-reference/upload")
+async def upload_vocal_reference(
+    file: UploadFile = File(...),
+    song_id: int = Form(0),
+    track_hash: str = Form(""),
+):
+    owner = _owner_key(song_id, track_hash)
+    if not owner:
+        raise HTTPException(400, "A song_id or local track_hash is required.")
+    suffix = pathlib.Path(file.filename or "vocals").suffix or ".audio"
+    raw = UPLOAD_DIR / f"vocal-{uuid.uuid4().hex[:12]}{suffix}"
+    stable = _VOCAL_REFERENCE_DIR / f"{hashlib.sha256(owner.encode('utf-8')).hexdigest()}.flac"
+    try:
+        with raw.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                out.write(chunk)
+        await asyncio.to_thread(_normalize_audio_only, raw, stable)
+        _set_vocal_reference(owner, stable, file.filename or "Uploaded vocals", "")
+        return _vocal_reference_payload(song_id, track_hash)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        raw.unlink(missing_ok=True)
+
+
+class VocalReferenceUrlRequest(BaseModel):
+    url: str
+    song_id: int = 0
+    track_hash: str = ""
+
+
+@app.post("/api/vocal-reference/url")
+async def vocal_reference_from_url(req: VocalReferenceUrlRequest):
+    owner = _owner_key(req.song_id, req.track_hash)
+    if not owner:
+        raise HTTPException(400, "A song_id or local track_hash is required.")
+    downloaded: pathlib.Path | None = None
+    stable = _VOCAL_REFERENCE_DIR / f"{hashlib.sha256(owner.encode('utf-8')).hexdigest()}.flac"
+    try:
+        downloaded, source_name, source_url = await _fetch_remote_audio(req.url)
+        await asyncio.to_thread(_normalize_audio_only, downloaded, stable)
+        _set_vocal_reference(owner, stable, source_name, source_url)
+        return _vocal_reference_payload(req.song_id, req.track_hash)
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(exc.response.status_code, f"Vocal-reference URL returned HTTP {exc.response.status_code}.")
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Could not download that vocal reference: {exc}")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        if downloaded is not None:
+            downloaded.unlink(missing_ok=True)
 
 
 @app.get("/api/local/{track_hash}/cover")
@@ -3008,6 +3641,9 @@ class QueueAddRequest(BaseModel):
     inline_parenthetical_background: bool = True
     allow_overlapping_lyrics: bool = False
     interlude_threshold: float = 2.0
+    preprocess_vocals: bool | None = None
+    separator_model: str = ""
+    separator_target: str = ""
 
 
 @app.post("/api/queue")
@@ -3019,8 +3655,14 @@ async def queue_add(req: QueueAddRequest):
     # task is waiting cannot silently change which model that task will use.
     sync_model = ALIGN_MODEL_SIZE
     transcribe_model = VERIFY_MODEL_SIZE
+    preprocess_vocals = ADVANCED_SETTINGS["preprocess_vocals"] if req.preprocess_vocals is None else bool(req.preprocess_vocals)
+    separator_model = req.separator_model or ADVANCED_SETTINGS["separator_model"]
+    separator_target = req.separator_target or ADVANCED_SETTINGS["separator_target"]
     model_tasks: list[str] = []
-    for model_id in _task_model_requirements(req.type, sync_model, transcribe_model):
+    required_models = _task_model_requirements(req.type, sync_model, transcribe_model)
+    if preprocess_vocals:
+        required_models.append(separator_model)
+    for model_id in dict.fromkeys(required_models):
         tid = await _enqueue_model_download(model_id)
         if tid:
             model_tasks.append(tid)
@@ -3039,11 +3681,14 @@ async def queue_add(req: QueueAddRequest):
         inline_parenthetical_background=req.inline_parenthetical_background,
         allow_overlapping_lyrics=req.allow_overlapping_lyrics,
         interlude_threshold=max(0.0, req.interlude_threshold),
+        preprocess_vocals=preprocess_vocals,
+        separator_model=separator_model,
+        separator_target=separator_target,
         sync_model=sync_model,
         transcribe_model=transcribe_model,
     )
     _tasks[task.id] = task
-    await _task_queue.put(task)
+    await _queue_put_once(task)
     await _q_broadcast()
     return {"task_id": task.id, "model_tasks": model_tasks}
 
@@ -3051,7 +3696,7 @@ async def queue_add(req: QueueAddRequest):
 @app.get("/api/queue")
 async def queue_state():
     active   = _active_task.to_dict() if _active_task else None
-    pending  = [t.to_dict() for t in _tasks.values() if t.status == "pending"]
+    pending  = [t.to_dict() for t in _tasks.values() if t.status in ("pending", "paused")]
     done_list = [t for t in _tasks.values() if t.status in ("done", "error", "cancelled")]
     history  = [t.to_dict() for t in sorted(done_list, key=lambda t: t.created_at)][-20:]
     return {"active": active, "pending": pending, "history": history}
@@ -3074,13 +3719,69 @@ async def queue_cancel(task_id: str):
     if not task:
         raise HTTPException(404, "Task not found")
     task.cancel_requested = True
+    task.pause_requested = False
     if task.status == "pending":
         task.status = "cancelled"
+    elif task.status == "paused":
+        task.status = "cancelled"
+        if task.type == "model_download":
+            if task.model_id in MODEL_SPECS:
+                await asyncio.to_thread(remove_managed_model, task.model_id)
+            else:
+                try:
+                    item = get_catalog_model(task.model_id)
+                except ValueError:
+                    item = {}
+                if item.get("source") == "hubertfa_release":
+                    await asyncio.to_thread(remove_hubertfa)
+                elif item.get("source") == "audio-separator":
+                    asset = _UVR_MODEL_DIR / str(item.get("asset") or item.get("runtime_id") or "")
+                    asset.unlink(missing_ok=True)
     elif task.status == "running":
         task.progress = {**task.progress, "msg": "Cancelling…"}
         task.status = "cancelling"
     await _q_broadcast()
     return {"cancelled": True}
+
+
+@app.post("/api/queue/{task_id}/pause")
+async def pause_queue_task(task_id: str):
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found.")
+    if task.type != "model_download":
+        raise HTTPException(400, "Only model downloads can be paused.")
+    if task.status == "paused":
+        return task.to_dict()
+    if task.status == "pending":
+        task.status = "paused"
+        task.pause_requested = False
+    elif task.status in ("running", "cancelling"):
+        task.pause_requested = True
+        task.cancel_requested = False
+        task.progress = {**task.progress, "stage": "pausing", "msg": "Pausing after the current download chunk…"}
+    else:
+        raise HTTPException(409, f"Task cannot be paused from state {task.status}.")
+    await _q_broadcast()
+    return task.to_dict()
+
+
+@app.post("/api/queue/{task_id}/resume")
+async def resume_queue_task(task_id: str):
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found.")
+    if task.type != "model_download":
+        raise HTTPException(400, "Only model downloads can be resumed.")
+    if task.status != "paused":
+        raise HTTPException(409, f"Task cannot be resumed from state {task.status}.")
+    task.pause_requested = False
+    task.cancel_requested = False
+    task.status = "pending"
+    task.progress = {**task.progress, "stage": "queued", "msg": "Resuming model download…"}
+    await _queue_put_once(task)
+    await _q_broadcast()
+    return task.to_dict()
 
 
 @app.get("/api/queue/stream")

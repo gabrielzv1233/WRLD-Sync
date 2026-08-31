@@ -8,8 +8,13 @@ import shutil
 import tempfile
 import threading
 import time
+import urllib.parse
+
+import httpx
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
+
+from model_catalog import load_catalog
 
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
@@ -20,6 +25,11 @@ MANIFEST_NAME = ".wrld-model.json"
 
 ProgressCallback = Callable[[dict], None]
 CancelCallback = Callable[[], bool]
+PauseCallback = Callable[[], bool]
+
+
+class DownloadPaused(InterruptedError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -28,64 +38,42 @@ class ModelSpec:
     label: str
     repo_id: str
     folder: str
-    kind: str  # asr | aligner
-    provider: str  # qwen | parakeet
+    kind: str
+    provider: str
     revision: str | None = None
     allow_patterns: tuple[str, ...] = field(default_factory=tuple)
     dependencies: tuple[str, ...] = field(default_factory=tuple)
     description: str = ""
+    runtime_adapter: str = ""
 
     @property
     def path(self) -> pathlib.Path:
         return MODELS_DIR / self.folder
 
 
-MODEL_SPECS: dict[str, ModelSpec] = {
-    "qwen3-asr-0.6b": ModelSpec(
-        id="qwen3-asr-0.6b",
-        label="Qwen3-ASR 0.6B",
-        repo_id="Qwen/Qwen3-ASR-0.6B-hf",
-        folder="qwen3-asr-0.6b",
-        kind="asr",
-        provider="qwen",
-        allow_patterns=("*.json", "*.safetensors", "*.jinja"),
-        dependencies=("qwen3-forced-aligner-0.6b",),
-        description="Fast Qwen song/singing transcription with Qwen word alignment.",
-    ),
-    "qwen3-asr-1.7b": ModelSpec(
-        id="qwen3-asr-1.7b",
-        label="Qwen3-ASR 1.7B",
-        repo_id="Qwen/Qwen3-ASR-1.7B-hf",
-        folder="qwen3-asr-1.7b",
-        kind="asr",
-        provider="qwen",
-        allow_patterns=("*.json", "*.safetensors", "*.jinja"),
-        dependencies=("qwen3-forced-aligner-0.6b",),
-        description="Higher-accuracy Qwen transcription tuned for singing and songs with BGM.",
-    ),
-    "qwen3-forced-aligner-0.6b": ModelSpec(
-        id="qwen3-forced-aligner-0.6b",
-        label="Qwen3 Forced Aligner 0.6B",
-        repo_id="Qwen/Qwen3-ForcedAligner-0.6B-hf",
-        folder="qwen3-forced-aligner-0.6b",
-        kind="aligner",
-        provider="qwen",
-        allow_patterns=("*.json", "*.safetensors", "*.jinja"),
-        description="Qwen forced alignment for existing lyrics.",
-    ),
-    "parakeet-tdt-0.6b-v3": ModelSpec(
-        id="parakeet-tdt-0.6b-v3",
-        label="Parakeet TDT 0.6B v3",
-        repo_id="nvidia/parakeet-tdt-0.6b-v3",
-        folder="parakeet-tdt-0.6b-v3",
-        kind="asr",
-        provider="parakeet",
-        # Download only the native Transformers checkpoint, not the duplicate
-        # NeMo/GGUF weights that live in the same repository.
-        allow_patterns=("config.json", "generation_config.json", "processor_config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors"),
-        description="Fast Parakeet TDT transcription with native token-duration timestamps.",
-    ),
-}
+def _managed_specs_from_catalog() -> dict[str, ModelSpec]:
+    specs: dict[str, ModelSpec] = {}
+    for item in load_catalog()["models"]:
+        if item.get("source") != "huggingface":
+            continue
+        model_id = str(item["id"])
+        specs[model_id] = ModelSpec(
+            id=model_id,
+            label=str(item.get("label") or model_id),
+            repo_id=str(item.get("repo_id") or ""),
+            folder=str(item.get("folder") or model_id),
+            kind=str(item.get("kind") or (item.get("tasks") or ["model"])[0]),
+            provider=str(item.get("provider") or "huggingface"),
+            revision=item.get("revision"),
+            allow_patterns=tuple(item.get("allow_patterns") or ()),
+            dependencies=tuple(item.get("dependencies") or ()),
+            description=str(item.get("description") or ""),
+            runtime_adapter=str(item.get("runtime_adapter") or ""),
+        )
+    return specs
+
+
+MODEL_SPECS: dict[str, ModelSpec] = _managed_specs_from_catalog()
 
 _remote_manifest_cache: dict[str, dict] = {}
 _remote_manifest_lock = threading.Lock()
@@ -457,6 +445,7 @@ def ensure_model(
     model_id: str,
     progress: ProgressCallback | None = None,
     cancel: CancelCallback | None = None,
+    pause: PauseCallback | None = None,
 ) -> pathlib.Path:
     """Ensure a managed model exists in ./models, copying a verified cache before downloading."""
     spec = get_spec(model_id)
@@ -465,7 +454,7 @@ def ensure_model(
     # A forced launcher exit can leave a partial temp model behind. The queue is
     # serial, so stale temp directories for this model are safe to remove before
     # starting a new acquisition attempt.
-    for pattern in (f".{spec.folder}-download-*", f".{spec.folder}-copy-*"):
+    for pattern in (f".{spec.folder}-copy-*",):
         for stale in MODELS_DIR.glob(pattern):
             if stale.is_dir():
                 shutil.rmtree(stale, ignore_errors=True)
@@ -514,68 +503,149 @@ def ensure_model(
             shutil.rmtree(tmp_target, ignore_errors=True)
             raise
 
-    # Download into a temporary project-local directory, then verify and atomically publish.
-    from huggingface_hub import snapshot_download
+    # Download into a persistent project-local partial directory. Each file is
+    # resumed with HTTP Range so pausing or a launcher restart does not discard
+    # multi-GB progress.
+    partial_root = MODELS_DIR / ".partials" / spec.folder
+    partial_root.mkdir(parents=True, exist_ok=True)
+    revision = str(remote.get("revision") or spec.revision or "main")
+    files = list(remote.get("files") or [])
+    total = sum(int(x.get("size") or 0) for x in files) or 1
 
-    tmp_target = pathlib.Path(tempfile.mkdtemp(prefix=f".{spec.folder}-download-", dir=MODELS_DIR))
-    errors: list[BaseException] = []
+    def interrupt_state() -> str | None:
+        if cancel and cancel():
+            return "cancel"
+        if pause and pause():
+            return "pause"
+        return None
 
-    def _download() -> None:
-        try:
-            snapshot_download(
-                repo_id=spec.repo_id,
-                revision=str(remote.get("revision") or spec.revision or "main"),
-                local_dir=str(tmp_target),
-                allow_patterns=list(spec.allow_patterns) or None,
-            )
-        except BaseException as exc:
-            errors.append(exc)
-
-    worker = threading.Thread(target=_download, name=f"download-{model_id}", daemon=True)
-    worker.start()
-    total = int(remote.get("total_size") or 0)
     try:
-        while worker.is_alive():
-            if cancel and cancel():
-                raise InterruptedError("Cancelled")
-            done = _dir_download_bytes(tmp_target)
-            pct = min(99.0, (done / total * 100) if total else 0.0)
-            _emit(progress, stage="downloading", msg=f"Downloading {spec.label}…", pct=pct, done_bytes=done, total_bytes=total)
-            worker.join(0.25)
-        if errors:
-            raise errors[0]
+        # Keep a running byte counter instead of recursively rescanning a multi-GB
+        # partial tree after every 1 MiB chunk. Existing completed/partial bytes
+        # are counted once when their file is reached and then incremented in-memory.
+        done_total = 0
+        timeout = httpx.Timeout(30.0, read=180.0, write=30.0, pool=30.0)
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            for item in files:
+                state = interrupt_state()
+                if state == "pause":
+                    raise DownloadPaused("Paused")
+                if state == "cancel":
+                    raise InterruptedError("Cancelled")
 
-        # snapshot_download(local_dir=...) adds transfer bookkeeping that is not
-        # part of the model itself. Keep project model folders clean.
-        shutil.rmtree(tmp_target / ".cache", ignore_errors=True)
+                rel = str(item["path"])
+                expected = int(item.get("size") or 0)
+                final = partial_root / rel
+                part = final.with_name(final.name + ".part")
+                final.parent.mkdir(parents=True, exist_ok=True)
+
+                # A complete file from a previous run can be reused directly.
+                if final.is_file() and (not expected or final.stat().st_size == expected):
+                    done_total += final.stat().st_size
+                    _emit(progress, stage="downloading", msg=f"Reusing {pathlib.Path(rel).name}…", pct=min(99.0, done_total / total * 100), done_bytes=done_total, total_bytes=total)
+                    continue
+                if final.exists():
+                    final.unlink(missing_ok=True)
+
+                existing = part.stat().st_size if part.is_file() else 0
+                if expected and existing > expected:
+                    part.unlink(missing_ok=True)
+                    existing = 0
+                done_total += existing
+
+                url_path = "/".join(urllib.parse.quote(piece, safe="") for piece in rel.split("/"))
+                url = f"https://huggingface.co/{spec.repo_id}/resolve/{urllib.parse.quote(revision, safe='')}/{url_path}"
+                headers = {"Range": f"bytes={existing}-"} if existing else {}
+                with client.stream("GET", url, headers=headers) as response:
+                    response.raise_for_status()
+                    # Some origins ignore Range. Restart only this file if so.
+                    if existing and response.status_code != 206:
+                        part.unlink(missing_ok=True)
+                        done_total -= existing
+                        existing = 0
+                        response.close()
+                        with client.stream("GET", url) as restarted:
+                            restarted.raise_for_status()
+                            with part.open("wb") as out:
+                                for chunk in restarted.iter_bytes(1024 * 1024):
+                                    state = interrupt_state()
+                                    if state == "pause":
+                                        raise DownloadPaused("Paused")
+                                    if state == "cancel":
+                                        raise InterruptedError("Cancelled")
+                                    out.write(chunk)
+                                    done_total += len(chunk)
+                                    _emit(progress, stage="downloading", msg=f"Downloading {pathlib.Path(rel).name}…", pct=min(99.0, done_total / total * 100), done_bytes=done_total, total_bytes=total)
+                    else:
+                        mode = "ab" if existing else "wb"
+                        with part.open(mode) as out:
+                            for chunk in response.iter_bytes(1024 * 1024):
+                                state = interrupt_state()
+                                if state == "pause":
+                                    raise DownloadPaused("Paused")
+                                if state == "cancel":
+                                    raise InterruptedError("Cancelled")
+                                out.write(chunk)
+                                done_total += len(chunk)
+                                _emit(progress, stage="downloading", msg=f"Downloading {pathlib.Path(rel).name}…", pct=min(99.0, done_total / total * 100), done_bytes=done_total, total_bytes=total)
+
+                if expected and part.stat().st_size != expected:
+                    raise RuntimeError(f"Incomplete download for {rel}: expected {expected} bytes, got {part.stat().st_size}")
+                part.replace(final)
+
+        # Ignore any old transfer bookkeeping and verify every required model file
+        # before publishing the install.
+        shutil.rmtree(partial_root / ".cache", ignore_errors=True)
         _emit(progress, stage="verifying", msg=f"Verifying downloaded {spec.label}…", pct=0)
-        ok, hashes = _verify_candidate(tmp_target, remote, progress, cancel)
+        ok, hashes = _verify_candidate(partial_root, remote, progress, cancel)
         if not ok:
-            raise RuntimeError(f"Downloaded {spec.label} failed SHA-256 verification")
-        _write_manifest(tmp_target, spec, remote, hashes, "download")
+            raise RuntimeError(f"Downloaded {spec.label} failed repository verification")
+        _write_manifest(partial_root, spec, remote, hashes, "download-resumed")
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
-        tmp_target.replace(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial_root.replace(target)
         _verified_this_process.add(model_id)
         _emit(progress, stage="ready", msg=f"{spec.label} ready", pct=100, source="download")
         return target
-    except Exception:
-        shutil.rmtree(tmp_target, ignore_errors=True)
+    except DownloadPaused:
+        _emit(progress, stage="paused", msg=f"Paused {spec.label}", pct=min(99.0, _dir_download_bytes(partial_root) / total * 100))
+        raise
+    except InterruptedError:
+        # Explicit destructive cancel removes partial bytes. Pause has its own
+        # path above and deliberately preserves them.
+        shutil.rmtree(partial_root, ignore_errors=True)
         raise
 
 
+
+def remove_model(model_id: str) -> dict:
+    spec = get_spec(model_id)
+    removed = False
+    if spec.path.exists():
+        shutil.rmtree(spec.path, ignore_errors=True)
+        removed = True
+    partial = MODELS_DIR / ".partials" / spec.folder
+    if partial.exists():
+        shutil.rmtree(partial, ignore_errors=True)
+        removed = True
+    _verified_this_process.discard(model_id)
+    return {"model_id": model_id, "removed": removed}
+
 def catalog_status() -> list[dict]:
+    catalog = {str(item["id"]): dict(item) for item in load_catalog()["models"]}
     out = []
     for spec in MODEL_SPECS.values():
-        out.append({
-            "id": spec.id,
-            "label": spec.label,
+        item = catalog.get(spec.id, {"id": spec.id, "label": spec.label})
+        item.update({
             "repo_id": spec.repo_id,
             "kind": spec.kind,
             "provider": spec.provider,
-            "description": spec.description,
+            "description": item.get("description") or spec.description,
             "installed": _quick_installed(spec),
             "path": str(spec.path),
             "dependencies": list(spec.dependencies),
+            "managed": True,
         })
+        out.append(item)
     return out
