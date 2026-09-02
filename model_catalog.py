@@ -1,8 +1,7 @@
 from __future__ import annotations
-
-import json
-import pathlib
 from functools import lru_cache
+import pathlib
+import json
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 CATALOG_PATH = PROJECT_ROOT / "models_manifest.json"

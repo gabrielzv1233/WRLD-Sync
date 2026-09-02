@@ -30,6 +30,16 @@ uvicorn app:app --reload
 
 Or just run `python launch.py`, which does the setup + launch + browser-opening for you. The launcher detects uv automatically and uses `uv pip` for dependency and PyTorch installs when available, with regular pip as the fallback. Flags: `--port <1-65535>`, `--no-browser`, `--auto-update`, `--no-update-check`.
 
+### Docker
+
+Use Docker Compose so application data, downloaded models, and caches live in named volumes and survive container replacement or image upgrades:
+
+```bash
+docker compose up --build -d
+```
+
+Open <http://localhost:8000>. To update after changing or pulling the source, run the same command again. The named volumes `wrld-sync-data`, `wrld-sync-models`, and `wrld-sync-cache` are retained when the container is recreated. `docker compose down` is safe, but do not add `--volumes`/`-v` unless you intentionally want to delete the persistent data.
+
 If an NVIDIA GPU is detected, `launch.py` automatically verifies that PyTorch is actually a CUDA build. If the venv already contains a CPU-only `+cpu` wheel, the launcher force-reinstalls the matching CUDA wheel instead of incorrectly treating the existing package as satisfied. CUDA installation is skipped on machines without an NVIDIA GPU.
 
 The Faster-Whisper backend uses CTranslate2 for inference and checks CTranslate2's CUDA devices directly; it is no longer incorrectly disabled just because `torch.cuda.is_available()` is false. PyTorch CUDA is still repaired/verified because the PyTorch Whisper compatibility backend can use it.
@@ -74,13 +84,13 @@ Managed checkpoints use the native Hugging Face Transformers versions of Qwen3-A
 WHISPER_MODEL=small uvicorn app:app --reload
 ```
 
-| Model | Role | Rough trade-off |
-|---|---|---|
-| Whisper tiny/base/small/medium/large-v3 | Transcribe + legacy Sync | Proven compatibility; Faster-Whisper can stream |
-| Qwen3-ASR 0.6B | Transcribe | Smaller/faster Qwen option, singing/BGM aware |
-| Qwen3-ASR 1.7B | Transcribe | Higher-accuracy Qwen option |
-| Qwen3 Forced Aligner 0.6B | Sync / word timing | Dedicated forced alignment of existing lyrics |
-| Parakeet TDT 0.6B v3 | Transcribe | Fast alternative with native duration timestamps |
+| Model                                   | Role                     | Rough trade-off                                  |
+| --------------------------------------- | ------------------------ | ------------------------------------------------ |
+| Whisper tiny/base/small/medium/large-v3 | Transcribe + legacy Sync | Proven compatibility; Faster-Whisper can stream  |
+| Qwen3-ASR 0.6B                          | Transcribe               | Smaller/faster Qwen option, singing/BGM aware    |
+| Qwen3-ASR 1.7B                          | Transcribe               | Higher-accuracy Qwen option                      |
+| Qwen3 Forced Aligner 0.6B               | Sync / word timing       | Dedicated forced alignment of existing lyrics    |
+| Parakeet TDT 0.6B v3                    | Transcribe               | Fast alternative with native duration timestamps |
 
 ## Notes
 
@@ -115,7 +125,7 @@ Settings includes **Inline (…) as background vocals**. Leave it enabled to tre
 ### Overlapping lyric playback
 
 Settings includes **Allow overlapping lyrics**, off by default. When enabled, Preview keeps every lyric line whose real timestamp range is still active highlighted and animates word timing on all of them at once. This is useful when a sustained last word continues after the next line starts, or when a separately timed background/ad-lib line overlaps the foreground vocal. The option does not invent or stretch timestamps; it only renders overlap that already exists in Whisper output, imported/edited TTML, or manual timing. TTML parent sections and interlude boundaries also account for the latest overlapping vocal end.
+
 ### Preview source navigation
 
 Each timed Preview line has a Feather `map-pin` action beside its timestamp. It jumps to the best matching raw Lyrics line, focuses the raw editor, and places the caret at that line start. The mapping keeps source-index/text hints when available, then falls back through exact and fuzzy matching so inserted, deleted, edited, or repeated lyric lines do not immediately break navigation. In Preview, the backquote key (`` ` ``) toggles lyric auto-scroll; enabling it smoothly re-anchors to the active/nearest timed line.
-

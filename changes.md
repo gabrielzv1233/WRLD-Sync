@@ -1,4 +1,5 @@
-this file lists changes I have made whilest you (codex) have been inactive
+this file lists changes I have made whilst you (codex) have been inactive
+
 > one thing I actually want u to add is the project storing already processed lyrics in a database, than storing its processing settings in it aswell, using the song ID as the database ID/key
 
 ## 2026-08-29 Preview → Lyrics source pin / auto-scroll shortcut
@@ -81,7 +82,6 @@ this file lists changes I have made whilest you (codex) have been inactive
 - Replaced plain TTML checkboxes with custom animated switch controls, full-row click targets, and concise descriptions of each behavior.
 - Added modal interaction polish: backdrop-click dismissal, Escape dismissal, focus restoration to the previously focused control, Tab focus containment, responsive one-column behavior, and body scroll locking while Settings is open.
 - Improved status presentation for model/device saves and token saves, including clearing stale error coloring after a successful model setting update.
-
 
 ## 2026-08-29 Preview scroll / inline background toggle correction
 
@@ -188,3 +188,14 @@ this file lists changes I have made whilest you (codex) have been inactive
 - CMU lookup now prefers the maintained direct `cmudict` package and keeps `pronouncing` only as a compatibility fallback. Neural `g2p_en` initialization is cached and the context model only runs when a line actually contains an unknown, slang, or known context-sensitive homograph instead of paying that cost for every ordinary dictionary-only line.
 - Fixed runtime model labeling so HuBERT FA is reported by its catalog label instead of being incorrectly logged as `Whisper hubert-fa-combined`.
 - Validation completed for this pass where the environment permits it: modified Python modules compile, production inline JavaScript passes `node --check`, production HTML has no duplicate IDs, the app imports and core FastAPI routes smoke-test with only `stable_whisper` stubbed, HuBERT dictionary/slang/original-word reconstruction tests pass, audio-scored singing-candidate selection passes with a decoder stub, manual vocal-reference persistence/stale fallback passes, UVR cache reuse passes, yt-dlp service routing passes, and queue pause/resume/cancel unit tests pass. A real Whisper/CTranslate2 inference smoke test was not possible in this environment because those existing runtime dependencies are unavailable here.
+
+## 2026-08-31 approved UI integration / UVR dependency hotfix
+
+- Replaced the simplified production Settings presentation with the approved v4 General / Models / Advanced design while preserving the real production IDs, persisted preferences, API endpoints, and queue/model-manager behavior. The modal now uses the approved animated tab underline, section cards, sliding compute-device selector, TTML switch rows, model filters/cards, Model Guide, and Advanced processing layout.
+- Kept the later v11 mock as the visual source for the editor/player pass rather than treating its fake demo data as production logic. Preview / Lyrics / TTML now use the sliding tab indicator, active tab text uses `var(--accent2)`, TTML Refresh/Save live in the shared tab strip, Lyrics remains readable white prose, and TTML is nowrap with horizontal scrolling and no redundant inner header.
+- Finished the custom player styling in normal document flow with the transparent play control, custom filled seek/volume ranges, progressive speaker-wave state, muted styling, and the final `--seek-pct` / `--volume-pct` variables.
+- Kept the frosted Resume auto-scroll strip but explicitly restored its text and hover text to `var(--accent2)` as the one requested carry-over from the older styling.
+- Reworked the Models page to keep v4 card/guide styling while driving the real model catalog. Cards can select compatible runtime models, install/remove managed models, and pause/resume/cancel active model downloads without replacing the production Task Queue behavior.
+- Added the HuBERT FA phoneme-bridge explanation to Advanced settings so its hidden dictionary / contextual G2P / candidate-scoring input format is represented without exposing `.lab` files to the user.
+- Added `audioread>=3.0.1` as an explicit project dependency because the installed `audio-separator` runtime imports `audioread` from its UVR utilities even though it was absent from the resolved environment, which prevented BS-RoFormer and UVR-MDX-NET-Inst_HQ_5 model setup from starting.
+- Final static validation for this pass: modified Python modules compile, production inline JavaScript passes `node --check`, production HTML has no duplicate IDs, all statically referenced DOM IDs resolve, required Settings/editor/player IDs are present, model cards retain real queue actions, and obsolete TTML inner-bar markup/styling is removed.

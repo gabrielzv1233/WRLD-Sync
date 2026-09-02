@@ -6,11 +6,11 @@ can collapse aligned phoneme intervals back to the original words.
 """
 from __future__ import annotations
 
-import re
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+import re
 
 _WORD_EDGE_RE = re.compile(r"^[^A-Za-z0-9']+|[^A-Za-z0-9']+$")
 _VARIANT_SUFFIX_RE = re.compile(r"\(\d+\)$")

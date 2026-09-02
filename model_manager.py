@@ -1,20 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from model_catalog import load_catalog
+import urllib.parse
+import threading
+import tempfile
 import hashlib
-import json
-import os
 import pathlib
 import shutil
-import tempfile
-import threading
-import time
-import urllib.parse
-
 import httpx
-from dataclasses import dataclass, field
-from typing import Callable, Iterable
-
-from model_catalog import load_catalog
+import json
+import time
+import os
 
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent

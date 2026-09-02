@@ -1,26 +1,26 @@
-import asyncio
-import gc
-import hashlib
-import io
-import json
-import mimetypes
-import os
-import pathlib
+from dataclasses import dataclass, field as dc_field
+from contextlib import asynccontextmanager
+import xml.etree.ElementTree as ET
 import queue as thread_queue
-import re
+import urllib.parse
+import subprocess
+import mimetypes
+import threading
+import tempfile
+import asyncio
+import hashlib
+import pathlib
+import sqlite3
 import shutil
 import signal
-import sqlite3
-import subprocess
-import sys
-import tempfile
-import threading
+import json
 import time
-import urllib.parse
 import uuid
-import xml.etree.ElementTree as ET
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field as dc_field
+import sys
+import gc
+import io
+import os
+import re
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -188,7 +188,9 @@ _ADVANCED_DEFAULTS = {
     "yt_dlp_enabled": True,
     "yt_dlp_quality": "high",
 }
-_ADVANCED_PATH = pathlib.Path(__file__).parent / ".advanced_settings.json"
+_STATE_DIR = pathlib.Path(os.getenv("WRLD_SYNC_STATE_DIR", pathlib.Path(__file__).parent))
+_STATE_DIR.mkdir(parents=True, exist_ok=True)
+_ADVANCED_PATH = _STATE_DIR / ".advanced_settings.json"
 
 def _load_advanced_settings() -> dict:
     values = dict(_ADVANCED_DEFAULTS)
@@ -712,7 +714,7 @@ WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large
 WHISPER_ENGINES = ["faster", "torch"]
 SYNC_MODELS = WHISPER_MODELS + ["qwen3-forced-aligner-0.6b", "hubert-fa-combined"]
 TRANSCRIBE_MODELS = WHISPER_MODELS + ["qwen3-asr-0.6b", "qwen3-asr-1.7b", "parakeet-tdt-0.6b-v3"]
-_PREF_DIR = pathlib.Path(__file__).parent
+_PREF_DIR = _STATE_DIR
 
 def _read_pref(filename: str, choices: list, default: str) -> str:
     try:

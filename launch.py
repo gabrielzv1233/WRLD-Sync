@@ -14,19 +14,18 @@ Usage:
     python launch.py --no-update-check   # skip the update check entirely
 """
 from __future__ import annotations
-
+from pathlib import Path
+import urllib.request
+import urllib.error
+import subprocess
+import webbrowser
 import argparse
-import os
 import platform
 import shutil
 import signal
-import subprocess
-import sys
 import time
-import urllib.error
-import urllib.request
-import webbrowser
-from pathlib import Path
+import sys
+import os
 
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / ".venv"

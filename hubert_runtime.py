@@ -7,21 +7,19 @@ from the phoneme plan after alignment.
 """
 from __future__ import annotations
 
-import hashlib
-import importlib
-import json
-import pathlib
-import shutil
-import sys
-import tempfile
-import urllib.parse
-import zipfile
+from hubert_phonemes import build_phoneme_plan, PhonemePlan
 from dataclasses import dataclass, replace
-from typing import Callable
-
+from collections.abc import Callable
+import urllib.parse
+import importlib
+import tempfile
+import hashlib
+import pathlib
+import zipfile
+import shutil
 import httpx
-
-from hubert_phonemes import PhonemePlan, build_phoneme_plan
+import json
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "models"
