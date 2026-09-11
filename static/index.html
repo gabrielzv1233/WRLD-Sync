@@ -12,6 +12,8 @@
 <link rel="stylesheet" href="/index.css" />
 </head>
 <body>
+<div id="lyricsAmbientBg" class="lyrics-ambient-bg" aria-hidden="true"></div>
+<div class="lyrics-ambient-shade" aria-hidden="true"></div>
 
 <header>
   <a class="logo" href="/" aria-label="WRLD Sync home">
@@ -143,7 +145,7 @@
 
 <main>
   <!-- Left: song list -->
-  <div id="resultsPanel">
+  <aside id="resultsPanel" class="results" aria-label="Song catalog">
     <div class="results-header">
       <span class="results-header-text" id="resultsHeaderText" aria-live="polite">Type to search</span>
       <button class="icon-btn-sm" id="collapseSidebarBtn" title="Collapse sidebar" type="button" aria-label="Collapse song list">
@@ -153,7 +155,7 @@
       </button>
     </div>
     <div id="resultsList" aria-label="Song search results"></div>
-  </div>
+  </aside>
 
   <!-- Right: player -->
   <div id="playerPanel">
@@ -237,11 +239,8 @@
         Resume auto-scroll
       </button>
 
-      <!-- Lyrics + controls share this wrapper so controls can float over lyrics -->
+      <!-- Editor and controls share the remaining player height. -->
       <div class="lyrics-controls-area">
-        <div id="lyricsAmbientBg" class="lyrics-ambient-bg" aria-hidden="true"></div>
-        <div class="lyrics-ambient-shade" aria-hidden="true"></div>
-
         <!-- Lyrics (scrollable) -->
         <div id="lyricsSection">
           <div id="lyricsTabBar" class="lyrics-tabs editor-tabs" role="tablist" aria-label="Lyrics views">
@@ -254,7 +253,7 @@
             <div class="editor-utils">
               <span id="shortcutsHint" class="shortcuts-hint">↑ ↓ lyrics &nbsp;← → ±1s &nbsp;Space play/pause &nbsp;` auto-scroll</span>
               <button id="refreshTtmlBtn" class="tiny-btn hidden" type="button"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>Refresh</button>
-              <button id="saveTtmlBtn" class="tiny-btn primary hidden" type="button"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg>Save</button>
+              <button id="saveTtmlBtn" class="tiny-btn hidden" type="button"><svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg>Save</button>
               <div class="shortcuts-info-wrap"><button class="icon-btn-sm info-btn" id="shortcutsInfoBtn" title="Keyboard shortcuts" type="button" aria-label="Keyboard shortcuts" aria-expanded="false" aria-controls="shortcutsPopover"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4m0-4h.01"/></svg></button><div id="shortcutsPopover" role="dialog" aria-label="Keyboard shortcuts"><div class="rf-title">Keyboard shortcuts</div><div class="shortcuts-row"><kbd>↑</kbd> <kbd>↓</kbd><span>Previous / next lyric</span></div><div class="shortcuts-row"><kbd>←</kbd> <kbd>→</kbd><span>Seek 1 second back / forward</span></div><div class="shortcuts-row"><kbd>Ctrl</kbd>+<kbd>↑</kbd> <kbd>↓</kbd><span>Pin previous / next lyric</span></div><div class="shortcuts-row"><kbd>Shift</kbd>+<kbd>←</kbd><span>Jump to current line start</span></div><div class="shortcuts-row"><kbd>Shift</kbd>+<kbd>→</kbd><span>Jump to current line end</span></div><div class="shortcuts-row"><kbd>Space</kbd><span>Play / pause</span></div><div class="shortcuts-row"><kbd>`</kbd><span>Toggle lyric auto-scroll</span></div></div></div>
             </div>
           </div>
@@ -347,6 +346,22 @@
             </div>
           </div>
           <div class="sync-row">
+            <div id="vocalRefWrap" class="vocal-ref-wrap">
+              <button id="uploadVocalsBtn" class="ctrl-btn ctrl-btn-ghost" type="button" title="Attach a vocal-only reference for alignment" aria-expanded="false">
+                <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
+                Upload Vocals
+              </button>
+              <button id="removeVocalRefBtn" class="vocal-ref-remove" type="button" aria-label="Remove vocal reference" title="Remove vocal reference">×</button>
+              <input id="vocalFileInput" type="file" accept="audio/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus" hidden />
+              <div id="vocalRefMenu" class="vocal-ref-menu" role="menu">
+                <button id="vocalSelectFileBtn" type="button" role="menuitem">Select file</button>
+                <button id="vocalLoadUrlBtn" type="button" role="menuitem">Load from URL</button>
+                <button id="vocalMenuCancelBtn" type="button" role="menuitem">Cancel</button>
+              </div>
+            </div>
+
+            <div class="btn-divider"></div>
+
             <div class="btn-group">
               <button id="autoWhisperBtn" class="ctrl-btn ctrl-btn-auto" title="Auto: run a full Whisper transcription with timestamps">
                 <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
@@ -366,22 +381,6 @@
                 </svg>
                 Transcribe
               </button>
-            </div>
-
-            <div class="btn-divider"></div>
-
-            <div id="vocalRefWrap" class="vocal-ref-wrap">
-              <button id="uploadVocalsBtn" class="ctrl-btn ctrl-btn-ghost" type="button" title="Attach a vocal-only reference for alignment" aria-expanded="false">
-                <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
-                Upload Vocals
-              </button>
-              <button id="removeVocalRefBtn" class="vocal-ref-remove" type="button" aria-label="Remove vocal reference" title="Remove vocal reference">×</button>
-              <input id="vocalFileInput" type="file" accept="audio/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus" hidden />
-              <div id="vocalRefMenu" class="vocal-ref-menu" role="menu">
-                <button id="vocalSelectFileBtn" type="button" role="menuitem">Select file</button>
-                <button id="vocalLoadUrlBtn" type="button" role="menuitem">Load from URL</button>
-                <button id="vocalMenuCancelBtn" type="button" role="menuitem">Cancel</button>
-              </div>
             </div>
 
             <div class="btn-divider"></div>
@@ -1043,7 +1042,7 @@ async function doSearch(q) {
     const data = await api('/api/search?q=' + encodeURIComponent(q));
     if (generation !== searchGeneration || searchInput.value.trim() !== q || idMode) return;
     const songs = data.results ?? [];
-    resultsHeaderText.textContent = `${songs.length} result${songs.length !== 1 ? 's' : ''} for "${q}"`;
+    resultsHeaderText.innerHTML = `<span class="results-query-prefix">${songs.length} result${songs.length !== 1 ? 's' : ''} for &quot;</span><span class="results-query-value">${esc(q)}</span><span class="results-query-quote">&quot;</span>`;
     if (!songs.length) {
       renderSearchState('No songs found', 'Try another title or alternate name.');
       return;
@@ -1072,6 +1071,12 @@ function apiAssetUrl(path) {
   catch { return ''; }
 }
 
+function setArtworkBackdrop(url) {
+  lyricsAmbientBg.style.backgroundImage = url
+    ? `linear-gradient(rgba(8,8,13,.58),rgba(8,8,13,.70)),url(${JSON.stringify(url)})`
+    : '';
+}
+
 function songCardHTML(s) {
   const imageUrl = apiAssetUrl(s.image_url);
   const thumb = imageUrl
@@ -1080,15 +1085,15 @@ function songCardHTML(s) {
   const title = (s.track_titles?.[0] ?? s.name) || s.name;
   const era = s.era?.name ?? '';
   const cat = s.category ?? '';
-  const catClass = String(cat).toLowerCase().replace(/[^a-z0-9_-]/g, '');
   const catLabel = CATEGORY_LABELS[cat] ?? String(cat).replaceAll('_', ' ');
+  const length = String(s.length ?? '').trim().replace(/^(\d):(\d{2})$/, '0$1:$2');
+  const subtitle = [catLabel, era, length].filter(Boolean).join(' · ');
   return `<button class="song-card" type="button" data-id="${Number(s.id)}" aria-label="Load ${esc(title)}"${s.path ? '' : ' style="opacity:.62"'}>
     ${thumb}
     <div class="song-meta">
       <div class="song-name">${esc(title)}</div>
-      <div class="song-sub">${esc(era)}${era && s.length ? ' · ' : ''}${esc(s.length ?? '')}</div>
+      <div class="song-sub">${esc(subtitle)}</div>
     </div>
-    ${cat ? `<span class="song-badge badge-${catClass}">${esc(catLabel)}</span>` : ''}
   </button>`;
 }
 
@@ -1145,12 +1150,12 @@ async function loadSongData(song) {
       npArt.src = imageUrl;
       npArt.alt = `${npTitle.textContent} artwork`;
       npArt.style.display = '';
-      lyricsAmbientBg.style.backgroundImage = `url(${JSON.stringify(imageUrl)})`;
+      setArtworkBackdrop(imageUrl);
     } else {
       npArt.removeAttribute('src');
       npArt.alt = '';
       npArt.style.display = 'none';
-      lyricsAmbientBg.style.backgroundImage = '';
+      setArtworkBackdrop('');
     }
 
     if (song.path) {
@@ -2374,6 +2379,7 @@ function setTab(tab) {
   }
 
   activeTab = tab;
+  lyricsSection.classList.toggle('editing-view', tab !== 'karaoke');
   document.querySelectorAll('.tab-btn').forEach(b => {
     const active = b.dataset.tab === tab;
     b.classList.toggle('active', active);
@@ -2899,27 +2905,24 @@ function applyCompletedTasks(state) {
 
 
 function _indicatorBox(container, el) {
-  const c = container.getBoundingClientRect(), r = el.getBoundingClientRect();
-  return { left: r.left - c.left, width: r.width, right: r.right - c.left };
+  // Layout coordinates exclude transforms from button presses and modal motion.
+  return { left: el.offsetLeft, width: el.offsetWidth, right: el.offsetLeft + el.offsetWidth };
 }
 function placeSlidingIndicator(container, indicator, target) {
   if (!container || !indicator || !target) return;
+  indicator.getAnimations().forEach(animation => animation.cancel());
   const b = _indicatorBox(container, target); indicator.style.left = `${b.left}px`; indicator.style.width = `${b.width}px`;
 }
 function stretchSlidingIndicator(container, indicator, fromEl, toEl, duration = 350) {
-  if (!container || !indicator || !toEl) return;
-  if (!fromEl || fromEl === toEl) { placeSlidingIndicator(container, indicator, toEl); return; }
-  const a = _indicatorBox(container, fromEl), b = _indicatorBox(container, toEl);
-  const bridge = b.left > a.left ? {left:a.left,width:b.right-a.left} : {left:b.left,width:a.right-b.left};
-  indicator.getAnimations().forEach(anim => anim.cancel());
-  const anim = indicator.animate([{left:`${a.left}px`,width:`${a.width}px`},{left:`${bridge.left}px`,width:`${bridge.width}px`,offset:.46},{left:`${b.left}px`,width:`${b.width}px`}],{duration,easing:'cubic-bezier(.2,.8,.2,1)'});
-  indicator.style.left=`${b.left}px`; indicator.style.width=`${b.width}px`;
+  stretchSettingsIndicator(container, indicator, fromEl, toEl, duration);
 }
 
 // Demo settings animation: fast stretch, then a slightly firmer settle.
 function stretchSettingsIndicator(container, indicator, fromEl, toEl, duration = 370) {
   if (!container || !indicator || !toEl) return;
-  if (!fromEl || fromEl === toEl) { placeSlidingIndicator(container, indicator, toEl); return; }
+  if (!fromEl || fromEl === toEl || matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    placeSlidingIndicator(container, indicator, toEl); return;
+  }
   const a = _indicatorBox(container, fromEl), b = _indicatorBox(container, toEl);
   const bridge = b.left > a.left
     ? {left: a.left, width: b.right - a.left}
@@ -2935,6 +2938,20 @@ function stretchSettingsIndicator(container, indicator, fromEl, toEl, duration =
     animation.cancel();
   };
 }
+
+// Reposition after loading a song, revealing General, or resizing the sidebar.
+const indicatorObserver = new ResizeObserver(entries => {
+  for (const {target} of entries) {
+    if (!target.offsetWidth) continue;
+    if (target === lyricsTabset) {
+      placeSlidingIndicator(lyricsTabset, lyricsTabIndicator, lyricsTabset.querySelector('.active'));
+    } else if (settingsPanel.classList.contains('visible')) {
+      if (target === devices) placeSlidingIndicator(devices, deviceIndicator, [...deviceBtns].find(b => b.classList.contains('active')));
+      else placeSlidingIndicator(target, settingsIndicator, settingsTabs.find(b => b.classList.contains('active')));
+    }
+  }
+});
+[lyricsTabset, devices, document.getElementById('settingsTabs')].forEach(el => indicatorObserver.observe(el));
 
 // ── Settings ──────────────────────────────────────────────────────────────
 let _settingsPage = 'general';
@@ -3252,10 +3269,14 @@ function applyModelInfo(info) {
 
 
 function _setDeviceBtn(pref) {
-  _currentDevicePref = pref;
   const oldBtn = [...deviceBtns].find(b => b.classList.contains('active'));
-  const nextBtn = [...deviceBtns].find(b => b.dataset.dev === pref);
-  if (settingsPanel.classList.contains('visible')) stretchSettingsIndicator(devices, deviceIndicator, oldBtn, nextBtn, 430);
+  const nextBtn = [...deviceBtns].find(b => b.dataset.dev === pref)
+    || [...deviceBtns].find(b => b.dataset.dev === 'auto');
+  _currentDevicePref = nextBtn.dataset.dev;
+  if (settingsPanel.classList.contains('visible')) {
+    if (oldBtn !== nextBtn) stretchSettingsIndicator(devices, deviceIndicator, oldBtn, nextBtn, 430);
+    else if (!deviceIndicator.getAnimations().length) placeSlidingIndicator(devices, deviceIndicator, nextBtn);
+  }
   deviceBtns.forEach(b => { const active = b === nextBtn; b.classList.toggle('active', active); b.setAttribute('aria-pressed', String(active)); });
 }
 
@@ -3280,9 +3301,11 @@ async function _saveModelSettings(patch) {
       modelInstallStatus.textContent = 'Model download added to Task Queue';
     }
     setTimeout(() => { if (!info.queued_models?.length) modelStatus.textContent = ''; }, 3000);
+    return true;
   } catch (e) {
     modelStatus.textContent = 'Error: ' + (e.message ?? e);
     modelStatus.style.color = 'var(--danger)';
+    return false;
   }
 }
 
@@ -3295,9 +3318,14 @@ verifyModelSelect.addEventListener('change', () =>
   _saveModelSettings({ verify_model: verifyModelSelect.value }));
 engineSelect.addEventListener('change', () =>
   _saveModelSettings({ engine: engineSelect.value }));
-deviceBtns.forEach(btn => btn.addEventListener('click', () => {
+deviceBtns.forEach(btn => btn.addEventListener('click', async () => {
+  if (btn.dataset.dev === _currentDevicePref) return;
+  const previousPref = _currentDevicePref;
+  deviceBtns.forEach(b => { b.disabled = true; });
   _setDeviceBtn(btn.dataset.dev);
-  _saveModelSettings({ device_pref: btn.dataset.dev });
+  const saved = await _saveModelSettings({ device_pref: btn.dataset.dev });
+  if (!saved) _setDeviceBtn(previousPref);
+  deviceBtns.forEach(b => { b.disabled = false; });
 }));
 
 function loadBoolSetting(key, fallback) {
@@ -3448,10 +3476,10 @@ async function loadLocalTrack(meta) {
     npArt.src = meta.cover_url;
     npArt.alt = `${npTitle.textContent} artwork`;
     npArt.style.display = '';
-    lyricsAmbientBg.style.backgroundImage = `url(${JSON.stringify(meta.cover_url)})`;
+    setArtworkBackdrop(meta.cover_url);
   } else {
     npArt.removeAttribute('src'); npArt.alt = ''; npArt.style.display = 'none';
-    lyricsAmbientBg.style.backgroundImage = '';
+    setArtworkBackdrop('');
   }
 
   audioPlayer.src = meta.audio_url || `/api/local/${encodeURIComponent(meta.track_hash)}/audio`;

@@ -2808,7 +2808,7 @@ header {
 #ttmlView.visible {
 	display: flex;
 	flex-direction: column;
-	min-height: 320px;
+	min-height: 0;
 }
 #ttmlEditorText {
 	flex: 1;
@@ -4393,19 +4393,24 @@ body.settings-open {
 	color: #fca5a5;
 }
 
-/* 2026-08-31: approved v4 Settings + final v11 editor/player production merge */
+/* v11 editor/player and Settings */
 #resumeFollowBtn {
-	color: var(--accent2) !important;
-	background: rgba(21, 21, 29, 0.6) !important;
+	position: relative;
+	background: rgba(66, 42, 104, .24) !important;
+	color: rgba(214, 195, 241, .72) !important;
 	border: 0 !important;
-	border-bottom: 1px solid rgba(255, 255, 255, 0.055) !important;
-	backdrop-filter: blur(18px) saturate(1.12);
-	-webkit-backdrop-filter: blur(18px) saturate(1.12);
-	box-shadow: inset 0 1px rgba(255, 255, 255, 0.018);
+	border-top: 1px solid rgba(255, 255, 255, .018) !important;
+	border-bottom: 1px solid rgba(255, 255, 255, .05) !important;
+	backdrop-filter: blur(30px) saturate(1.24) brightness(.82);
+	-webkit-backdrop-filter: blur(30px) saturate(1.24) brightness(.82);
+	box-shadow: inset 0 1px rgba(124, 58, 237, .035), inset 0 -1px rgba(0, 0, 0, .1);
+	transition: color .16s var(--ease), background .18s var(--ease), border-color .18s var(--ease);
 }
+#resumeFollowBtn svg { opacity: .76; }
 #resumeFollowBtn:hover {
-	color: var(--accent2) !important;
-	background: rgba(24, 24, 34, 0.68) !important;
+	background: rgba(76, 49, 117, .30) !important;
+	color: rgba(229, 215, 248, .84) !important;
+	border-bottom-color: rgba(255, 255, 255, .065) !important;
 }
 #lyricsTabBar {
 	position: sticky;
@@ -4418,9 +4423,9 @@ body.settings-open {
 	padding: 0 18px;
 	border: 0;
 	border-bottom: 1px solid rgba(255, 255, 255, 0.065);
-	background: rgba(8, 8, 13, 0.78);
-	backdrop-filter: blur(25px) saturate(1.08) brightness(0.72);
-	-webkit-backdrop-filter: blur(25px) saturate(1.08) brightness(0.72);
+	background: rgba(9, 9, 14, .5) !important;
+	backdrop-filter: blur(34px) saturate(1.10) brightness(.66);
+	-webkit-backdrop-filter: blur(34px) saturate(1.10) brightness(.66);
 }
 #lyricsTabset {
 	position: relative;
@@ -4518,7 +4523,7 @@ body.settings-open {
 #plainLyricsText {
 	margin: 8px 14px 14px;
 	width: calc(100% - 28px);
-	height: calc(100% - 64px);
+	height: auto;
 	min-height: 0;
 	resize: none;
 	border: 1px solid var(--border) !important;
@@ -4639,11 +4644,8 @@ body.settings-open {
 #seekRange::-webkit-slider-runnable-track {
 	height: 4px;
 	border-radius: 999px;
-	background: linear-gradient(
-		90deg,
-		#9a70ff 0 var(--seek-pct),
-		rgba(255, 255, 255, 0.1) var(--seek-pct) 100%
-	);
+	background: linear-gradient(90deg, #7c3aed, #a855f7) left / var(--seek-pct) 100% no-repeat,
+		rgba(255, 255, 255, .1);
 }
 #seekRange::-webkit-slider-thumb {
 	-webkit-appearance: none;
@@ -4665,7 +4667,7 @@ body.settings-open {
 #seekRange::-moz-range-progress {
 	height: 4px;
 	border-radius: 999px;
-	background: #9a70ff;
+	background: linear-gradient(90deg, #7c3aed, #a855f7);
 }
 #seekRange::-moz-range-thumb {
 	width: 10px;
@@ -4676,7 +4678,7 @@ body.settings-open {
 }
 .player-volume {
 	--volume-pct: 100%;
-	--range-fill: #9a70ff;
+	--range-fill: linear-gradient(90deg, #7c3aed, #a855f7);
 	display: flex;
 	align-items: center;
 	gap: 6px;
@@ -4684,7 +4686,7 @@ body.settings-open {
 	transition: color 0.18s;
 }
 .player-volume.muted {
-	--range-fill: rgba(255, 255, 255, 0.2);
+	--range-fill: linear-gradient(rgba(255, 255, 255, .2), rgba(255, 255, 255, .2));
 	color: rgba(255, 255, 255, 0.27);
 }
 .player-volume #volumeBtn {
@@ -4725,11 +4727,8 @@ body.settings-open {
 #volumeRange::-webkit-slider-runnable-track {
 	height: 4px;
 	border-radius: 999px;
-	background: linear-gradient(
-		90deg,
-		var(--range-fill) 0 var(--volume-pct),
-		rgba(255, 255, 255, 0.1) var(--volume-pct) 100%
-	);
+	background: var(--range-fill) left / var(--volume-pct) 100% no-repeat,
+		rgba(255, 255, 255, .1);
 }
 #volumeRange::-webkit-slider-thumb {
 	-webkit-appearance: none;
@@ -5616,4 +5615,216 @@ body.settings-open {
 	#lyricsTabBar .shortcuts-hint {
 		display: none;
 	}
+}
+/* v11 catalog and editor surfaces. Shared tokens match the demo locally. */
+#resultsPanel,
+#nowPlaying {
+	--bg: #0b0b10;
+	--surface2: #171720;
+	--border: rgba(255, 255, 255, .075);
+	--muted: rgba(255, 255, 255, .46);
+}
+/* One continuous artwork layer under the catalog, song header and editor. */
+body { isolation: isolate; }
+.lyrics-ambient-bg,
+.lyrics-ambient-shade {
+	position: fixed;
+	inset: -80px;
+	z-index: -1;
+}
+.lyrics-ambient-bg {
+	opacity: 1;
+	background-color: #09090e;
+	background-image: radial-gradient(circle at 67% 40%, rgba(93,48,180,.40), transparent 27%),
+		radial-gradient(circle at 73% 71%, rgba(185,54,103,.17), transparent 25%),
+		radial-gradient(circle at 45% 20%, rgba(40,92,146,.18), transparent 25%);
+	filter: saturate(1.18);
+	transform: none;
+	animation: none;
+	will-change: auto;
+}
+.lyrics-ambient-shade {
+	background: rgba(5,5,9,.56);
+	backdrop-filter: blur(56px);
+	-webkit-backdrop-filter: blur(56px);
+}
+#playerPanel,
+.lyrics-controls-area { background: transparent; }
+.np-top {
+	background: rgba(12,12,18,.34) !important;
+	border-bottom-color: rgba(255,255,255,.052);
+	backdrop-filter: blur(28px) saturate(1.22) brightness(.84);
+	-webkit-backdrop-filter: blur(28px) saturate(1.22) brightness(.84);
+	box-shadow: inset 0 -1px rgba(0,0,0,.10);
+}
+/* Keep the existing now-playing metadata colors and artwork dimensions. */
+.np-info { --muted: #aaa6bd; --border: #343442; }
+.np-art { --surface2: #20202b; }
+#lyricsTabBar {
+	border-bottom-color: rgba(255,255,255,.060);
+	box-shadow: inset 0 1px rgba(255,255,255,.010), inset 0 -1px rgba(0,0,0,.14);
+	overflow: visible;
+}
+#lyricsTabset { flex-shrink: 0; }
+
+@media (min-width: 761px) {
+	main { grid-template-columns: 315px minmax(0, 1fr); }
+}
+#resultsPanel {
+	min-width: 0;
+	overflow: hidden;
+	background: rgba(11,11,16,.74);
+	backdrop-filter: blur(14px);
+	-webkit-backdrop-filter: blur(14px);
+	transition: opacity .24s var(--ease), transform .34s var(--ease);
+}
+main.sidebar-collapsed #resultsPanel { transform: translateX(-20px); }
+.results-header {
+	height: 44px;
+	gap: 8px;
+	padding: 0 10px 0 13px;
+}
+.results-header-text {
+	display: flex;
+	align-items: baseline;
+	flex: 1;
+	min-width: 0;
+	font-size: .864rem;
+	color: rgba(255,255,255,.8);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.results-query-prefix,
+.results-query-quote { flex: 0 0 auto; }
+.results-query-value {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	text-transform: none;
+	letter-spacing: 0;
+}
+#collapseSidebarBtn {
+	flex: 0 0 auto;
+	width: 28px;
+	height: 28px;
+	justify-content: center;
+	border-radius: 8px;
+}
+#collapseSidebarBtn:hover { background: rgba(255,255,255,.05); color: #fff; }
+#resultsList { flex: 1; min-height: 0; overflow: auto; padding: 8.4px; }
+.song-card {
+	display: grid;
+	grid-template-columns: 50.4px minmax(0, 1fr);
+	gap: 12px;
+	width: 100%;
+	margin: 0;
+	padding: 10.8px;
+	border: 0;
+	border-radius: 12px;
+	transition: background .14s;
+}
+.song-card:hover {
+	background: rgba(255,255,255,.035);
+	transform: none;
+	box-shadow: none;
+}
+.song-card.active { background: rgba(124,58,237,.12); box-shadow: inset 2px 0 #9f70ff; }
+.song-thumb,
+.song-thumb-placeholder {
+	width: 50.4px;
+	height: 50.4px;
+	border-radius: 9.6px;
+	background: linear-gradient(145deg, #563580, #1a1524);
+	box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+}
+.song-meta { align-self: center; }
+.song-name { font-size: .80rem; font-weight: 700; }
+.song-sub { margin-top: 3.6px; font-size: .67rem; color: rgba(255,255,255,.6); }
+
+/* Preview keeps its existing scrolling/timing engine; editors fill the pane. */
+#lyricsSection { padding-bottom: 0; }
+.lyrics-body { padding: 0; flex: 1 0 auto; }
+#karaokeView { padding: 20px; }
+#lyricsSection.editing-view { overflow: hidden; }
+#lyricsSection.editing-view .lyrics-body {
+	flex: 1 1 0;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+#plainLyricsView,
+#ttmlView { flex: 1; min-height: 0; }
+#plainLyricsView { overflow: hidden; }
+.lyrics-edit-bar { min-height: 42px; }
+#plainLyricsText { flex: 1 1 0; }
+#ttmlEditorText { border-radius: 0; tab-size: 2; }
+#resultsList,
+#lyricsSection,
+#plainLyricsText,
+#ttmlEditorText { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.18) transparent; }
+#ttmlEditorText::-webkit-scrollbar-corner { background: transparent; }
+#plainLyricsText::selection,
+#ttmlEditorText::selection { background: rgba(124,58,237,.35); }
+#verifyLinesView { min-height: 0; overflow: auto; }
+.kl:not(.editing),
+.kl.current:not(.editing),
+.kl.primary:not(.editing) { background: transparent; box-shadow: none; }
+.kl:not(.editing):hover { background: rgba(255,255,255,.045); }
+
+.sync-row {
+	position: relative;
+	min-height: 34px;
+	gap: 7px;
+	margin-top: 0;
+}
+.sync-row .btn-group { gap: 6px; flex-wrap: nowrap; }
+.sync-row .btn-divider { background: rgba(255,255,255,.11); margin: 0 3px; }
+.sync-row .ctrl-btn {
+	height: 31px;
+	padding: 0 10px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: rgba(255,255,255,.025);
+	color: rgba(255,255,255,.62);
+	font-size: .64rem;
+	font-weight: 650;
+	transition: .15s;
+}
+.sync-row .ctrl-btn-primary {
+	border-color: rgba(150,104,255,.24);
+	background: rgba(124,58,237,.14);
+	color: #e9ddff;
+}
+.sync-row .ctrl-btn-auto { border-color: rgba(172,126,255,.20); color: #d9c4ff; }
+.sync-row .ctrl-btn-accent-outline { border-color: rgba(168,85,247,.22); color: #d8b4fe; }
+.sync-row #uploadVocalsBtn.has-reference {
+	color: #a4e8bd;
+	border-color: rgba(88,214,141,.22);
+	background: rgba(88,214,141,.06);
+}
+.sync-row .ctrl-btn:hover:not(:disabled) {
+	color: #fff;
+	background: rgba(255,255,255,.06);
+	transform: translateY(-1px);
+	opacity: 1;
+}
+.sync-row .ctrl-btn:active:not(:disabled) { transform: scale(.97); }
+#syncStatus { margin-left: auto; flex: 0 1 auto; font-size: .6rem; color: rgba(255,255,255,.27); }
+#syncStatus.error { color: var(--danger); }
+#syncStatus.ok { color: var(--green); }
+#settingsPanel .device:disabled { cursor: wait; }
+
+@media (max-width: 1100px) {
+	#lyricsTabBar .shortcuts-hint { display: none; }
+}
+@media (max-width: 760px) {
+	#lyricsTabBar { padding-inline: 8px; }
+	#lyricsTabset .tab-btn { padding-inline: 10px; }
+	#karaokeView { padding: 14px 10px; }
+	/* Wrapping keeps the vocal menu and its remove action outside a scroller. */
+	.sync-row { flex-wrap: wrap; overflow: visible; padding: 0; }
+	.sync-row .btn-divider { display: none; }
+	#syncStatus { flex-basis: 100%; }
 }
