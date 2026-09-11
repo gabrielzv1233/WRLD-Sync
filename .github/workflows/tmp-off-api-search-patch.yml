@@ -40,20 +40,8 @@ jobs:
                   raise SystemExit(f'{label}: expected exactly 1 match, found {count}')
               text = text.replace(old, new, 1)
 
-          replace_once(
-          """function setSearchQueryParam(q) {
-            const url = new URL(location.href);
-            if (q) url.searchParams.set('q', q); else url.searchParams.delete('q');
-            history.replaceState(null, '', url);
-          }
-          """,
-          """function setSearchQueryParam(q) {
-            const url = new URL(location.href);
-            if (q) url.searchParams.set('q', q); else url.searchParams.delete('q');
-            history.replaceState(null, '', url);
-          }
-
-          function isSupportedRemoteMediaUrl(value) {
+          search_state_anchor = "function renderSearchState(title, detail) {"
+          url_helper = """function isSupportedRemoteMediaUrl(value) {
             try {
               const url = new URL(String(value ?? '').trim());
               if (!['http:', 'https:'].includes(url.protocol)) return false;
@@ -66,27 +54,19 @@ jobs:
               return false;
             }
           }
-          """,
-          'URL helper',
-          )
 
-          replace_once(
-          """  if (mainEl.classList.contains('sidebar-collapsed')) {
-            mainEl.classList.remove('sidebar-collapsed');
-            localStorage.removeItem('jw_sidebar');
-          }
-          searchTimer = setTimeout(() => doSearch(q), 380);
+          """
+          replace_once(search_state_anchor, url_helper + search_state_anchor, 'URL helper anchor')
+
+          search_tail = """  searchTimer = setTimeout(() => doSearch(q), 380);
           });
-          """,
-          """  if (isSupportedRemoteMediaUrl(q)) {
+
+          async function doSearch(q) {"""
+          search_tail_new = """  if (isSupportedRemoteMediaUrl(q)) {
             resultsHeaderText.textContent = 'Media link detected';
             renderSearchState('Opening media link', 'Downloading the audio locally with yt-dlp…');
             searchTimer = setTimeout(() => loadRemoteTrackUrl(q, { fromSearch: true }), 380);
             return;
-          }
-          if (mainEl.classList.contains('sidebar-collapsed')) {
-            mainEl.classList.remove('sidebar-collapsed');
-            localStorage.removeItem('jw_sidebar');
           }
           searchTimer = setTimeout(() => doSearch(q), 380);
           });
@@ -107,97 +87,33 @@ jobs:
             setSearchQueryParam('');
             await uploadLocalFile(file, { fromSearch: true });
           });
-          """,
-          'search input handling',
-          )
+
+          async function doSearch(q) {"""
+          replace_once(search_tail, search_tail_new, 'search handler tail')
 
           replace_once(
-          """async function uploadLocalFile(file) {
-            localBrowseBtn.disabled = true;
-            localUrlLoadBtn.disabled = true;
-            localLandingStatus.className = '';
-            localLandingStatus.textContent = `Reading ${file.name}…`;
-            try {
-              const fd = new FormData();
-              fd.append('file', file);
-              const r = await fetch('/api/upload', { method: 'POST', body: fd });
-              if (!r.ok) throw new Error(await r.text());
-              const meta = await r.json();
-              localLandingStatus.className = 'ok';
-              localLandingStatus.textContent = 'Audio ready ✓';
-              await loadLocalTrack(meta);
-            } catch (e) {
-              localLandingStatus.className = 'error';
-              localLandingStatus.textContent = 'Could not open that file: ' + (e.message ?? e);
-            } finally {
-              localBrowseBtn.disabled = false;
-              localUrlLoadBtn.disabled = false;
-            }
-          }
-          """,
-          """async function uploadLocalFile(file, { fromSearch = false } = {}) {
-            localBrowseBtn.disabled = true;
-            localUrlLoadBtn.disabled = true;
-            localLandingStatus.className = '';
-            localLandingStatus.textContent = `Reading ${file.name}…`;
-            if (fromSearch) {
-              resultsHeaderText.textContent = `Opening ${file.name}…`;
-              renderSearchSkeleton();
-            }
-            try {
-              const fd = new FormData();
-              fd.append('file', file);
-              const r = await fetch('/api/upload', { method: 'POST', body: fd });
-              if (!r.ok) throw new Error(await r.text());
-              const meta = await r.json();
-              localLandingStatus.className = 'ok';
-              localLandingStatus.textContent = 'Audio ready ✓';
-              await loadLocalTrack(meta);
-            } catch (e) {
-              localLandingStatus.className = 'error';
-              localLandingStatus.textContent = 'Could not open that file: ' + (e.message ?? e);
-              if (fromSearch) {
-                resultsHeaderText.textContent = 'Could not open file';
-                renderSearchState('Could not open that file', String(e.message ?? e));
-              }
-            } finally {
-              localBrowseBtn.disabled = false;
-              localUrlLoadBtn.disabled = false;
-            }
-          }
-          """,
-          'local file upload',
+              'async function uploadLocalFile(file) {',
+              'async function uploadLocalFile(file, { fromSearch = false } = {}) {',
+              'upload signature',
+          )
+          replace_once(
+              "  localLandingStatus.textContent = `Reading ${file.name}…`;\n  try {",
+              "  localLandingStatus.textContent = `Reading ${file.name}…`;\n  if (fromSearch) {\n    resultsHeaderText.textContent = `Opening ${file.name}…`;\n    renderSearchSkeleton();\n  }\n  try {",
+              'upload search loading state',
+          )
+          replace_once(
+              "    localLandingStatus.textContent = 'Could not open that file: ' + (e.message ?? e);\n  } finally {",
+              "    localLandingStatus.textContent = 'Could not open that file: ' + (e.message ?? e);\n    if (fromSearch) {\n      resultsHeaderText.textContent = 'Could not open file';\n      renderSearchState('Could not open that file', String(e.message ?? e));\n    }\n  } finally {",
+              'upload search error state',
           )
 
-          replace_once(
-          """localUrlForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const url = localUrlInput.value.trim();
-            if (!url) return;
-            localBrowseBtn.disabled = true;
-            localUrlLoadBtn.disabled = true;
-            localUrlInput.disabled = true;
-            localLandingStatus.className = '';
-            localLandingStatus.textContent = 'Downloading audio URL locally…';
-            try {
-              const meta = await api('/api/local-url', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url })
-              }, 240_000);
-              localLandingStatus.className = 'ok';
-              localLandingStatus.textContent = 'Audio ready ✓';
-              await loadLocalTrack(meta);
-              localUrlInput.value = '';
-            } catch (err) {
-              localLandingStatus.className = 'error';
-              localLandingStatus.textContent = 'Could not load URL: ' + (err.message ?? err);
-            } finally {
-              localBrowseBtn.disabled = false;
-              localUrlLoadBtn.disabled = false;
-              localUrlInput.disabled = false;
-            }
-          });
-          """,
-          """async function loadRemoteTrackUrl(url, { fromSearch = false } = {}) {
+          form_start = "localUrlForm.addEventListener('submit', async (e) => {"
+          form_end = "// Keep the demo's animated save/check artwork while persisting the real token."
+          start = text.find(form_start)
+          end = text.find(form_end, start)
+          if start < 0 or end < 0:
+              raise SystemExit('remote URL form anchors not found')
+          remote_loader = """async function loadRemoteTrackUrl(url, { fromSearch = false } = {}) {
             const cleanUrl = String(url ?? '').trim();
             if (!cleanUrl) return;
             if (fromSearch) {
@@ -249,9 +165,9 @@ jobs:
             e.preventDefault();
             await loadRemoteTrackUrl(localUrlInput.value);
           });
-          """,
-          'remote URL loader',
-          )
+
+          """
+          text = text[:start] + remote_loader + text[end:]
 
           path.write_text(text, encoding='utf-8')
           PY
