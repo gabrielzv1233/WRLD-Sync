@@ -1,0 +1,96 @@
+name: Temporary yt-dlp metadata patch
+
+on:
+  push:
+    branches:
+      - UI
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: UI
+
+      - name: Patch yt-dlp metadata handling
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("app.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''    exe = shutil.which("yt-dlp")
+              cmd = [exe] if exe else [sys.executable, "-m", "yt_dlp"]
+              cmd += [
+                  "--no-playlist", "--no-progress", "--no-warnings",
+                  "--max-filesize", "2G",
+                  "-f", _yt_dlp_format(quality),
+                  "-x", "--audio-format", "flac",
+                  "-o", output_template,
+                  "--print", "after_move:filepath",
+                  url,
+              ]
+          '''
+          old = old.replace("              ", "    ")
+
+          new = '''    service = _yt_dlp_service(url) or "Remote media"
+              exe = shutil.which("yt-dlp")
+              cmd = [exe] if exe else [sys.executable, "-m", "yt_dlp"]
+              cmd += [
+                  "--no-playlist", "--no-progress", "--no-warnings",
+                  "--max-filesize", "2G",
+                  "-f", _yt_dlp_format(quality),
+                  "-x", "--audio-format", "flac",
+                  "--embed-metadata",
+              ]
+              if service in {"YouTube", "YouTube Music"}:
+                  cmd += [
+                      "--parse-metadata", "%(title|)s:%(meta_title)s",
+                      "--parse-metadata", "%(uploader|)s:%(meta_artist)s",
+                  ]
+              cmd += [
+                  "-o", output_template,
+                  "--print", "after_move:filepath",
+                  url,
+              ]
+          '''
+          new = new.replace("              ", "    ")
+
+          if old not in text:
+              raise SystemExit("Expected yt-dlp command block not found")
+          text = text.replace(old, new, 1)
+
+          duplicate = '''    if not path.is_file():
+              raise ValueError("yt-dlp completed but did not leave a usable audio file.")
+              service = _yt_dlp_service(url) or "Remote media"
+              return path, f"{service} audio"
+          '''.replace("              ", "    ")
+          cleaned = '''    if not path.is_file():
+              raise ValueError("yt-dlp completed but did not leave a usable audio file.")
+              return path, f"{service} audio"
+          '''.replace("              ", "    ")
+          if duplicate not in text:
+              raise SystemExit("Expected yt-dlp return block not found")
+          text = text.replace(duplicate, cleaned, 1)
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          python -m py_compile app.py
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Embed source metadata for yt-dlp downloads"
+          git push origin HEAD:UI
