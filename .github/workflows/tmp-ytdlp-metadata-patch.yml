@@ -24,45 +24,22 @@ jobs:
 
           path = Path("app.py")
           text = path.read_text(encoding="utf-8")
-
-          old = '''    exe = shutil.which("yt-dlp")
-              cmd = [exe] if exe else [sys.executable, "-m", "yt_dlp"]
-              cmd += [
-                  "--no-playlist", "--no-progress", "--no-warnings",
-                  "--max-filesize", "2G",
-                  "-f", _yt_dlp_format(quality),
-                  "-x", "--audio-format", "flac",
-                  "-o", output_template,
-                  "--print", "after_move:filepath",
-                  url,
-              ]
-          '''.replace("              ", "    ")
-
-          new = '''    service = _yt_dlp_service(url) or "Remote media"
-              exe = shutil.which("yt-dlp")
-              cmd = [exe] if exe else [sys.executable, "-m", "yt_dlp"]
-              cmd += [
-                  "--no-playlist", "--no-progress", "--no-warnings",
-                  "--max-filesize", "2G",
-                  "-f", _yt_dlp_format(quality),
-                  "-x", "--audio-format", "flac",
-                  "--embed-metadata",
-              ]
+          needle = '    proc = subprocess.run(cmd, capture_output=True, text=True)\n'
+          insert = '''    service = _yt_dlp_service(url) or "Remote media"
+              metadata_args = ["--embed-metadata"]
               if service in {"YouTube", "YouTube Music"}:
-                  cmd += [
+                  metadata_args += [
                       "--parse-metadata", "%(title|)s:%(meta_title)s",
                       "--parse-metadata", "%(uploader|)s:%(meta_artist)s",
                   ]
-              cmd += [
-                  "-o", output_template,
-                  "--print", "after_move:filepath",
-                  url,
-              ]
+              cmd[-1:-1] = metadata_args
           '''.replace("              ", "    ")
 
-          if old not in text:
-              raise SystemExit("Expected yt-dlp command block not found")
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          if needle not in text:
+              raise SystemExit("Expected yt-dlp subprocess call not found")
+          if 'cmd[-1:-1] = metadata_args' not in text:
+              text = text.replace(needle, insert + needle, 1)
+          path.write_text(text, encoding="utf-8")
           PY
 
           python -m py_compile app.py
