@@ -959,6 +959,20 @@ function setSearchQueryParam(q) {
   history.replaceState(null, '', url);
 }
 
+function isSupportedRemoteMediaUrl(value) {
+  try {
+    const url = new URL(String(value ?? '').trim());
+    if (!['http:', 'https:'].includes(url.protocol)) return false;
+    const host = url.hostname.toLowerCase().replace(/^www\./, '');
+    if (host === 'youtu.be') return url.pathname.length > 1;
+    if (host === 'youtube.com' || host.endsWith('.youtube.com')) return url.pathname.length > 1 || !!url.searchParams.get('v');
+    if (host === 'soundcloud.com' || host.endsWith('.soundcloud.com')) return url.pathname.length > 1;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function renderSearchState(title, detail) {
   resultsList.innerHTML = `<div class="search-state">
     <svg width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true">
@@ -1031,7 +1045,30 @@ searchInput.addEventListener('input', () => {
     mainEl.classList.remove('sidebar-collapsed');
     localStorage.removeItem('jw_sidebar');
   }
-  searchTimer = setTimeout(() => doSearch(q), 380);
+  if (isSupportedRemoteMediaUrl(q)) {
+  resultsHeaderText.textContent = 'Media link detected';
+  renderSearchState('Opening media link', 'Downloading the audio locally with yt-dlp…');
+  searchTimer = setTimeout(() => loadRemoteTrackUrl(q, { fromSearch: true }), 380);
+  return;
+}
+searchTimer = setTimeout(() => doSearch(q), 380);
+});
+
+const searchDropTarget = searchInput.closest('.search-wrap') || searchInput;
+searchDropTarget.addEventListener('dragover', (e) => {
+  if (!Array.from(e.dataTransfer?.types ?? []).includes('Files')) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+searchDropTarget.addEventListener('drop', async (e) => {
+  const file = e.dataTransfer?.files?.[0];
+  if (!file) return;
+  e.preventDefault();
+  clearTimeout(searchTimer);
+  searchGeneration++;
+  searchInput.value = '';
+  setSearchQueryParam('');
+  await uploadLocalFile(file, { fromSearch: true });
 });
 
 async function doSearch(q) {
@@ -3527,11 +3564,15 @@ async function loadLocalTrack(meta) {
   animateSidebarReturn();
 }
 
-async function uploadLocalFile(file) {
+async function uploadLocalFile(file, { fromSearch = false } = {}) {
   localBrowseBtn.disabled = true;
   localUrlLoadBtn.disabled = true;
   localLandingStatus.className = '';
   localLandingStatus.textContent = `Reading ${file.name}…`;
+  if (fromSearch) {
+    resultsHeaderText.textContent = `Opening ${file.name}…`;
+    renderSearchSkeleton();
+  }
   try {
     const fd = new FormData();
     fd.append('file', file);
@@ -3544,6 +3585,10 @@ async function uploadLocalFile(file) {
   } catch (e) {
     localLandingStatus.className = 'error';
     localLandingStatus.textContent = 'Could not open that file: ' + (e.message ?? e);
+    if (fromSearch) {
+      resultsHeaderText.textContent = 'Could not open file';
+      renderSearchState('Could not open that file', String(e.message ?? e));
+    }
   } finally {
     localBrowseBtn.disabled = false;
     localUrlLoadBtn.disabled = false;
@@ -3556,31 +3601,57 @@ localFileInput.addEventListener('change', async () => {
   if (file) await uploadLocalFile(file);
 });
 
-localUrlForm.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const url = localUrlInput.value.trim();
-  if (!url) return;
-  localBrowseBtn.disabled = true;
-  localUrlLoadBtn.disabled = true;
-  localUrlInput.disabled = true;
-  localLandingStatus.className = '';
-  localLandingStatus.textContent = 'Downloading audio URL locally…';
+async function loadRemoteTrackUrl(url, { fromSearch = false } = {}) {
+  const cleanUrl = String(url ?? '').trim();
+  if (!cleanUrl) return;
+  if (fromSearch) {
+    searchInput.disabled = true;
+    searchModeBtn.disabled = true;
+    resultsHeaderText.textContent = 'Opening media link…';
+    renderSearchSkeleton();
+  } else {
+    localBrowseBtn.disabled = true;
+    localUrlLoadBtn.disabled = true;
+    localUrlInput.disabled = true;
+    localLandingStatus.className = '';
+    localLandingStatus.textContent = 'Downloading audio URL locally…';
+  }
   try {
     const meta = await api('/api/local-url', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url })
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: cleanUrl })
     }, 240_000);
     localLandingStatus.className = 'ok';
     localLandingStatus.textContent = 'Audio ready ✓';
     await loadLocalTrack(meta);
-    localUrlInput.value = '';
+    if (fromSearch) {
+      searchInput.value = '';
+      setSearchQueryParam('');
+    } else {
+      localUrlInput.value = '';
+    }
   } catch (err) {
-    localLandingStatus.className = 'error';
-    localLandingStatus.textContent = 'Could not load URL: ' + (err.message ?? err);
+    if (fromSearch) {
+      resultsHeaderText.textContent = 'Could not open media link';
+      renderSearchState('Could not open media link', String(err.message ?? err));
+    } else {
+      localLandingStatus.className = 'error';
+      localLandingStatus.textContent = 'Could not load URL: ' + (err.message ?? err);
+    }
   } finally {
-    localBrowseBtn.disabled = false;
-    localUrlLoadBtn.disabled = false;
-    localUrlInput.disabled = false;
+    if (fromSearch) {
+      searchInput.disabled = false;
+      searchModeBtn.disabled = false;
+    } else {
+      localBrowseBtn.disabled = false;
+      localUrlLoadBtn.disabled = false;
+      localUrlInput.disabled = false;
+    }
   }
+}
+
+localUrlForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  await loadRemoteTrackUrl(localUrlInput.value);
 });
 
 // Keep the demo's animated save/check artwork while persisting the real token.
