@@ -491,6 +491,14 @@ def _normalize_audio_only(source: pathlib.Path, dest: pathlib.Path) -> pathlib.P
         "ffmpeg", "-y", "-v", "error", "-i", str(source), "-map", "0:a:0",
         "-vn", "-sn", "-dn", "-map_metadata", "-1", "-c:a", "flac", str(tmp),
     ]
+    service = _yt_dlp_service(url) or "Remote media"
+    metadata_args = ["--embed-metadata"]
+    if service in {"YouTube", "YouTube Music"}:
+        metadata_args += [
+            "--parse-metadata", "%(title|)s:%(meta_title)s",
+            "--parse-metadata", "%(uploader|)s:%(meta_artist)s",
+        ]
+    cmd[-1:-1] = metadata_args
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
