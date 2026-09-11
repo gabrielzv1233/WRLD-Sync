@@ -1,16 +1,3 @@
-copy over editor-tab animation
-copy over sync-row layout
-copy over lyrics tab layout/display fully
-copy over TTML layout
-copy over aside.results and sub elements formatting and css
-copy over div.np-top background effect
-copy over editor-tabs and its bg effects but use background rgba(9, 9, 14, .5) !important instead (that is more transparent than the demo file)
-copy over previewView styling and cover art seethrough rendering stuff (idk if its more clear or what but i just like it more
-copy over resumeFollowBtn styling
-use linear-gradient(90deg,#7c3aed,#a855f7) for the volume and progress slider instead.
-use the less colored/excessful (idk how to put it, its just like the current ones are too solid purple) button styling in sync-row (directly copied from the demo aswell) 
-it has been brought to my attention i didn't provide u the demo file in this session lol
-"C:\Users\gabri\Downloads\wrld-sync-full-ui-dev-demo-v11.html"
-the styling of the elements in np-top (np-info and npArt) can be left as they are
-im including removing the song-badge in the sidebar infavor of having it in the song sub, going from DRFL · 3:11 and UNRELEASED tag, to Unreleased · DRFL · 03:11
-not sure if compute device starts as like none or som bc the setting ui is fucked and it allwos me to switch it to gpu without clicking another option
+currently there are Runtime-managed model, im not sure what that means but it prevents me from uninstalling them, so i assume it installs them by default
+Whisper Large v3 and Whisper small are the models listed as such
+keep whisper large v3 as a choice, just make it not managed, keeping whisper small being managed

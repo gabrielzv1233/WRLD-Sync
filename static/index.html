@@ -1233,9 +1233,10 @@ function showProgress(msg, pct, indeterminate = false, prog = null) {
   }
   if (prog) {
     progRich.classList.add('visible');
-    progDone.textContent  = `${prog.done.toFixed(1)} / ${prog.total.toFixed(1)}s`;
-    progEta.textContent   = `ETA ${prog.eta}`;
-    progSpeed.textContent = `${prog.speed.toFixed(2)} s/sec`;
+    const details = processingDetails(prog);
+    progDone.textContent = details.work;
+    progEta.textContent = details.eta;
+    progSpeed.textContent = details.rate;
   } else {
     progRich.classList.remove('visible');
   }
@@ -2712,6 +2713,31 @@ function formatBytes(bytes) {
   return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[i]}`;
 }
 
+function progressClock(seconds) {
+  if (!Number.isFinite(seconds)) return '—';
+  const total = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(total / 60);
+  return `${minutes}:${String(total % 60).padStart(2, '0')}`;
+}
+
+function processingDetails(prog) {
+  const measured = Number.isFinite(prog.done) && Number.isFinite(prog.total) && prog.total > 0;
+  const seconds = !prog.unit || prog.unit === 'seconds';
+  const unit = seconds ? 's audio' : prog.unit;
+  const work = measured
+    ? `${prog.done.toFixed(seconds ? 1 : 0)}/${prog.total.toFixed(seconds ? 1 : 0)} ${unit}`
+    : `Elapsed ${progressClock(prog.elapsed_seconds)}`;
+  const remaining = Number.isFinite(prog.eta_seconds) ? progressClock(prog.eta_seconds) : null;
+  const legacyEta = prog.eta_scope ? null : prog.eta;
+  const eta = remaining || legacyEta
+    ? `${prog.estimated ? 'Estimated stage ETA' : 'Stage ETA'} ${remaining || legacyEta}`
+    : (prog.estimated ? 'Stage ETA recalculating…' : 'Stage ETA estimating…');
+  const rate = Number.isFinite(prog.speed)
+    ? `${prog.speed.toFixed(2)} ${seconds ? 'audio s/s' : `${prog.unit}/s`}`
+    : (prog.estimated ? 'Based on previous runs' : '');
+  return {work, eta, rate};
+}
+
 function renderTask(task, isActive) {
   const canCancel = ['pending','running','paused'].includes(task.status);
   const canPause = task.type === 'model_download' && ['pending','running'].includes(task.status);
@@ -2720,21 +2746,23 @@ function renderTask(task, isActive) {
   const msg       = task.progress?.msg ?? (task.status === 'pending' ? 'Waiting in queue…' : '');
   const prog      = task.progress?.progress ?? null;
   const uvr       = task.progress?.uvr ?? null;
-  const indeterminate = task.progress?.stage === 'loading';
+  const indeterminate = task.progress?.indeterminate || task.progress?.stage === 'loading';
   const isCancelling  = task.status === 'cancelling';
 
   let bodyHtml = '';
   if (isActive || isCancelling || task.status === 'paused') {
+    const details = prog ? processingDetails(prog) : null;
     const richHtml = prog
       ? `<div class="tc-rich">
-           <span>${prog.done.toFixed(1)}/${prog.total.toFixed(1)}s</span>
-           <span>ETA ${prog.eta}</span>
-           <span>${prog.speed.toFixed(2)} s/sec</span>
+           <span>${esc(details.work)}</span>
+           ${!isCancelling ? `<span>${esc(details.eta)}</span>` : ''}
+           ${details.rate ? `<span>${esc(details.rate)}</span>` : ''}
+           ${Number.isFinite(prog.elapsed_seconds) && Number.isFinite(prog.done) ? `<span>Elapsed ${progressClock(prog.elapsed_seconds)}</span>` : ''}
          </div>`
       : uvr
           ? `<div class="tc-rich">
                <span>${Number(uvr.done).toFixed(0)}/${Number(uvr.total).toFixed(0)} ${esc(uvr.unit || 'chunks')}</span>
-               <span>ETA ${esc(uvr.eta || '—')}</span>
+               ${!isCancelling ? `<span>UVR ETA ${esc(uvr.eta || '—')}</span>` : ''}
                <span>${esc(uvr.rate || '—')}</span>
              </div>`
       : (task.type === 'model_download' && task.progress?.total_bytes

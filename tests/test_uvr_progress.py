@@ -1,4 +1,9 @@
 import unittest
+import asyncio
+import concurrent.futures
+import subprocess
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -91,7 +96,7 @@ class UVRPreparationTests(unittest.IsolatedAsyncioTestCase):
     async def test_fresh_separation_exposes_uvr_progress(
         self, _audio_hash, _reference, broadcast,
     ):
-        def fake_separate(_source, _model, destination, spy):
+        def fake_separate(_source, _model, destination, spy, cancelled):
             spy.write("\r100%|██████████| 5/5 [00:10<00:00,  2.00s/it]")
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(b"vocals")
@@ -108,6 +113,100 @@ class UVRPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.task.progress["msg"], "Caching all-vocals stem…")
         self.assertEqual(self.task.progress["uvr"]["pct"], 100)
         self.assertGreaterEqual(broadcast.await_count, 3)
+
+    @patch('app._q_broadcast', new_callable=AsyncMock)
+    @patch('app._get_vocal_reference', return_value=None)
+    @patch('app._audio_content_hash', return_value='c' * 64)
+    async def test_cancel_stops_worker_before_returning(self, *_):
+        started, stopped = threading.Event(), threading.Event()
+        def separate(source, model, destination, spy, cancelled):
+            started.set()
+            while not cancelled():
+                time.sleep(.01)
+            stopped.set()
+            raise InterruptedError('Cancelled')
+        with patch.object(app, '_STEM_CACHE_DIR', self.root / 'stems'), patch('app._separate_vocals', side_effect=separate):
+            future = asyncio.create_task(app._prepare_analysis_audio(self.task, str(self.source)))
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            self.task.cancel_requested = True
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(future, 2)
+            self.assertTrue(stopped.is_set())
+            self.assertFalse(list(self.root.rglob('vocals.flac')))
+
+    @patch('app._q_broadcast', new_callable=AsyncMock)
+    @patch('app._get_vocal_reference', return_value=None)
+    @patch('app._audio_content_hash', return_value='d' * 64)
+    async def test_coroutine_cancellation_waits_for_worker_cleanup(self, *_):
+        started, stopped = threading.Event(), threading.Event()
+        def separate(source, model, destination, spy, cancelled):
+            started.set()
+            while not cancelled():
+                time.sleep(.01)
+            stopped.set()
+            raise InterruptedError('Cancelled')
+        with patch.object(app, '_STEM_CACHE_DIR', self.root / 'stems'), patch('app._separate_vocals', side_effect=separate):
+            future = asyncio.create_task(app._prepare_analysis_audio(self.task, str(self.source)))
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            future.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(future, 2)
+            self.assertTrue(stopped.is_set())
+
+
+class UVRProcessTests(unittest.TestCase):
+    def run_worker(self, script, cancel_during=False):
+        original_popen = subprocess.Popen
+        children = []
+        def popen(command, **kwargs):
+            if len(command) > 2 and str(command[2]).endswith('uvr_worker.py'):
+                command = [command[0], '-u', '-c', script, *command[3:]]
+                process = original_popen(command, **kwargs)
+                children.append(process)
+                return process
+            return original_popen(command, **kwargs)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dest = root / 'cache/vocals.flac'
+            spy, cancel = app._UVRProgressSpy(), threading.Event()
+            with patch('app.subprocess.Popen', side_effect=popen), concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(app._separate_vocals, root / 'audio.flac', 'uvr-bs-roformer', dest, spy, cancel.is_set)
+                if cancel_during:
+                    deadline = time.monotonic() + 5
+                    while spy.latest() is None and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertIsNotNone(spy.latest(), 'Worker did not start')
+                    started = time.monotonic()
+                    cancel.set()
+                    with self.assertRaises(InterruptedError):
+                        future.result(timeout=5)
+                    self.assertLess(time.monotonic() - started, 5)
+                    self.assertFalse(dest.exists())
+                else:
+                    self.assertEqual(future.result(timeout=5), dest)
+                    self.assertEqual(dest.read_bytes(), b'complete-stem')
+                self.assertIsNotNone(children[0].poll())
+                self.assertFalse(list(dest.parent.glob('.uvr-*')))
+
+    def test_cancel_interrupts_native_work_and_cleans_partial_stem(self):
+        self.run_worker('''
+import sys, time
+from pathlib import Path
+out = Path(sys.argv[sys.argv.index('--output-dir')+1])
+(out/'partial.flac').write_bytes(b'incomplete')
+print('\\r 10%|x         | 1/10 [00:01<00:09, 1.00s/it]', flush=True)
+time.sleep(60)
+''', cancel_during=True)
+
+    def test_success_publishes_only_finished_stem(self):
+        self.run_worker('''
+import sys
+from pathlib import Path
+out = Path(sys.argv[sys.argv.index('--output-dir')+1])
+stem = out/'test_vocals.flac'
+stem.write_bytes(b'complete-stem')
+(out/'result.txt').write_text(str(stem.resolve()), encoding='utf-8')
+''')
 
 
 if __name__ == "__main__":

@@ -322,7 +322,7 @@ class HubertFAEngine:
         )
         return words, float(confidence), decoder
 
-    def _score_word_candidates(self, plan: PhonemePlan, base_words, frame_logits, edge_logits) -> None:
+    def _score_word_candidates(self, plan: PhonemePlan, base_words, frame_logits, edge_logits, progress=None) -> None:
         """Score alternates locally around each base word using the same audio logits.
 
         The canonical full-song pass gives a time window. Each word's CMU/G2P/
@@ -334,7 +334,9 @@ class HubertFAEngine:
 
         by_index = {i: word for i, word in enumerate(base_words)}
         frame_seconds = self.hop_size / self.sample_rate
-        for lyric_word in plan.words:
+        for index, lyric_word in enumerate(plan.words):
+            if progress:
+                progress('candidates', index, len(plan.words))
             if len(lyric_word.candidates) <= 1:
                 continue
             base = by_index.get(lyric_word.index)
@@ -352,6 +354,8 @@ class HubertFAEngine:
             best_idx, best_score = lyric_word.chosen, float("-inf")
             original_choice = lyric_word.chosen
             for idx, candidate in enumerate(lyric_word.candidates):
+                if progress:
+                    progress('candidates', index, len(plan.words))
                 # Score with a detached one-word copy so trying an alternate never
                 # mutates the global word/range map until a winner is selected.
                 tiny_word = replace(lyric_word, chosen=idx, phoneme_start=0, phoneme_end=len(candidate.phones))
@@ -366,6 +370,8 @@ class HubertFAEngine:
                     best_idx, best_score = idx, score
             lyric_word.chosen = best_idx if best_score != float("-inf") else original_choice
 
+        if progress:
+            progress('candidates', len(plan.words), len(plan.words))
         # Rebuild global ranges after local candidate choices changed phone counts.
         flattened: list[str] = []
         for word in plan.words:
@@ -374,10 +380,12 @@ class HubertFAEngine:
             word.phoneme_end = len(flattened)
         plan.phones[:] = flattened
 
-    def align(self, audio_path: str | pathlib.Path, lyrics: str) -> list[dict]:
+    def align(self, audio_path: str | pathlib.Path, lyrics: str, progress=None) -> list[dict]:
         import librosa
         import numpy as np
 
+        if progress:
+            progress('preparing')
         plan = build_phoneme_plan(
             lyrics,
             dictionary_path=self.install.dictionary_path,
@@ -388,12 +396,18 @@ class HubertFAEngine:
         wav, _ = librosa.load(str(audio_path), sr=self.sample_rate, mono=True)
         wav = np.asarray(wav, dtype=np.float32)
         wav_length = len(wav) / self.sample_rate
+        if progress:
+            progress('inference')
         results = self.inference.run_onnx(self.inference.model, {"waveform": [wav]})
         frame_logits = results["ph_frame_logits"]
         edge_logits = results["ph_edge_logits"]
 
+        if progress:
+            progress('decoding')
         base_words, _, _ = self._decode(plan, frame_logits, edge_logits, wav_length)
-        self._score_word_candidates(plan, base_words, frame_logits, edge_logits)
+        self._score_word_candidates(plan, base_words, frame_logits, edge_logits, progress=progress)
+        if progress:
+            progress('finalizing')
         final_words, confidence, _ = self._decode(plan, frame_logits, edge_logits, wav_length)
 
         out: list[dict] = []

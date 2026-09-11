@@ -8,6 +8,7 @@ venv/
 tests/*
 !tests/test_hubert_phonemes.py
 !tests/test_uvr_progress.py
+!tests/test_processing_progress.py
 
 # Environment and local preferences
 .env
@@ -34,3 +35,4 @@ models/
 # OS
 .DS_Store
 Thumbs.db
+tdo.txt

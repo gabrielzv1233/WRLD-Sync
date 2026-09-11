@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field as dc_field
 from contextlib import asynccontextmanager
 import xml.etree.ElementTree as ET
-import queue as thread_queue
 import urllib.parse
 import subprocess
 import mimetypes
@@ -21,6 +20,9 @@ import gc
 import io
 import os
 import re
+from collections import deque
+
+from processing_progress import ProcessingProgress, RuntimeHistory
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -219,6 +221,7 @@ _audio_cache_lock = asyncio.Lock()
 _DATA_DIR = pathlib.Path(__file__).parent / "data"
 DB_PATH = _DATA_DIR / "wrld_sync.sqlite3"
 _CACHE_DIR = pathlib.Path(__file__).parent / "cache"
+_RUNTIME_HISTORY = RuntimeHistory(_CACHE_DIR / "processing-times.json")
 _STEM_CACHE_DIR = _CACHE_DIR / "stems"
 _VOCAL_REFERENCE_DIR = _CACHE_DIR / "vocal-references"
 _UVR_MODEL_DIR = pathlib.Path(__file__).parent / "models" / "uvr"
@@ -537,29 +540,35 @@ def _ensure_separator_model(model_id: str) -> pathlib.Path:
     return target
 
 
-def _separate_vocals_impl(source: pathlib.Path, model_id: str, cache_path: pathlib.Path) -> pathlib.Path:
-    item = _separator_catalog_item(model_id)
-    asset = str(item.get("asset") or item.get("runtime_id") or "")
-    _ensure_separator_model(model_id)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="wrld-uvr-") as temp_dir:
-        from audio_separator.separator import Separator
-        sep = Separator(
-            model_file_dir=str(_UVR_MODEL_DIR), output_dir=temp_dir,
-            output_format="FLAC", output_single_stem="Vocals",
-        )
-        sep.load_model(model_filename=asset)
-        outputs = sep.separate(str(source))
-        del sep
-        candidates = [pathlib.Path(x) for x in (outputs or [])]
-        candidates = [x if x.is_absolute() else pathlib.Path(temp_dir) / x for x in candidates]
-        vocal = next((x for x in candidates if x.is_file() and "vocal" in x.name.lower()), None)
-        if vocal is None:
-            vocal = next((x for x in pathlib.Path(temp_dir).glob("*.flac") if x.is_file()), None)
-        if vocal is None:
-            raise RuntimeError("UVR separation completed without a vocals stem")
-        shutil.copy2(vocal, cache_path)
-    return cache_path
+def _stop_process_tree(proc) -> None:
+    """Stop only this job's subprocess tree, including its audio encoders."""
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc.kill()
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        if sys.platform == "win32":
+            proc.kill()
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        proc.wait(timeout=3)
 
 
 def _separate_vocals(
@@ -567,16 +576,61 @@ def _separate_vocals(
     model_id: str,
     cache_path: pathlib.Path,
     progress_spy: _UVRProgressSpy | None = None,
+    cancelled=lambda: False,
 ) -> pathlib.Path:
-    """Separate vocals while optionally teeing UVR's tqdm output to the app."""
-    if progress_spy is None:
-        return _separate_vocals_impl(source, model_id, cache_path)
-    original_stderr = sys.stderr
-    sys.stderr = _TeeStderr(progress_spy, original_stderr)
-    try:
-        return _separate_vocals_impl(source, model_id, cache_path)
-    finally:
-        sys.stderr = original_stderr
+    """Run UVR out of process so Cancel can interrupt native GPU inference."""
+    if cancelled():
+        raise InterruptedError("Cancelled")
+    item = _separator_catalog_item(model_id)
+    asset = str(item.get("asset") or item.get("runtime_id") or "")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    # Keep temporary output on the same filesystem for atomic publication.
+    with tempfile.TemporaryDirectory(prefix=".uvr-", dir=cache_path.parent) as temp_dir:
+        worker = pathlib.Path(__file__).parent / "scripts" / "uvr_worker.py"
+        cmd = [sys.executable, "-u", str(worker), "--source", str(source.resolve()),
+               "--model", asset, "--model-dir", str(_UVR_MODEL_DIR.resolve()),
+               "--output-dir", str(pathlib.Path(temp_dir).resolve())]
+        kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {"start_new_session": True}
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
+        tail = deque(maxlen=12)
+
+        def read_output():
+            pending = ""
+            while chunk := proc.stdout.read1(4096):
+                text = chunk.decode("utf-8", "replace")
+                tail.append(text)
+                pending = (pending + text)[-8192:]
+                if progress_spy:
+                    progress_spy.write(pending)
+                if "\r" in pending or "\n" in pending:
+                    pending = re.split(r"[\r\n]", pending)[-1]
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        try:
+            while proc.poll() is None:
+                if cancelled():
+                    raise InterruptedError("Cancelled")
+                time.sleep(.1)
+            reader.join(timeout=2)
+            if cancelled():
+                raise InterruptedError("Cancelled")
+            if proc.returncode:
+                raise RuntimeError("UVR separation failed: " + "".join(tail)[-3000:].strip())
+            manifest = pathlib.Path(temp_dir) / "result.txt"
+            if not manifest.is_file():
+                raise RuntimeError("UVR separation completed without a vocals stem")
+            vocal = pathlib.Path(manifest.read_text(encoding="utf-8")).resolve()
+            if not vocal.is_relative_to(pathlib.Path(temp_dir).resolve()) or not vocal.is_file() or not vocal.stat().st_size:
+                raise RuntimeError("UVR returned an invalid vocals stem")
+            if cancelled():
+                raise InterruptedError("Cancelled")
+            vocal.replace(cache_path)
+            return cache_path
+        finally:
+            _stop_process_tree(proc)
+            reader.join(timeout=2)
+            proc.stdout.close()
 
 
 def _uvr_progress_window(task) -> tuple[int, int]:
@@ -590,6 +644,8 @@ def _uvr_progress_window(task) -> tuple[int, int]:
 
 
 async def _prepare_analysis_audio(task, source_path: str) -> str:
+    if task.cancel_requested:
+        raise asyncio.CancelledError()
     owner = _task_owner_key(task)
     reference = _get_vocal_reference(owner)
     if reference:
@@ -612,6 +668,8 @@ async def _prepare_analysis_audio(task, source_path: str) -> str:
     }
     await _q_broadcast()
     audio_hash = await asyncio.to_thread(_audio_content_hash, pathlib.Path(source_path))
+    if task.cancel_requested:
+        raise asyncio.CancelledError()
     config = {"separator_model": separator_model, "separator_target": "all_vocals"}
     config_hash = hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     stem_dir = _STEM_CACHE_DIR / audio_hash / config_hash
@@ -626,33 +684,41 @@ async def _prepare_analysis_audio(task, source_path: str) -> str:
         await _q_broadcast()
         spy = _UVRProgressSpy()
         loop = asyncio.get_running_loop()
+        stop = threading.Event()
         future = loop.run_in_executor(
             None,
-            lambda: _separate_vocals(pathlib.Path(source_path), separator_model, stem_path, spy),
+            lambda: _separate_vocals(pathlib.Path(source_path), separator_model, stem_path, spy,
+                                     lambda: task.cancel_requested or stop.is_set()),
         )
-        cancelled = False
-        elapsed = 0.0
-        while not future.done():
-            if task.cancel_requested:
-                cancelled = True
-            uvr = spy.latest()
-            if uvr:
-                phase_pct = uvr["pct"]
-                overall_pct = round(progress_start + (progress_end - progress_start) * phase_pct / 100)
-                message = f"Separating all vocals with UVR… {phase_pct}%"
-            else:
-                overall_pct = progress_start
-                message = f"Loading UVR · {label}… {elapsed:.0f}s"
-            task.progress = {
-                "stage": "separating", "step": "preprocessing", "pct": overall_pct,
-                "msg": "Cancelling after UVR finishes…" if cancelled else message,
-                **({"uvr": uvr} if uvr else {}),
-            }
-            await _q_broadcast()
-            await asyncio.sleep(0.25)
-            elapsed += 0.25
-        await future
-        if cancelled:
+        started = time.perf_counter()
+        try:
+            while not future.done():
+                uvr = spy.latest()
+                if uvr:
+                    phase_pct = uvr["pct"]
+                    overall_pct = round(progress_start + (progress_end - progress_start) * phase_pct / 100)
+                    message = f"Separating all vocals with UVR… {phase_pct}%"
+                else:
+                    overall_pct = progress_start
+                    message = f"Loading UVR · {label}… {time.perf_counter() - started:.0f}s"
+                task.progress = {
+                    "stage": "separating", "step": "preprocessing", "pct": overall_pct,
+                    "msg": "Cancelling UVR…" if task.cancel_requested else message,
+                    "indeterminate": not bool(uvr),
+                    **({"uvr": uvr} if uvr else {}),
+                }
+                await _q_broadcast()
+                await asyncio.sleep(.25)
+            await future
+        except (asyncio.CancelledError, InterruptedError):
+            stop.set()
+            # Do not advance the queue until the child exits and its temporary files are gone.
+            try:
+                await asyncio.shield(future)
+            except (InterruptedError, asyncio.CancelledError):
+                pass
+            raise asyncio.CancelledError()
+        if task.cancel_requested:
             raise asyncio.CancelledError()
         task.progress = {
             "stage": "separating", "step": "preprocessing", "pct": progress_end,
@@ -1304,7 +1370,7 @@ async def _q_broadcast() -> None:
 
 # ── Shared whisper helpers ────────────────────────────────────────────────
 
-def _align(model_obj, tmp_path: str, lyrics: str, fast_mode: bool = False):
+def _align(model_obj, tmp_path: str, lyrics: str, fast_mode: bool = False, progress_callback=None):
     # original_split=True keeps one output segment per input lyric line.
     # Optional fast alignment remains available internally for compatibility.
     # The UI Auto action now performs a full transcription instead; Sync uses
@@ -1320,6 +1386,7 @@ def _align(model_obj, tmp_path: str, lyrics: str, fast_mode: bool = False):
         suppress_silence=True,
         suppress_word_ts=True,
         verbose=False,
+        progress_callback=progress_callback,
     )
 
 
@@ -1428,101 +1495,114 @@ def _line_from_faster_segment(segment) -> dict | None:
     }
 
 
+def _processing_audio_duration(path: str) -> float:
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=nw=1:nk=1', path],
+            capture_output=True, text=True, timeout=5,
+            **({'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}),
+        )
+        duration = float(result.stdout.strip())
+        return duration if 0 < duration < float('inf') else 0.0
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+async def _run_model_job(task, path, model_id, runner, *, phase, label, start, end=98, live=False, broadcast=True):
+    """Poll measured stage progress without releasing the inference lock prematurely."""
+    if task.cancel_requested:
+        raise asyncio.CancelledError()
+    duration = await asyncio.to_thread(_processing_audio_duration, path)
+    stop = threading.Event()
+    engine = 'torch' if model_id in MODEL_SPECS else ENGINE_PREF
+    key = f'{model_id}:{engine}:{_get_device(engine)}:words={task.word_timing}'
+    async with _inference_lock:
+        report = ProcessingProgress(_RUNTIME_HISTORY, key, duration,
+                                    lambda: task.cancel_requested or stop.is_set())
+        try:
+            report.begin(phase, label, start, end)
+        except InterruptedError:
+            raise asyncio.CancelledError()
+        future = asyncio.get_running_loop().run_in_executor(None, lambda: runner(report))
+        try:
+            while not future.done():
+                task.progress = {**report.snapshot(), 'live': live}
+                if broadcast:
+                    await _q_broadcast()
+                await asyncio.sleep(.25)
+            result = await future
+            report.finish()
+            task.progress = {**report.snapshot(), 'live': live}
+            if broadcast:
+                await _q_broadcast()
+            return result
+        except asyncio.CancelledError:
+            stop.set()
+            try:
+                await asyncio.shield(future)
+            except (InterruptedError, asyncio.CancelledError):
+                pass
+            raise
+        except InterruptedError:
+            raise asyncio.CancelledError()
+
+
+async def _legacy_model_events(path, model_id, runner, **options):
+    """Share measured progress with the legacy direct SSE endpoints."""
+    task = QueueTask(uuid.uuid4().hex, 'sync', 0, '', '')
+    future = asyncio.create_task(_run_model_job(task, path, model_id, runner, broadcast=False, **options))
+    try:
+        while not future.done():
+            if task.progress:
+                yield task.progress
+            await asyncio.sleep(.25)
+        yield {'_result': await future}
+    finally:
+        if not future.done():
+            task.cancel_requested = True
+            try:
+                await asyncio.shield(future)
+            except (InterruptedError, asyncio.CancelledError):
+                pass
+
+
 async def _faster_stream_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dict] | None:
     """Stream faster-whisper segments into QueueTask.live_lines as they decode.
 
     Returns None when the loaded model is not a faster-whisper model, allowing
     the caller to fall back to stable-ts/PyTorch transcription.
     """
-    model_obj = await get_verify_model()
+    model_id = task.transcribe_model or VERIFY_MODEL_SIZE
+    model_obj = await get_verify_model(model_id)
     transcribe_original = getattr(model_obj, "transcribe_original", None)
     if not callable(transcribe_original):
         return None
 
-    loop = asyncio.get_running_loop()
-    updates: thread_queue.Queue = thread_queue.Queue()
-
-    def _run():
+    def run(report):
+        lines = []
+        segments, info = transcribe_original(tmp_path, language="en", word_timestamps=True)
+        duration = float(getattr(info, "duration", 0.0) or report.duration)
+        report.update(0, duration)
         try:
-            segments, info = transcribe_original(
-                tmp_path,
-                language="en",
-                word_timestamps=True,
-            )
-            updates.put(("meta", float(getattr(info, "duration", 0.0) or 0.0)))
             for segment in segments:
-                if task.cancel_requested:
-                    break
+                report.check_cancel()
                 line = _line_from_faster_segment(segment)
                 if line:
-                    updates.put(("line", line))
-            updates.put(("done", None))
-        except BaseException as exc:
-            updates.put(("error", exc))
-
-    lines: list[dict] = []
-    total_duration = 0.0
-    finished = False
-
-    async with _inference_lock:
-        future = loop.run_in_executor(None, _run)
-        while not finished:
-            changed = False
-            while True:
-                try:
-                    kind, payload = updates.get_nowait()
-                except thread_queue.Empty:
-                    break
-
-                if kind == "meta":
-                    total_duration = float(payload or 0.0)
-                elif kind == "line":
-                    lines.append(payload)
+                    lines.append(line)
                     task.live_lines = list(lines)
-                    changed = True
-                elif kind == "error":
-                    await future
-                    raise payload
-                elif kind == "done":
-                    finished = True
-                    break
+                report.update(float(segment.end), duration)
+        finally:
+            close = getattr(segments, "close", None)
+            if close:
+                close()
+        return lines
 
-            if task.cancel_requested:
-                task.progress = {
-                    "stage": "transcribing", "msg": "Cancelling…", "pct": 0,
-                    "step": "transcribing",
-                }
-                await _q_broadcast()
-
-            if changed:
-                end = lines[-1]["end"] if lines else 0.0
-                pct = 30 + ((min(1.0, end / total_duration) * 68) if total_duration else 0)
-                task.progress = {
-                    "stage": "transcribing",
-                    "msg": f"Transcribing live… {len(lines)} lines",
-                    "pct": pct,
-                    "step": "transcribing",
-                    "live": True,
-                }
-                await _q_broadcast()
-
-            if not finished:
-                if future.done() and updates.empty():
-                    await future
-                    finished = True
-                    break
-                await asyncio.sleep(0.06)
-
-        await future
-
-    if task.cancel_requested:
-        raise asyncio.CancelledError()
-
-    # Raw faster-whisper segments already include real word timestamps, including
-    # natural silence between words. Preserve those timings for TTML/rendering.
-    return _sanitize_timed_lines(
-        lines, inline_parenthetical_background=task.inline_parenthetical_background
+    lines = await _run_model_job(
+        task, tmp_path, model_id, run, phase="transcribing", label="Transcribing live…",
+        start=42 if task.type == "verify" else 30, live=True,
     )
+    return _sanitize_timed_lines(lines, inline_parenthetical_background=task.inline_parenthetical_background)
 
 
 def _new_terminal_progress() -> Progress:
@@ -1684,11 +1764,9 @@ def _parakeet_tokens_to_words(tokens: list[dict]) -> list[dict]:
 
 async def _qwen_sync_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
     runtime = await get_align_model(task.sync_model or ALIGN_MODEL_SIZE)
-    loop = asyncio.get_running_loop()
-    task.progress = {"stage": "aligning", "msg": "Qwen forced alignment…", "pct": 55, "step": "aligning"}
-    await _q_broadcast()
 
-    def run_alignment():
+    def run_alignment(report):
+        report.check_cancel()
         import torch
         from whisper.audio import load_audio
         processor, net = runtime.processor, runtime.model
@@ -1706,17 +1784,10 @@ async def _qwen_sync_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list
             timestamp_token_id=net.config.timestamp_token_id,
         )[0]
 
-    async with _inference_lock:
-        fut = loop.run_in_executor(None, run_alignment)
-        elapsed = 0.0
-        while not fut.done():
-            if task.cancel_requested:
-                await asyncio.shield(fut)
-                raise asyncio.CancelledError()
-            pct = min(96, 55 + (elapsed / 90.0) ** 0.5 * 35)
-            task.progress = {"stage": "aligning", "msg": f"Qwen forced alignment… {elapsed:.0f}s", "pct": pct, "step": "aligning"}
-            await _q_broadcast(); await asyncio.sleep(.5); elapsed += .5
-        timestamps = await fut
+    timestamps = await _run_model_job(
+        task, tmp_path, task.sync_model or ALIGN_MODEL_SIZE, run_alignment,
+        phase="aligning", label="Qwen forced alignment…", start=55,
+    )
     return _sanitize_timed_lines(
         _align_items_to_lyric_lines(timestamps, lyrics),
         inline_parenthetical_background=task.inline_parenthetical_background,
@@ -1725,23 +1796,28 @@ async def _qwen_sync_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list
 
 async def _hubertfa_sync_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
     runtime = await get_align_model("hubert-fa-combined")
-    loop = asyncio.get_running_loop()
-    task.progress = {"stage": "aligning", "msg": "HuBERT FA phoneme alignment…", "pct": 55, "step": "aligning"}
-    await _q_broadcast()
 
-    async with _inference_lock:
-        fut = loop.run_in_executor(None, lambda: runtime.align(tmp_path, lyrics))
-        elapsed = 0.0
-        while not fut.done():
-            if task.cancel_requested:
-                await asyncio.shield(fut)
-                raise asyncio.CancelledError()
-            pct = min(96, 55 + (elapsed / 90.0) ** 0.5 * 35)
-            task.progress = {"stage": "aligning", "msg": f"HuBERT FA phoneme alignment… {elapsed:.0f}s", "pct": pct, "step": "aligning"}
-            await _q_broadcast()
-            await asyncio.sleep(.5)
-            elapsed += .5
-        timestamps = await fut
+    def run(report):
+        phases = {
+            "preparing": (55, 58, "Preparing HuBERT phonemes…"),
+            "inference": (58, 72, "HuBERT audio inference…"),
+            "decoding": (72, 80, "Aligning phonemes…"),
+            "candidates": (80, 92, "Scoring pronunciations…"),
+            "finalizing": (92, 98, "Finalizing word alignment…"),
+        }
+        def update(phase, done=None, total=None):
+            start, end, label = phases[phase]
+            stage = f"aligning_{phase}"
+            if report.phase != stage:
+                report.begin(stage, label, start, end, total=total, unit="words")
+            if total:
+                report.update(done or 0, total)
+        return runtime.align(tmp_path, lyrics, progress=update)
+
+    timestamps = await _run_model_job(
+        task, tmp_path, "hubert-fa-combined", run,
+        phase="aligning_preparing", label="Preparing HuBERT phonemes…", start=55, end=58,
+    )
 
     return _sanitize_timed_lines(
         _align_items_to_lyric_lines(timestamps, lyrics),
@@ -1754,12 +1830,10 @@ async def _managed_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dic
     if model_id not in MODEL_SPECS:
         return None
     runtime = await get_verify_model(model_id)
-    loop = asyncio.get_running_loop()
     label = get_managed_spec(model_id).label
-    task.progress = {"stage": "transcribing", "msg": f"{label} transcription…", "pct": 30, "step": "transcribing", "live": False}
-    await _q_broadcast()
 
-    def run_qwen():
+    def run_qwen(report):
+        report.check_cancel()
         import torch
         from whisper.audio import load_audio
         asr_processor, asr_net = runtime.processor, runtime.model
@@ -1774,6 +1848,7 @@ async def _managed_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dic
         transcript = str(parsed.get("transcription", "") or "").strip()
         language = parsed.get("language") or "English"
 
+        report.begin("aligning", "Aligning Qwen transcription…", 76, 98)
         aligner = runtime.aligner
         align_processor, align_net = aligner.processor, aligner.model
         align_inputs, word_lists = align_processor.prepare_forced_aligner_inputs(
@@ -1790,7 +1865,8 @@ async def _managed_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dic
         )[0]
         return transcript, timestamps
 
-    def run_parakeet():
+    def run_parakeet(report):
+        report.check_cancel()
         from whisper.audio import load_audio
         processor = runtime.processor; net = runtime.model
         sr = int(processor.feature_extractor.sampling_rate)
@@ -1807,17 +1883,11 @@ async def _managed_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dic
         return text, words
 
     runner = run_qwen if model_id.startswith("qwen3-asr-") else run_parakeet
-    async with _inference_lock:
-        fut = loop.run_in_executor(None, runner)
-        elapsed = 0.0
-        while not fut.done():
-            if task.cancel_requested:
-                await asyncio.shield(fut)
-                raise asyncio.CancelledError()
-            pct = min(96, 30 + (elapsed / 150.0) ** 0.5 * 60)
-            task.progress = {"stage": "transcribing", "msg": f"{label} transcription… {elapsed:.0f}s", "pct": pct, "step": "transcribing", "live": False}
-            await _q_broadcast(); await asyncio.sleep(.5); elapsed += .5
-        raw = await fut
+    raw = await _run_model_job(
+        task, tmp_path, model_id, runner, phase="transcribing", label=f"{label} transcription…",
+        start=42 if task.type == "verify" else 30,
+        end=76 if model_id.startswith("qwen3-asr-") else 98,
+    )
 
     if model_id.startswith("qwen3-asr-"):
         text, timestamps = raw
@@ -1848,146 +1918,52 @@ async def _selected_verify_worker(task: QueueTask, tmp_path: str, lyrics: str) -
 
 
 async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast_mode: bool = False) -> list[dict]:
-    """Run align/transcribe in executor. Returns lines."""
+    """Use stable-ts callbacks rather than parsing terminal timing strings."""
     label = "Aligning" if lyrics else "Transcribing"
-    spy = _ProgressSpy()
-    spy.silent = True  # capture stable-ts tqdm instead of dumping raw progress into uvicorn logs
-    loop = asyncio.get_running_loop()
-    model_obj = await (get_align_model(task.sync_model or ALIGN_MODEL_SIZE) if lyrics else get_verify_model(task.transcribe_model or VERIFY_MODEL_SIZE))
-    started = time.perf_counter()
-    display = _display_name(task.song_name) or f"song {task.song_id}"
+    model_id = (task.sync_model or ALIGN_MODEL_SIZE) if lyrics else (task.transcribe_model or VERIFY_MODEL_SIZE)
+    model_obj = await (get_align_model(model_id) if lyrics else get_verify_model(model_id))
 
-    def _run():
-        orig = sys.stderr
-        sys.stderr = _TeeStderr(spy, orig)
-        try:
-            if lyrics:
-                return _align(model_obj, tmp_path, lyrics, fast_mode=fast_mode)
-            return model_obj.transcribe(tmp_path, word_timestamps=True, verbose=False)
-        finally:
-            sys.stderr = orig
+    def run(report):
+        if lyrics:
+            # stable-ts only advances its alignment callback when tqdm is enabled.
+            # Capture that output while publishing the numeric callback directly.
+            spy = _ProgressSpy()
+            spy.silent = True
+            original_stderr = sys.stderr
+            sys.stderr = _TeeStderr(spy, original_stderr)
+            try:
+                return _align(model_obj, tmp_path, lyrics, fast_mode=fast_mode, progress_callback=report.update)
+            finally:
+                sys.stderr = original_stderr
+        return model_obj.transcribe(tmp_path, word_timestamps=True, verbose=None, progress_callback=report.update)
 
-    terminal = _new_terminal_progress()
-    terminal_id = terminal.add_task(f"[cyan]{label}[/cyan] {display}", total=100)
-    terminal.start()
-    try:
-        async with _inference_lock:
-            fut = loop.run_in_executor(None, _run)
-            cancelled = False
-            elapsed = 0
-            while not fut.done():
-                if task.cancel_requested:
-                    cancelled = True
-                    task.progress = {"stage": "aligning", "msg": "Cancelling…", "pct": 0, "step": "aligning"}
-                    await _q_broadcast()
-                    await asyncio.shield(fut)
-                    break
-                prog = spy.latest()
-                if prog:
-                    terminal.update(terminal_id, completed=prog["pct"])
-                    pct = 55 + prog["pct"] * 0.44
-                    msg = (f"{label}: {prog['pct']}%  "
-                           f"{prog['done']:.1f}/{prog['total']:.1f}s  "
-                           f"[{prog['elapsed']}<{prog['eta']}, {prog['speed']:.2f}s/sec]")
-                else:
-                    terminal.update(terminal_id, completed=min(95, (elapsed / 180) ** 0.5 * 100))
-                    pct = min(54, int((elapsed / 180) ** 0.5 * 54))
-                    msg = f"{label}… {elapsed}s"
-                task.progress = {
-                    "stage": "aligning", "pct": pct, "msg": msg, "step": "aligning",
-                    **({"progress": prog} if prog else {}),
-                }
-                await _q_broadcast()
-                await asyncio.sleep(0.5)
-                elapsed += 1
-            if not cancelled:
-                result = await fut
-    finally:
-        terminal.stop()
-
-    if cancelled:
-        raise asyncio.CancelledError()
-
-    lines = _sanitize_timed_lines(
+    result = await _run_model_job(
+        task, tmp_path, model_id, run,
+        phase="aligning" if lyrics else "transcribing", label=f"{label}…",
+        start=55 if lyrics else 30,
+    )
+    return _sanitize_timed_lines(
         _lines_from_alignment(result, lyrics),
         inline_parenthetical_background=task.inline_parenthetical_background,
     )
-    CONSOLE.print(
-        f"[green]✓[/green] {'Aligned' if lyrics else 'Transcribed'} [bold]{display}[/bold] "
-        f"[dim]({len(lines)} lines, {time.perf_counter() - started:.1f}s)[/dim]"
-    )
-    return lines
 
 
 async def _whisper_verify_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
-    """Free-transcribe + compare. Returns verify_results list."""
-    spy = _ProgressSpy()
-    spy.silent = True
-    loop = asyncio.get_running_loop()
-    model_v = await get_verify_model()
-    started = time.perf_counter()
-    display = _display_name(task.song_name) or f"song {task.song_id}"
+    """Free-transcribe + compare, using the same measured progress as Auto."""
+    model_id = task.transcribe_model or VERIFY_MODEL_SIZE
+    model_v = await get_verify_model(model_id)
 
-    def _run():
-        orig = sys.stderr
-        sys.stderr = _TeeStderr(spy, orig)
-        try:
-            return model_v.transcribe(
-                tmp_path, verbose=False, word_timestamps=False,
-                suppress_silence=False, regroup=False,
-            )
-        finally:
-            sys.stderr = orig
+    def run(report):
+        return model_v.transcribe(
+            tmp_path, verbose=None, word_timestamps=False,
+            suppress_silence=False, regroup=False, progress_callback=report.update,
+        )
 
-    terminal = _new_terminal_progress()
-    terminal_id = terminal.add_task(f"[cyan]Verifying[/cyan] {display}", total=100)
-    terminal.start()
-    try:
-        async with _inference_lock:
-            fut = loop.run_in_executor(None, _run)
-            cancelled = False
-            elapsed = 0
-            while not fut.done():
-                if task.cancel_requested:
-                    cancelled = True
-                    task.progress = {"stage": "transcribing", "msg": "Cancelling…", "pct": 0, "step": "verifying"}
-                    await _q_broadcast()
-                    await asyncio.shield(fut)
-                    break
-                prog = spy.latest()
-                if prog:
-                    terminal.update(terminal_id, completed=prog["pct"])
-                    pct = 42 + prog["pct"] * 0.53
-                    msg = (f"Transcribing: {prog['pct']}%  "
-                           f"{prog['done']:.1f}/{prog['total']:.1f}s  "
-                           f"[{prog['elapsed']}<{prog['eta']}, {prog['speed']:.2f}s/sec]")
-                else:
-                    terminal.update(terminal_id, completed=min(95, (elapsed / 180) ** 0.5 * 100))
-                    pct = min(41, int((elapsed / 180) ** 0.5 * 41))
-                    msg = f"Transcribing… {elapsed}s"
-                task.progress = {
-                    "stage": "transcribing", "pct": pct, "msg": msg, "step": "verifying",
-                    **({"progress": prog} if prog else {}),
-                }
-                await _q_broadcast()
-                await asyncio.sleep(0.5)
-                elapsed += 1
-            if not cancelled:
-                result = await fut
-    finally:
-        terminal.stop()
-
-    if cancelled:
-        raise asyncio.CancelledError()
-
-    transcription = result.text or ""
-    lyric_lines = [l for l in lyrics.split("\n") if l.strip()]
-    verified = _verify_lines(lyric_lines, transcription)
-    CONSOLE.print(
-        f"[green]✓[/green] Verified [bold]{display}[/bold] "
-        f"[dim]({len(verified)} lines, {time.perf_counter() - started:.1f}s)[/dim]"
+    result = await _run_model_job(
+        task, tmp_path, model_id, run, phase="transcribing",
+        label="Transcribing for verification…", start=42, end=95,
     )
-    return verified
+    return _verify_lines([line for line in lyrics.splitlines() if line.strip()], result.text or "")
 
 
 async def _download_audio(task: QueueTask, song: dict) -> str:
@@ -1999,7 +1975,7 @@ async def _download_audio(task: QueueTask, song: dict) -> str:
         if "_path" in ev:
             tmp_path = ev["_path"]
         else:
-            task.progress = {**ev, "step": "downloading"}
+            task.progress = {**ev, "pct": 2 + max(0, min(100, ev.get("pct", 0) or 0)) * .06, "step": "downloading"}
             await _q_broadcast()
     if tmp_path is None:
         raise ValueError("Audio download failed.")
@@ -2164,6 +2140,8 @@ async def _queue_processor() -> None:
                 await _run_transcribe_task(task)
             elif task.type == "model_download":
                 await _run_model_download_task(task)
+            if task.cancel_requested:
+                raise asyncio.CancelledError()
             if task.status in ("running", "cancelling"):   # runner didn't set error/cancelled
                 task.status = "done"
             if task.status == "done" and task.result and task.result.get("lines"):
@@ -2173,8 +2151,11 @@ async def _queue_processor() -> None:
                     CONSOLE.print(f"[yellow]Could not save processed lyrics for {task.song_id}: {exc}[/yellow]")
         except asyncio.CancelledError:
             task.status = "cancelled"
+            task.result = None
+            if asyncio.current_task().cancelling():
+                raise
         except Exception as exc:
-            task.status = "error"
+            task.status = "cancelled" if task.cancel_requested else "error"
             task.error  = str(exc)
             CONSOLE.print(f"[red]Task {task.id} failed:[/red] {exc}")
         finally:
@@ -3208,36 +3189,16 @@ async def verify_lyrics_audio(req: VerifyRequest):
             yield sse({"stage": "loading", "msg": "Loading Whisper model…"})
             model = await get_model()
 
-            yield sse({"stage": "transcribing", "pct": 0, "msg": "Transcribing audio (free pass)…"})
-            loop = asyncio.get_event_loop()
-            spy = _ProgressSpy()
-            spy.silent = True
+            def run(report):
+                return model.transcribe(tmp_path, verbose=None, word_timestamps=False,
+                                        suppress_silence=False, regroup=False, progress_callback=report.update)
 
-            def _run_verify():
-                orig = sys.stderr
-                sys.stderr = _TeeStderr(spy, orig)
-                try:
-                    return model.transcribe(tmp_path, verbose=False, word_timestamps=False, suppress_silence=False, regroup=False)
-                finally:
-                    sys.stderr = orig
-
-            fut = loop.run_in_executor(None, _run_verify)
-            elapsed = 0
-            while not fut.done():
-                prog = spy.latest()
-                if prog:
-                    pct = 42 + prog['pct'] * 0.53
-                    msg = (f"{prog['label']}: {prog['pct']}%  "
-                           f"{prog['done']:.1f}/{prog['total']:.1f}s  "
-                           f"[{prog['elapsed']}<{prog['eta']}, {prog['speed']:.2f}s/sec]")
+            async for event in _legacy_model_events(tmp_path, ALIGN_MODEL_SIZE, run,
+                                                    phase="transcribing", label="Transcribing…", start=42):
+                if "_result" in event:
+                    result = event["_result"]
                 else:
-                    pct = min(41, int((elapsed / 180) ** 0.5 * 41))
-                    msg = f"Transcribing… {elapsed}s"
-                yield sse({"stage": "transcribing", "pct": pct, "msg": msg,
-                           **({"progress": prog} if prog else {})})
-                await asyncio.sleep(1)
-                elapsed += 1
-            result = await fut
+                    yield sse(event)
 
             transcription = result.text or ""
             lyric_lines = [l for l in lyrics.split("\n") if l.strip()]
@@ -3291,46 +3252,28 @@ async def sync_lyrics(req: SyncRequest):
             yield sse({"stage": "loading", "msg": "Loading Whisper model…"})
             model = await get_model()
 
-            # Stage 4: align / transcribe
-            # Run in thread pool and stream tick events every second while waiting,
-            # since the executor blocks the generator and tqdm only prints to terminal.
-            # Custom lyrics (from Genius / manual paste) override song.lyrics
             lyrics = (req.lyrics or song.get("lyrics") or "").strip()
             label = "Aligning lyrics to audio" if lyrics else "Transcribing audio"
-            loop = asyncio.get_event_loop()
-            spy = _ProgressSpy()
-            spy.silent = True
 
-            def _run_sync():
+            def run(report):
+                spy = _ProgressSpy()
+                spy.silent = True
                 orig = sys.stderr
                 sys.stderr = _TeeStderr(spy, orig)
                 try:
                     if lyrics:
-                        return _align(model, tmp_path, lyrics)
-                    else:
-                        return model.transcribe(tmp_path, word_timestamps=True, verbose=False)
+                        return _align(model, tmp_path, lyrics, progress_callback=report.update)
+                    return model.transcribe(tmp_path, word_timestamps=True, verbose=None, progress_callback=report.update)
                 finally:
                     sys.stderr = orig
 
-            fut = loop.run_in_executor(None, _run_sync)
-
-            elapsed = 0
-            while not fut.done():
-                prog = spy.latest()
-                if prog:
-                    pct = 55 + prog['pct'] * 0.44
-                    msg = (f"{prog['label']}: {prog['pct']}%  "
-                           f"{prog['done']:.1f}/{prog['total']:.1f}s  "
-                           f"[{prog['elapsed']}<{prog['eta']}, {prog['speed']:.2f}s/sec]")
+            async for event in _legacy_model_events(tmp_path, ALIGN_MODEL_SIZE, run,
+                                                    phase="aligning" if lyrics else "transcribing",
+                                                    label=label, start=55 if lyrics else 30):
+                if "_result" in event:
+                    result = event["_result"]
                 else:
-                    pct = min(54, int((elapsed / 180) ** 0.5 * 54))
-                    msg = f"{label}… {elapsed}s"
-                yield sse({"stage": "aligning", "pct": pct, "msg": msg,
-                           **({"progress": prog} if prog else {})})
-                await asyncio.sleep(1)
-                elapsed += 1
-
-            result = await fut
+                    yield sse(event)
             lines = _lines_from_alignment(result, lyrics)
 
             yield sse({"stage": "done", "lines": lines})
