@@ -3484,6 +3484,7 @@ def _download_with_yt_dlp(url: str, *, quality: str = "high") -> tuple[pathlib.P
     _valid_remote_url(url)
     uid = uuid.uuid4().hex[:12]
     output_template = str(UPLOAD_DIR / f"{uid}.%(ext)s")
+    service = _yt_dlp_service(url) or "Remote media"
     exe = shutil.which("yt-dlp")
     cmd = [exe] if exe else [sys.executable, "-m", "yt_dlp"]
     cmd += [
@@ -3491,6 +3492,14 @@ def _download_with_yt_dlp(url: str, *, quality: str = "high") -> tuple[pathlib.P
         "--max-filesize", "2G",
         "-f", _yt_dlp_format(quality),
         "-x", "--audio-format", "flac",
+        "--embed-metadata",
+    ]
+    if service in {"YouTube", "YouTube Music"}:
+        cmd += [
+            "--parse-metadata", "%(title|)s:%(meta_title)s",
+            "--parse-metadata", "%(uploader|)s:%(meta_artist)s",
+        ]
+    cmd += [
         "-o", output_template,
         "--print", "after_move:filepath",
         url,
