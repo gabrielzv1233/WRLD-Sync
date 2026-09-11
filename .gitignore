@@ -5,7 +5,9 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-tests/
+tests/*
+!tests/test_hubert_phonemes.py
+!tests/test_uvr_progress.py
 
 # Environment and local preferences
 .env

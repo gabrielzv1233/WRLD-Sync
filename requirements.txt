@@ -1,6 +1,6 @@
+onnxruntime-gpu[cudnn,cuda]>=1.19,<2
 huggingface_hub[hf-xet]>=0.34
 audio-separator[gpu]>=0.35
-onnxruntime-gpu>=1.19,<2
 openai-whisper>=20231117
 python-multipart>=0.0.9
 transformers>=5.13.0,<6

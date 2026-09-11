@@ -2713,6 +2713,7 @@ function renderTask(task, isActive) {
   const pct       = task.progress?.pct ?? 0;
   const msg       = task.progress?.msg ?? (task.status === 'pending' ? 'Waiting in queue…' : '');
   const prog      = task.progress?.progress ?? null;
+  const uvr       = task.progress?.uvr ?? null;
   const indeterminate = task.progress?.stage === 'loading';
   const isCancelling  = task.status === 'cancelling';
 
@@ -2724,6 +2725,12 @@ function renderTask(task, isActive) {
            <span>ETA ${prog.eta}</span>
            <span>${prog.speed.toFixed(2)} s/sec</span>
          </div>`
+      : uvr
+          ? `<div class="tc-rich">
+               <span>${Number(uvr.done).toFixed(0)}/${Number(uvr.total).toFixed(0)} ${esc(uvr.unit || 'chunks')}</span>
+               <span>ETA ${esc(uvr.eta || '—')}</span>
+               <span>${esc(uvr.rate || '—')}</span>
+             </div>`
       : (task.type === 'model_download' && task.progress?.total_bytes
           ? `<div class="tc-rich"><span>${formatBytes(task.progress.done_bytes)} / ${formatBytes(task.progress.total_bytes)}</span><span>SHA-256 verified before install</span></div>`
           : '');

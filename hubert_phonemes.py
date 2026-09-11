@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 import re
+import unicodedata
 
 _WORD_EDGE_RE = re.compile(r"^[^A-Za-z0-9']+|[^A-Za-z0-9']+$")
 _VARIANT_SUFFIX_RE = re.compile(r"\(\d+\)$")
@@ -50,6 +51,39 @@ SLANG_ALIASES = {
     "cos": "cause",
     "shawty": "shorty",
     "woah": "whoa",
+}
+
+# Conservative pronunciation-only rewrites commonly found in lyric sheets.
+# These never replace the text shown to the user.
+LYRIC_ALIASES = {
+    "aint": "ain't",
+    "bout": "about",
+    "cmon": "come on",
+    "coulda": "could have",
+    "dat": "that",
+    "dem": "them",
+    "dis": "this",
+    "em": "them",
+    "errbody": "everybody",
+    "gimme": "give me",
+    "gon": "gonna",
+    "ion": "i don't",
+    "jus": "just",
+    "kinda": "kind of",
+    "lemme": "let me",
+    "lotta": "lot of",
+    "musta": "must have",
+    "ol": "old",
+    "outta": "out of",
+    "shoulda": "should have",
+    "thang": "thing",
+    "tho": "though",
+    "til": "until",
+    "wit": "with",
+    "woulda": "would have",
+    "wrld": "world",
+    "xtc": "ecstasy",
+    "yall": "y'all",
 }
 
 # CMUdict ARPAbet -> the lowercase English inventory used by HuBERT FA's
@@ -126,6 +160,10 @@ class WordInterval:
 
 def normalize_lookup(text: str) -> str:
     text = str(text or "").replace("’", "'").replace("‘", "'").strip().lower()
+    text = "".join(
+        char for char in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(char)
+    )
     text = _WORD_EDGE_RE.sub("", text)
     return text
 
@@ -233,10 +271,10 @@ def _alias_phones(alias: str, dictionary: dict[str, list[tuple[str, ...]]]) -> t
         if candidates:
             out.extend(candidates[0])
             continue
-        try:
-            out.extend(cmu_sequence_to_hubert(x for x in _g2p_engine()(part) if x != " "))
-        except Exception:
+        predicted = _g2p_predict(part)
+        if not predicted:
             return ()
+        out.extend(predicted)
     return tuple(out)
 
 
@@ -247,6 +285,151 @@ def _append_candidate(word: LyricWord, phones: Sequence[str], source: str, note:
     if any(existing.phones == phones for existing in word.candidates):
         return
     word.candidates.append(PronunciationCandidate(phones=phones, source=source, note=note))
+
+
+def _lexical_candidates(
+    lookup: str,
+    dictionary: dict[str, list[tuple[str, ...]]],
+) -> list[tuple[str, ...]]:
+    """Return dictionary pronunciations for one hidden lookup spelling."""
+    return dictionary.get(lookup, []) or _cmudict_candidates(lookup)
+
+
+def _colloquial_lookup(lookup: str) -> str:
+    """Return a conservative standard spelling for a common lyric elision."""
+    compact = re.sub(r"[^a-z0-9]", "", lookup)
+    if len(compact) > 3 and compact.endswith("in"):
+        return f"{compact}g"
+    return ""
+
+
+def _reduced_repetition_lookups(lookup: str) -> list[str]:
+    """Offer bounded spellings for expressive forms such as ``yeaaah``."""
+    compact = re.sub(r"[^a-z0-9]", "", lookup)
+    variants: list[str] = []
+    for maximum in (2, 1):
+        reduced = re.sub(rf"([a-z])\1{{{maximum},}}", lambda match: match.group(1) * maximum, compact)
+        if reduced and reduced != compact and reduced not in variants:
+            variants.append(reduced)
+    return variants
+
+
+@lru_cache(maxsize=8192)
+def _g2p_predict(lookup: str) -> tuple[str, ...]:
+    """Run g2p-en's bundled per-word network without optional NLTK data."""
+    lookup = re.sub(r"[^a-z]", "", normalize_lookup(lookup))
+    if not lookup:
+        return ()
+    try:
+        return cmu_sequence_to_hubert(_g2p_engine().predict(lookup))
+    except Exception:
+        return ()
+
+
+def _token_g2p_phones(lookup: str) -> tuple[str, ...]:
+    """Predict each readable component of one OOV display token locally."""
+    out: list[str] = []
+    components = re.findall(r"[a-z]+|[0-9]", normalize_lookup(lookup))
+    digit_names = {
+        "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+        "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
+    }
+    for component in components:
+        spoken = digit_names.get(component, component)
+        phones = _g2p_predict(spoken)
+        if not phones:
+            return ()
+        out.extend(phones)
+    return tuple(out)
+
+
+def _lookup_with_rewrites(
+    lookup: str,
+    dictionary: dict[str, list[tuple[str, ...]]],
+) -> tuple[tuple[str, ...], str, str] | None:
+    """Resolve one hidden spelling through bounded, deterministic rewrites."""
+    compact = re.sub(r"[^a-z0-9]", "", lookup)
+    attempts: list[tuple[str, str]] = []
+    if compact:
+        attempts.append((compact, "alphanumeric-compact"))
+    colloquial = _colloquial_lookup(lookup)
+    if colloquial:
+        attempts.append((colloquial, "colloquial-ing"))
+    for reduced in _reduced_repetition_lookups(lookup):
+        attempts.append((reduced, "expressive-repeat"))
+    alias = LYRIC_ALIASES.get(compact)
+    if alias:
+        phones = _alias_phones(alias, dictionary)
+        if phones:
+            return phones, "lyric-alias", alias
+
+    seen: set[str] = set()
+    for spelling, source in attempts:
+        if spelling in seen:
+            continue
+        seen.add(spelling)
+        candidates = _lexical_candidates(spelling, dictionary)
+        if candidates:
+            return candidates[0], source, spelling
+        slang = SLANG_PHONES.get(spelling)
+        if slang:
+            return slang, source, spelling
+    return None
+
+
+def _add_unresolved_token_fallbacks(
+    word: LyricWord,
+    dictionary: dict[str, list[tuple[str, ...]]],
+) -> None:
+    """Retry punctuation-heavy OOVs without changing their display token.
+
+    Hyphens and underscores are first treated as hidden word boundaries, so a
+    token such as ``ring-ring`` receives the concatenated pronunciation of two
+    ``ring`` lookups.  If that cannot be resolved, punctuation is removed and
+    the compact spelling is tried.  In either case the result remains one
+    LyricWord and therefore one timed TTML term.
+    """
+    if word.candidates:
+        return
+
+    initialism = re.sub(r"[^A-Za-z]", "", word.text)
+    compact_lookup = re.sub(r"[^a-z0-9]", "", word.lookup)
+    if 1 < len(initialism) <= 4 and initialism.isupper() and compact_lookup not in LYRIC_ALIASES:
+        phones = _alias_phones(" ".join(initialism.lower()), dictionary)
+        if phones:
+            _append_candidate(
+                word,
+                phones,
+                "initialism",
+                f"hidden letter-by-letter pronunciation: {' '.join(initialism)}",
+            )
+
+    if word.candidates:
+        return
+
+    parts = [part for part in re.split(r"[-_]+", word.lookup) if part]
+    if len(parts) > 1:
+        phones: list[str] = []
+        for part in parts:
+            resolved = _lookup_with_rewrites(part, dictionary)
+            if not resolved:
+                phones = []
+                break
+            phones.extend(resolved[0])
+        if phones:
+            _append_candidate(
+                word,
+                phones,
+                "separator-split",
+                f"hidden pronunciation lookup: {' '.join(parts)}",
+            )
+
+    if word.candidates:
+        return
+    resolved = _lookup_with_rewrites(word.lookup, dictionary)
+    if resolved:
+        phones, source, spelling = resolved
+        _append_candidate(word, phones, source, f"hidden pronunciation lookup: {spelling}")
 
 
 def _add_singing_variants(word: LyricWord, max_variants: int = 5) -> None:
@@ -308,6 +491,16 @@ def build_phoneme_plan(
             _append_candidate(word, phones, "cmudict")
         if lookup in SLANG_PHONES:
             _append_candidate(word, SLANG_PHONES[lookup], "slang-pronunciation", "curated lyric/slang pronunciation")
+        compact = re.sub(r"[^a-z0-9]", "", lookup)
+        lyric_alias = LYRIC_ALIASES.get(compact)
+        if lyric_alias:
+            _append_candidate(
+                word,
+                _alias_phones(lyric_alias, dictionary),
+                "lyric-alias",
+                lyric_alias,
+            )
+        _add_unresolved_token_fallbacks(word, dictionary)
 
     needs_context = any(
         not word.candidates or word.lookup in SLANG_PHONES or word.lookup in _CONTEXT_SENSITIVE_WORDS
@@ -322,6 +515,13 @@ def build_phoneme_plan(
         alias = SLANG_ALIASES.get(lookup)
         if alias:
             _append_candidate(word, _alias_phones(alias, dictionary), "slang-alias", alias)
+        if not word.candidates:
+            _append_candidate(
+                word,
+                _token_g2p_phones(lookup),
+                "g2p-token",
+                "local per-token OOV fallback (no external language model)",
+            )
         if include_singing_variants:
             _add_singing_variants(word)
         if not word.candidates:

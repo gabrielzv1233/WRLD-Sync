@@ -1,0 +1,7 @@
+{
+  "preprocess_vocals": true,
+  "separator_model": "uvr-bs-roformer",
+  "separator_target": "all_vocals",
+  "yt_dlp_enabled": true,
+  "yt_dlp_quality": "high"
+}

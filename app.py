@@ -95,6 +95,12 @@ _TQDM_RE = re.compile(
     r'.*?([\d.]+)/([\d.]+)'                  # done / total (seconds)
     r'.*?\[(\d+:\d+)<(\d+:\d+),\s*([\d.]+)s/sec\]'  # [elapsed<eta, speed]
 )
+_UVR_TQDM_RE = re.compile(
+    r"(?P<pct>\d{1,3})%\|.*?\|\s*"
+    r"(?P<done>[\d.]+)/(?P<total>[\d.]+)\s*"
+    r"\[(?P<timing>[^\]]*)\]"
+)
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class _ProgressSpy:
@@ -130,6 +136,44 @@ class _ProgressSpy:
     def latest(self) -> dict | None:
         with self._lock:
             return self._latest
+
+
+class _UVRProgressSpy:
+    """Capture audio-separator's generic tqdm iteration progress."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._latest: dict | None = None
+        self.silent = False
+
+    def write(self, value: str) -> int:
+        clean = _ANSI_ESCAPE_RE.sub("", str(value or ""))
+        for chunk in re.split(r"[\r\n]", clean):
+            match = _UVR_TQDM_RE.search(chunk)
+            if not match:
+                continue
+            timing = match.group("timing").strip()
+            elapsed_eta, _, rate = timing.partition(",")
+            elapsed, separator, eta = elapsed_eta.partition("<")
+            update = {
+                "pct": max(0, min(100, int(match.group("pct")))),
+                "done": float(match.group("done")),
+                "total": float(match.group("total")),
+                "elapsed": elapsed.strip() or "—",
+                "eta": eta.strip() if separator else "—",
+                "rate": rate.strip() or "—",
+                "unit": "chunks",
+            }
+            with self._lock:
+                self._latest = update
+        return len(value)
+
+    def flush(self): pass
+    def isatty(self) -> bool: return False
+    def fileno(self): raise io.UnsupportedOperation("fileno")
+
+    def latest(self) -> dict | None:
+        with self._lock:
+            return dict(self._latest) if self._latest else None
 
 
 class _TeeStderr:
@@ -493,7 +537,7 @@ def _ensure_separator_model(model_id: str) -> pathlib.Path:
     return target
 
 
-def _separate_vocals(source: pathlib.Path, model_id: str, cache_path: pathlib.Path) -> pathlib.Path:
+def _separate_vocals_impl(source: pathlib.Path, model_id: str, cache_path: pathlib.Path) -> pathlib.Path:
     item = _separator_catalog_item(model_id)
     asset = str(item.get("asset") or item.get("runtime_id") or "")
     _ensure_separator_model(model_id)
@@ -518,6 +562,33 @@ def _separate_vocals(source: pathlib.Path, model_id: str, cache_path: pathlib.Pa
     return cache_path
 
 
+def _separate_vocals(
+    source: pathlib.Path,
+    model_id: str,
+    cache_path: pathlib.Path,
+    progress_spy: _UVRProgressSpy | None = None,
+) -> pathlib.Path:
+    """Separate vocals while optionally teeing UVR's tqdm output to the app."""
+    if progress_spy is None:
+        return _separate_vocals_impl(source, model_id, cache_path)
+    original_stderr = sys.stderr
+    sys.stderr = _TeeStderr(progress_spy, original_stderr)
+    try:
+        return _separate_vocals_impl(source, model_id, cache_path)
+    finally:
+        sys.stderr = original_stderr
+
+
+def _uvr_progress_window(task) -> tuple[int, int]:
+    """Reserve an overall queue-progress range for vocal preprocessing."""
+    return {
+        "sync": (8, 50),
+        "verify": (8, 36),
+        "transcribe": (8, 28),
+        "auto": (8, 26),
+    }.get(str(getattr(task, "type", "") or ""), (8, 30))
+
+
 async def _prepare_analysis_audio(task, source_path: str) -> str:
     owner = _task_owner_key(task)
     reference = _get_vocal_reference(owner)
@@ -534,7 +605,11 @@ async def _prepare_analysis_audio(task, source_path: str) -> str:
         return source_path
 
     separator_model = getattr(task, "separator_model", "") or ADVANCED_SETTINGS["separator_model"]
-    task.progress = {**task.progress, "stage": "separating", "step": "preprocessing", "msg": "Preparing cached all-vocals stem…"}
+    progress_start, progress_end = _uvr_progress_window(task)
+    task.progress = {
+        "stage": "separating", "step": "preprocessing", "pct": progress_start,
+        "msg": "Checking all-vocals stem cache…",
+    }
     await _q_broadcast()
     audio_hash = await asyncio.to_thread(_audio_content_hash, pathlib.Path(source_path))
     config = {"separator_model": separator_model, "separator_target": "all_vocals"}
@@ -543,8 +618,55 @@ async def _prepare_analysis_audio(task, source_path: str) -> str:
     stem_path = stem_dir / "vocals.flac"
     metadata_path = stem_dir / "metadata.json"
     if not stem_path.is_file():
-        await asyncio.to_thread(_separate_vocals, pathlib.Path(source_path), separator_model, stem_path)
+        label = get_catalog_model(separator_model).get("label", separator_model)
+        task.progress = {
+            "stage": "separating", "step": "preprocessing", "pct": progress_start,
+            "msg": f"Loading UVR · {label}…",
+        }
+        await _q_broadcast()
+        spy = _UVRProgressSpy()
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            None,
+            lambda: _separate_vocals(pathlib.Path(source_path), separator_model, stem_path, spy),
+        )
+        cancelled = False
+        elapsed = 0.0
+        while not future.done():
+            if task.cancel_requested:
+                cancelled = True
+            uvr = spy.latest()
+            if uvr:
+                phase_pct = uvr["pct"]
+                overall_pct = round(progress_start + (progress_end - progress_start) * phase_pct / 100)
+                message = f"Separating all vocals with UVR… {phase_pct}%"
+            else:
+                overall_pct = progress_start
+                message = f"Loading UVR · {label}… {elapsed:.0f}s"
+            task.progress = {
+                "stage": "separating", "step": "preprocessing", "pct": overall_pct,
+                "msg": "Cancelling after UVR finishes…" if cancelled else message,
+                **({"uvr": uvr} if uvr else {}),
+            }
+            await _q_broadcast()
+            await asyncio.sleep(0.25)
+            elapsed += 0.25
+        await future
+        if cancelled:
+            raise asyncio.CancelledError()
+        task.progress = {
+            "stage": "separating", "step": "preprocessing", "pct": progress_end,
+            "msg": "Caching all-vocals stem…",
+            **({"uvr": spy.latest()} if spy.latest() else {}),
+        }
+        await _q_broadcast()
         metadata_path.write_text(json.dumps({"audio_hash": audio_hash, **config}, indent=2), encoding="utf-8")
+    else:
+        task.progress = {
+            "stage": "separating", "step": "preprocessing", "pct": progress_end,
+            "msg": "Using cached all-vocals stem ✓",
+        }
+        await _q_broadcast()
     task.analysis_source = {
         "type": "uvr",
         "label": f"UVR · {get_catalog_model(separator_model).get('label', separator_model)}",

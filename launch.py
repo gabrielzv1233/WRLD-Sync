@@ -32,7 +32,7 @@ VENV_DIR = ROOT / ".venv"
 REQUIREMENTS = ROOT / "requirements.txt"
 VENV_PYTHON = (3, 13)
 VENV_PYTHON_LABEL = ".".join(map(str, VENV_PYTHON))
-
+host = "0.0.0.0"
 
 class C:
     RESET = "\033[0m"
@@ -926,7 +926,7 @@ def run_server(port: int, open_browser: bool) -> int:
     else:
         popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
-        [str(venv_python()), "-m", "uvicorn", "app:app", "--host", "127.0.0.1",
+        [str(venv_python()), "-m", "uvicorn", "app:app", "--host", host,
          "--port", str(port), "--no-access-log", "--log-level", "warning"],
         **popen_kwargs,
     )
