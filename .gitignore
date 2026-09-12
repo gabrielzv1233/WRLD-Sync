@@ -9,6 +9,7 @@ tests/*
 !tests/test_hubert_phonemes.py
 !tests/test_uvr_progress.py
 !tests/test_processing_progress.py
+!tests/test_youtube_lyrics.py
 
 # Environment and local preferences
 .env
