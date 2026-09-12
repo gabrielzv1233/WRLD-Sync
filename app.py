@@ -24,6 +24,7 @@ from collections import deque
 
 from processing_progress import ProcessingProgress, RuntimeHistory
 from youtube_lyrics import extract_youtube_lyrics
+from gap_hints import parse_lyrics_gap_hints
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -798,6 +799,7 @@ def _store_processed_lyrics(task) -> None:
         "separator_model": str(getattr(task, "separator_model", "") or ""),
         "separator_target": str(getattr(task, "separator_target", "") or "all_vocals"),
         "analysis_source": dict(getattr(task, "analysis_source", {}) or {}),
+        "gap_hints": list(getattr(task, "gap_hints", []) or []),
         "background_vocals": "parenthetical-inline-toggle",
         "alignment": {
             "original_split": True,
@@ -1147,6 +1149,7 @@ class QueueTask:
     separator_model: str = "uvr-bs-roformer"
     separator_target: str = "all_vocals"
     analysis_source: dict = dc_field(default_factory=dict)
+    gap_hints: list[dict] = dc_field(default_factory=list)
     status: str = "pending"   # pending|running|done|error|cancelled
     progress: dict = dc_field(default_factory=dict)
     error: str = ""
@@ -1183,6 +1186,7 @@ class QueueTask:
                 "separator_model": self.separator_model,
                 "separator_target": self.separator_target,
                 "analysis_source": self.analysis_source,
+                "gap_hints": self.gap_hints,
                 "sync_model": self.sync_model or ALIGN_MODEL_SIZE,
                 "transcribe_model": self.transcribe_model or VERIFY_MODEL_SIZE,
             },
@@ -1378,6 +1382,30 @@ async def _q_broadcast() -> None:
 
 
 # ── Shared whisper helpers ────────────────────────────────────────────────
+
+def _serialize_gap_hint(hint) -> dict:
+    return {
+        "position": int(hint.position),
+        "strength": max(1, int(hint.strength)),
+        "interlude": str(hint.interlude),
+        "source": str(hint.source),
+    }
+
+
+def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[dict]:
+    """Attach between-line controls without turning them into lyric content."""
+    if not lines or not gap_hints:
+        return lines
+    for hint in gap_hints:
+        position = int(hint.get("position", -1))
+        if 0 < position < len(lines):
+            lines[position - 1]["gap_after"] = {
+                "strength": max(1, int(hint.get("strength", 1) or 1)),
+                "interlude": str(hint.get("interlude") or "auto"),
+                "source": str(hint.get("source") or "[...]"),
+            }
+    return lines
+
 
 def _align(model_obj, tmp_path: str, lyrics: str, fast_mode: bool = False, progress_callback=None):
     # original_split=True keeps one output segment per input lyric line.
@@ -2005,7 +2033,12 @@ async def _run_sync_task(task: QueueTask) -> None:
             raise ValueError("No audio file for this song.")
         lyrics   = task.lyrics or song.get("lyrics", "") or ""
         tmp_path = await _download_audio(task, song)
+    parsed_lyrics = parse_lyrics_gap_hints(lyrics)
+    lyrics = parsed_lyrics.text
+    task.gap_hints = [_serialize_gap_hint(hint) for hint in parsed_lyrics.gaps]
     task.lyrics = lyrics
+    if not lyrics:
+        raise ValueError("No lyric lines remain after parsing gap controls.")
     if task.cancel_requested:
         raise asyncio.CancelledError()
     tmp_path = await _prepare_analysis_audio(task, tmp_path)
@@ -2019,7 +2052,8 @@ async def _run_sync_task(task: QueueTask) -> None:
         lines = await _hubertfa_sync_worker(task, tmp_path, lyrics)
     else:
         lines = await _whisper_sync_worker(task, tmp_path, lyrics)
-    task.result   = {"lines": lines}
+    lines = _apply_gap_hints_to_lines(lines, task.gap_hints)
+    task.result = {"lines": lines, "text": lyrics, "gap_hints": task.gap_hints}
     task.progress = {"stage": "done", "msg": f"Done — {len(lines)} lines synced", "step": "done", "pct": 100}
 
 
@@ -2900,12 +2934,20 @@ def _sanitize_timed_lines(
             candidate_end = max(candidate_end, max(w["end"] for w in valid_words))
 
         end = candidate_end if candidate_end > start else start + min_duration
-        cleaned.append({
+        cleaned_line = {
             "line": text,
             "start": start,
             "end": end,
             "words": valid_words,
-        })
+        }
+        gap_after = raw.get("gap_after")
+        if isinstance(gap_after, dict):
+            cleaned_line["gap_after"] = {
+                "strength": max(1, int(gap_after.get("strength", 1) or 1)),
+                "interlude": str(gap_after.get("interlude") or "auto"),
+                "source": str(gap_after.get("source") or "[...]"),
+            }
+        cleaned.append(cleaned_line)
 
     return cleaned
 
@@ -3013,13 +3055,21 @@ def _build_ttml(
     for i, line in enumerate(lines):
         active_block_end = max(active_block_end, line["end"])
         add_line(lyric_div, line, active_block_end)
-        if not detect_interludes or i + 1 >= len(lines):
+        if i + 1 >= len(lines):
             continue
 
         nxt = lines[i + 1]
         gap_start = active_block_end
         gap_end = nxt["start"]
-        if gap_end - gap_start >= threshold:
+        gap_hint = line.get("gap_after") if isinstance(line.get("gap_after"), dict) else {}
+        interlude_policy = str(gap_hint.get("interlude") or "auto")
+        if interlude_policy == "force":
+            emit_interlude = gap_end > gap_start
+        elif interlude_policy == "forbid":
+            emit_interlude = False
+        else:
+            emit_interlude = detect_interludes and gap_end - gap_start >= threshold
+        if emit_interlude:
             # Apple explicitly defines Instrumental as a song-part value. Start
             # only after every overlapping foreground/background vocal has ended.
             ET.SubElement(body, f"{{{TTML_NS}}}div", {
