@@ -23,6 +23,7 @@ import re
 from collections import deque
 
 from processing_progress import ProcessingProgress, RuntimeHistory
+from youtube_lyrics import extract_youtube_lyrics
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -3591,7 +3592,15 @@ async def load_local_url(req: LocalUrlRequest):
     url = req.url.strip()
     try:
         path, name, source_url = await _fetch_remote_audio(url)
-        return await asyncio.to_thread(_register_local_track, path, name, source_url)
+        meta = await asyncio.to_thread(_register_local_track, path, name, source_url)
+        if _yt_dlp_service(source_url) in {"YouTube", "YouTube Music"}:
+            try:
+                meta.update(await asyncio.to_thread(extract_youtube_lyrics, source_url))
+                if not meta.get("lyrics"):
+                    meta["lyrics_notice"] = "No YouTube subtitles available. Add lyrics or use Transcribe."
+            except Exception:
+                meta["lyrics_notice"] = "YouTube subtitles could not be retrieved. Add lyrics or use Transcribe."
+        return meta
     except HTTPException:
         raise
     except httpx.HTTPStatusError as exc:
