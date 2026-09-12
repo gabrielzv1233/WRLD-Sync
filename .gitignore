@@ -2,39 +2,38 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*.egg-info/
 .venv/
 venv/
-*.egg-info/
-tests/
+tests/*
+!tests/test_hubert_phonemes.py
+!tests/test_uvr_progress.py
+!tests/test_processing_progress.py
+!tests/test_youtube_lyrics.py
+
+# Environment and local preferences
+.env
+.device_pref
+.engine_pref
+.model_pref
+.model_pref_align
+.model_pref_verify
+
+# Generated runtime data and caches
 .artifacts/
-
-# Whisper model cache
 .cache/
+cache/
+data/
 
-# Temp audio files
+# Project-local managed ASR / alignment weights
+models/
+
+# Temporary audio files
 *.mp3
 *.wav
 *.m4a
 
-# Model preference (local config)
-.model_pref
-.model_pref_align
-.model_pref_verify
-.device_pref
-
-# Environment
-.env
-
 # OS
 .DS_Store
 Thumbs.db
-
-.engine_pref
-
-# Local processed lyrics cache
-data/*.sqlite3
-data/*.sqlite3-shm
-data/*.sqlite3-wal
-
-# Project-local managed ASR / alignment weights
-models/
+tdo.txt

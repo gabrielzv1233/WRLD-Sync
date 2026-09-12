@@ -1,0 +1,3 @@
+currently there are Runtime-managed model, im not sure what that means but it prevents me from uninstalling them, so i assume it installs them by default
+Whisper Large v3 and Whisper small are the models listed as such
+keep whisper large v3 as a choice, just make it not managed, keeping whisper small being managed

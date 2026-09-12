@@ -1,0 +1,19 @@
+services:
+  wrld-sync:
+    build: .
+    image: juicewrldapi-whisper:local
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      - wrld-sync-data:/app/data
+      - wrld-sync-models:/app/models
+      - wrld-sync-cache:/app/cache
+
+volumes:
+  wrld-sync-data:
+    name: wrld-sync-data
+  wrld-sync-models:
+    name: wrld-sync-models
+  wrld-sync-cache:
+    name: wrld-sync-cache
