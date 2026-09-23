@@ -1371,6 +1371,7 @@ function hideProgress() {
 
 // ── Karaoke ───────────────────────────────────────────────────────────────
 const INTERLUDE_THRESHOLD = 2.0;
+const LEADING_INTERLUDE_THRESHOLD = 3.0;
 
 function isWholeLineParenthetical(line) {
   const text = String(line?.line ?? line?.word ?? '').trim();
@@ -1581,6 +1582,19 @@ function jumpPreviewLineToRawLyrics(previewIndex) {
 function renderKaraoke(lines, { live = false } = {}) {
   attachMissingLyricSourceReferences(lines);
   const html = [];
+  const firstStart = Number(lines[0]?.start);
+  const leadingHint = lines[0]?.gap_before;
+  if (leadingHint && Number.isFinite(firstStart) && firstStart > 0) {
+    const policy = leadingHint.interlude || 'auto';
+    const emitLeading = policy === 'force'
+      || (policy !== 'forbid' && interludeToggle.checked && firstStart >= LEADING_INTERLUDE_THRESHOLD);
+    if (emitLeading) {
+      html.push(`<div class="ki future" data-after-i="-1" data-gap-start="0" data-gap-end="${firstStart}" role="button" tabindex="0" aria-label="Opening instrumental gap, ${firstStart.toFixed(1)} seconds">
+        <span class="ki-dots" aria-hidden="true"><span class="ki-dot"></span><span class="ki-dot"></span><span class="ki-dot"></span></span>
+      </div>`);
+    }
+  }
+
   lines.forEach((l, i) => {
     const words = Array.isArray(l.words)
       ? l.words.filter(w => Number.isFinite(Number(w.start)) && Number.isFinite(Number(w.end)) && Number(w.end) > Number(w.start))
@@ -1616,13 +1630,19 @@ function renderKaraoke(lines, { live = false } = {}) {
        </span>
      </div>`);
 
-    if (interludeToggle.checked && i + 1 < lines.length) {
+    if (i + 1 < lines.length) {
       let gapStart = Number(l.end);
       if (overlapLyricsToggle.checked) {
         for (let j = 0; j <= i; j++) gapStart = Math.max(gapStart, Number(lines[j].end) || 0);
       }
       const gapEnd = Number(lines[i + 1].start);
-      if (Number.isFinite(gapStart) && Number.isFinite(gapEnd) && gapEnd - gapStart >= INTERLUDE_THRESHOLD) {
+      const policy = l?.gap_after?.interlude || 'auto';
+      const emitInterlude = policy === 'force'
+        ? gapEnd > gapStart
+        : policy === 'forbid'
+          ? false
+          : interludeToggle.checked && gapEnd - gapStart >= INTERLUDE_THRESHOLD;
+      if (Number.isFinite(gapStart) && Number.isFinite(gapEnd) && emitInterlude) {
         html.push(`<div class="ki future" data-after-i="${i}" data-gap-start="${gapStart}" data-gap-end="${gapEnd}" role="button" tabindex="0" aria-label="Instrumental gap, ${Math.max(0, gapEnd - gapStart).toFixed(1)} seconds">
           <span class="ki-dots" aria-hidden="true"><span class="ki-dot"></span><span class="ki-dot"></span><span class="ki-dot"></span></span>
         </div>`);
@@ -1873,7 +1893,7 @@ function getAutoFollowTargets(t = audioPlayer.currentTime, preferNearest = false
   }
 
   const gap = computeGapState(t, idx);
-  if (gap.after >= 0 && gap.interlude) {
+  if (gap.interlude) {
     const interlude = karaokeLines.querySelector(`.ki[data-after-i="${gap.after}"]`);
     if (interlude) return { key: `gap:${gap.after}`, targets: [interlude] };
   }
@@ -1964,17 +1984,23 @@ function applyHighlight(idx, scroll = true, instant = false, gapAfter = -1, acti
     d.querySelectorAll('.kw').forEach(w => setWordFill(w, state === 'past' ? 100 : 0));
   });
 
+  const activeGap = computeGapState(audioPlayer.currentTime, idx);
   karaokeLines.querySelectorAll('.ki').forEach(el => {
     const after = Number(el.dataset.afterI);
-    const state = after < gapAfter || (gapAfter < 0 && after < idx) ? 'past'
-      : after === gapAfter ? 'current'
-      : 'future';
+    let state;
+    if (after === -1) {
+      state = activeGap.interlude && activeGap.after === -1 ? 'current' : idx >= 0 ? 'past' : 'future';
+    } else {
+      state = after < gapAfter || (gapAfter < 0 && after < idx) ? 'past'
+        : after === gapAfter && activeGap.interlude ? 'current'
+        : 'future';
+    }
     el.className = `ki ${state}`;
   });
 
   if (scroll && autoFollow && activeTab === 'karaoke') {
-    if (gapAfter >= 0) {
-      const interlude = karaokeLines.querySelector(`.ki[data-after-i="${gapAfter}"]`);
+    if (activeGap.interlude) {
+      const interlude = karaokeLines.querySelector(`.ki[data-after-i="${activeGap.after}"]`);
       if (interlude) scrollLyricsTo(interlude, instant);
       return;
     }
@@ -2013,7 +2039,18 @@ function computeActiveLineIndices(t = audioPlayer.currentTime, primaryIdx = comp
 }
 
 function computeGapState(t, idx = computeActiveIdx()) {
-  if (idx < 0 || idx >= syncedLines.length) return { after: -1, interlude: false };
+  if (idx < 0 || idx >= syncedLines.length) {
+    const first = syncedLines[0];
+    const firstStart = Number(first?.start);
+    const leadingHint = first?.gap_before;
+    if (leadingHint && Number.isFinite(firstStart) && t >= 0 && t < firstStart) {
+      const policy = leadingHint.interlude || 'auto';
+      const interlude = policy === 'force'
+        || (policy !== 'forbid' && interludeToggle.checked && firstStart >= LEADING_INTERLUDE_THRESHOLD);
+      return { after: -1, interlude };
+    }
+    return { after: -1, interlude: false };
+  }
   const line = syncedLines[idx];
   let vocalEnd = Number(line.end);
   if (overlapLyricsToggle.checked) {
@@ -2025,7 +2062,13 @@ function computeGapState(t, idx = computeActiveIdx()) {
   const nextStart = idx + 1 < syncedLines.length ? Number(syncedLines[idx + 1].start) : Infinity;
   if (!(t < nextStart)) return { after: -1, interlude: false };
   const duration = nextStart - vocalEnd;
-  return { after: idx, interlude: interludeToggle.checked && duration >= INTERLUDE_THRESHOLD };
+  const policy = line?.gap_after?.interlude || 'auto';
+  const interlude = policy === 'force'
+    ? duration > 0
+    : policy === 'forbid'
+      ? false
+      : interludeToggle.checked && duration >= INTERLUDE_THRESHOLD;
+  return { after: idx, interlude };
 }
 
 function updateActiveWordAnimation(t, idx = activeLineIdx) {
@@ -3824,7 +3867,7 @@ function buildTTML() {
     '  <body>',
   ];
   const threshold = INTERLUDE_THRESHOLD;
-  const leadingThreshold = 3.0;
+  const leadingThreshold = LEADING_INTERLUDE_THRESHOLD;
   let divOpen = false;
 
   const shouldEmitBetweenInterlude = (line, gapStart, gapEnd) => {
@@ -3881,7 +3924,7 @@ function buildTTML() {
       out.push(`      <p begin="${begin}" end="${end}">${xmlEsc(line.line)}</p>`);
     }
 
-    if (interludeToggle.checked && i + 1 < lines.length) {
+    if (i + 1 < lines.length) {
       let gapStart = Number(line.end);
       if (overlapLyricsToggle.checked) {
         for (let j = 0; j <= i; j++) gapStart = Math.max(gapStart, Number(lines[j].end) || 0);
