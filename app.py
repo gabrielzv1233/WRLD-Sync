@@ -2101,7 +2101,7 @@ async def _run_sync_model_once(
 
 
 async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics) -> list[dict]:
-    """Align each marker-separated lyric chunk only against audio after its barrier."""
+    """Align marker-separated lyrics with hard forward-only audio barriers."""
     chunks = build_alignment_chunks(parsed_lyrics)
     if not chunks:
         return []
@@ -2116,8 +2116,28 @@ async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics) ->
     duration = await asyncio.to_thread(_processing_audio_duration, tmp_path)
     aligned: list[dict] = []
     previous_end = 0.0
+    first_chunk_to_align = 0
 
-    for index, chunk in enumerate(chunks):
+    # When the lyrics do not start with a gap hint, do one normal full-text pass
+    # and keep only the lines before the first marker. This preserves the
+    # aligner's original global context for the pre-gap lyrics while discarding
+    # every timestamp after the boundary that may have been greedily compressed.
+    if chunks[0].before_gap is None and len(chunks) > 1:
+        baseline = await _run_sync_model_once(task, tmp_path, parsed_lyrics.text)
+        first_boundary = chunks[1].start_line
+        initial_lines = baseline[:first_boundary]
+        if len(initial_lines) < first_boundary:
+            # Backend did not preserve enough input lines. Fall back to aligning
+            # only the first chunk rather than manufacturing timestamps.
+            initial_lines = await _run_sync_model_once(task, tmp_path, chunks[0].text)
+        if not initial_lines:
+            raise ValueError("Could not align lyrics before the first gap hint.")
+        aligned.extend(initial_lines)
+        previous_end = max(float(line.get("end", 0.0) or 0.0) for line in initial_lines)
+        first_chunk_to_align = 1
+
+    for index in range(first_chunk_to_align, len(chunks)):
+        chunk = chunks[index]
         if task.cancel_requested:
             raise asyncio.CancelledError()
 
