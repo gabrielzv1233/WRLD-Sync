@@ -545,13 +545,19 @@ function startPlayerUiLoop() {
   };
   _playerUiRaf = requestAnimationFrame(frame);
 }
+function safePlayAudio() {
+  if (!audioPlayer.src) return Promise.resolve(false);
+  return audioPlayer.play()
+    .then(() => true)
+    .catch(err => {
+      setSyncStatus(`Audio playback failed: ${err?.message || err || 'unknown browser media error'}`, 'error');
+      return false;
+    });
+}
 playerPlayBtn.addEventListener('click', () => {
   if (!audioPlayer.src) return;
-  if (audioPlayer.paused) {
-    audioPlayer.play().catch(err => {
-      setSyncStatus(`Audio playback failed: ${err?.message || err || 'unknown browser media error'}`, 'error');
-    });
-  } else audioPlayer.pause();
+  if (audioPlayer.paused) safePlayAudio();
+  else audioPlayer.pause();
 });
 seekRange.addEventListener('input', () => {
   if (!Number.isFinite(audioPlayer.duration) || audioPlayer.duration <= 0) return;
@@ -2113,7 +2119,7 @@ karaokeLines.addEventListener('click', (e) => {
     const start = Number(interlude.dataset.gapStart);
     if (Number.isFinite(start)) {
       audioPlayer.currentTime = start;
-      if (audioPlayer.paused) audioPlayer.play();
+      if (audioPlayer.paused) safePlayAudio();
     }
     return;
   }
@@ -2122,7 +2128,7 @@ karaokeLines.addEventListener('click', (e) => {
   const idx = Number(div.dataset.i);
   if (!isNaN(idx) && syncedLines[idx]) {
     audioPlayer.currentTime = syncedLines[idx].start;
-    if (audioPlayer.paused) audioPlayer.play();
+    if (audioPlayer.paused) safePlayAudio();
   }
 });
 
@@ -2613,12 +2619,12 @@ document.addEventListener('keydown', (e) => {
   if (e.target.closest?.('input, textarea, select, button, a, [contenteditable="true"]')) return;
   if (OUR_KEYS.has(e.key)) e.preventDefault();
   if (e.key === '`') { setLyricAutoFollow(!autoFollow, { reanchor: !autoFollow }); return; }
-  if (e.key === ' ') { audioPlayer.paused ? audioPlayer.play() : audioPlayer.pause(); return; }
+  if (e.key === ' ') { audioPlayer.paused ? safePlayAudio() : audioPlayer.pause(); return; }
   if (!syncedLines.length) return;
 
   const idx = pinnedIdx >= 0 ? pinnedIdx : activeLineIdx;
   if (e.shiftKey && e.key === 'ArrowLeft') {
-    if (idx >= 0) { audioPlayer.currentTime = syncedLines[idx].start; if (audioPlayer.paused) audioPlayer.play(); paintKaraokeFrame({ scroll: true }); }
+    if (idx >= 0) { audioPlayer.currentTime = syncedLines[idx].start; if (audioPlayer.paused) safePlayAudio(); paintKaraokeFrame({ scroll: true }); }
     return;
   }
   if (e.shiftKey && e.key === 'ArrowRight') {

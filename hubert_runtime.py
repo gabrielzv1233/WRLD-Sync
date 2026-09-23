@@ -265,24 +265,92 @@ def remove_hubertfa() -> dict:
     return {"model_id": MODEL_ID, "removed": removed}
 
 
+def _select_onnx_providers(available: list[str], device_pref: str = "auto") -> list[str]:
+    """Choose a real ONNX Runtime provider order for HuBERT FA.
+
+    Upstream HubertFA v0.0.7 hardcodes CUDA + DirectML + CPU, which makes
+    onnxruntime-gpu warn about DirectML because that provider is not compiled
+    into the NVIDIA package. WRLD Sync filters against the installed runtime
+    instead and respects the app's cpu/cuda preference.
+    """
+    available = list(dict.fromkeys(available))
+    pref = str(device_pref or "auto").lower()
+
+    if pref == "cpu":
+        preferred = ["CPUExecutionProvider"]
+    elif pref == "cuda":
+        preferred = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    else:
+        # CUDA is the intended NVIDIA path. DirectML is only a fallback for an
+        # ORT build that actually includes it. TensorRT is intentionally not
+        # selected automatically because it has a different engine/build path.
+        preferred = [
+            "CUDAExecutionProvider",
+            "DmlExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+
+    selected = [provider for provider in preferred if provider in available]
+    if selected:
+        return selected
+    if available:
+        return [available[0]]
+    raise RuntimeError("ONNX Runtime reported no available execution providers.")
+
+
 class HubertFAEngine:
     """Pinned HuBERT FA ONNX engine with audio-scored pronunciation candidates."""
 
-    def __init__(self, install: HubertInstall | None = None):
+    def __init__(self, install: HubertInstall | None = None, device_pref: str = "auto"):
         self.install = install or get_hubert_install()
         if self.install is None:
             raise RuntimeError("HuBERT FA combined is not installed")
         runtime_str = str(self.install.runtime_dir)
         if runtime_str not in sys.path:
             sys.path.insert(0, runtime_str)
+
         # Import after adding the pinned runtime source directory.
         onnx_mod = importlib.import_module("onnx_infer")
         decoder_mod = importlib.import_module("tools.decoder")
+        import onnxruntime as ort
+
+        # ORT GPU packages can load CUDA/cuDNN from their bundled nvidia wheels
+        # or from PyTorch. Preload when the API exists so Windows DLL resolution
+        # does not depend on incidental PATH ordering.
+        if str(device_pref or "auto").lower() != "cpu" and hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls()
+            except Exception:
+                pass
+
+        self.onnx_available_providers = tuple(ort.get_available_providers())
+        selected_providers = _select_onnx_providers(
+            list(self.onnx_available_providers),
+            device_pref,
+        )
+        self.onnx_requested_providers = tuple(selected_providers)
+
+        def create_session(onnx_path):
+            options = ort.SessionOptions()
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            # HubertFA's graph commonly emits a noisy CUDA memcpy warning even
+            # when CUDA is working correctly. Keep errors, hide ORT warnings.
+            options.log_severity_level = 3
+            return ort.InferenceSession(
+                str(onnx_path),
+                sess_options=options,
+                providers=selected_providers,
+            )
+
         self.AlignmentDecoder = decoder_mod.AlignmentDecoder
         self.inference = onnx_mod.InferenceOnnx(self.install.model_path)
+        # Override only the upstream session factory. The downloaded pinned
+        # runtime remains untouched and can still be reinstalled safely.
+        self.inference.create_session = create_session
         self.inference.load_config()
         self.inference.init_decoder()
         self.inference.load_model()
+        self.onnx_active_providers = tuple(self.inference.model.get_providers())
         self.sample_rate = int(self.inference.mel_cfg["sample_rate"])
         self.hop_size = int(self.inference.mel_cfg["hop_size"])
         self.language_prefix = bool(self.inference.vocab.get("language_prefix"))

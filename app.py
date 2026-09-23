@@ -1065,7 +1065,14 @@ def _load_parakeet(model_id: str):
 def _load_hubertfa():
     if not hubert_installed():
         raise RuntimeError("HuBERT FA combined is not installed yet. Wait for its model-download queue task.")
-    return HubertFAEngine()
+    engine = HubertFAEngine(device_pref=DEVICE_PREF)
+    active = " → ".join(engine.onnx_active_providers) or "none"
+    available = ", ".join(engine.onnx_available_providers) or "none"
+    CONSOLE.print(
+        f"[green]HuBERT ONNX[/green] · preference {DEVICE_PREF} · active {active} "
+        f"[dim](available: {available})[/dim]"
+    )
+    return engine
 
 
 def _runtime_model_label(model_id: str) -> str:
@@ -2526,13 +2533,35 @@ async def lifespan(app: FastAPI):
     _log_startup_diagnostics()
     global _q_cond
     _q_cond = asyncio.Condition()
+
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+
+    def handle_asyncio_exception(active_loop, context):
+        exc = context.get("exception")
+        if (
+            sys.platform == "win32"
+            and isinstance(exc, ConnectionResetError)
+            and getattr(exc, "winerror", None) == 10054
+        ):
+            CONSOLE.print("[dim]Client connection reset during reload (WinError 10054).[/dim]")
+            return
+        if previous_exception_handler is not None:
+            previous_exception_handler(active_loop, context)
+        else:
+            active_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handle_asyncio_exception)
     proc = asyncio.create_task(_queue_processor())
-    yield
-    proc.cancel()
     try:
-        await proc
-    except asyncio.CancelledError:
-        pass
+        yield
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+        proc.cancel()
+        try:
+            await proc
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="WRLD Sync", lifespan=lifespan)
