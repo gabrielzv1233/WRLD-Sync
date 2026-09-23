@@ -97,4 +97,23 @@ I waited [...] forever
 
 That line remains normal lyric text.
 
-A leading hint can delay the first lyric from the beginning of the audio. A trailing hint is retained as metadata, but with no following lyric it does not create another alignment section.
+## Leading hints and opening instrumentals
+
+A leading hint can delay the first lyric from the beginning of the audio:
+
+```text
+[...]
+First lyric
+```
+
+The number still acts as the minimum forward offset before the first lyric may be accepted.
+
+Opening Instrumental output is intentionally conservative:
+
+- a leading automatic hint such as `[...]` or `1[...]` emits an opening Instrumental only when the actual resolved first lyric starts at least **3 seconds** into the song
+- a shorter automatic opening gap emits no Instrumental metadata, so `[...]` can fix a small early offset without creating a visible interlude
+- `1+[...]` (or `+[...]`) forces an opening Instrumental even when the resolved opening is shorter than 3 seconds
+- `-[...]` always forbids an opening Instrumental
+- disabling interlude detection suppresses automatic opening Instrumentals, but an explicit `+` still forces one
+
+A trailing hint is retained as metadata, but with no following lyric it does not create another alignment section.

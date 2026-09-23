@@ -6,6 +6,23 @@ from typing import Literal
 import re
 
 GapInterludeMode = Literal["auto", "force", "forbid"]
+LEADING_INTERLUDE_AUTO_THRESHOLD = 3.0
+
+
+def should_emit_leading_interlude(
+    first_lyric_start: float,
+    interlude: GapInterludeMode,
+    *,
+    detect_interludes: bool = True,
+    auto_threshold: float = LEADING_INTERLUDE_AUTO_THRESHOLD,
+) -> bool:
+    """Decide whether a leading gap hint should become an Instrumental block."""
+    duration = max(0.0, float(first_lyric_start or 0.0))
+    if interlude == "force":
+        return duration > 0.0
+    if interlude == "forbid":
+        return False
+    return bool(detect_interludes) and duration >= max(0.0, float(auto_threshold))
 
 _MARKER_TOKEN_RE = re.compile(
     r"(?P<seconds>(?:\d+(?:\.\d+)?|\.\d+))?"

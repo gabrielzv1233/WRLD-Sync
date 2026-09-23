@@ -975,8 +975,63 @@ searchInput.addEventListener('pointerdown', unlockSearchInput, { once: true });
 searchInput.addEventListener('focus', unlockSearchInput, { once: true });
 function setSearchQueryParam(q) {
   const url = new URL(location.href);
-  if (q) url.searchParams.set('q', q); else url.searchParams.delete('q');
+  if (q) {
+    url.searchParams.set('q', q);
+    url.searchParams.delete('id');
+  } else {
+    url.searchParams.delete('q');
+  }
   history.replaceState(null, '', url);
+}
+
+function setActiveSourceParam(source) {
+  const url = new URL(location.href);
+  const value = String(source ?? '').trim();
+  if (value) {
+    url.searchParams.set('id', value);
+    url.searchParams.delete('q');
+  } else {
+    url.searchParams.delete('id');
+  }
+  history.replaceState(null, '', url);
+}
+
+function activeSourceType(value) {
+  const source = String(value ?? '').trim();
+  if (/^\d+$/.test(source) && Number(source) > 0) return 'catalog';
+  try {
+    const parsed = new URL(source);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return 'url';
+  } catch {}
+  return source ? 'local' : '';
+}
+
+async function restoreActiveSource(source) {
+  const clean = String(source ?? '').trim();
+  const type = activeSourceType(clean);
+  if (!type) return;
+
+  resultsHeaderText.textContent = 'Restoring active track…';
+  renderSearchSkeleton();
+  try {
+    if (type === 'catalog') {
+      await loadSongById(Number(clean));
+      return;
+    }
+    if (type === 'url') {
+      await loadRemoteTrackUrl(clean, { fromSearch: true });
+      return;
+    }
+    const meta = await api('/api/local-restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: clean }),
+    });
+    await loadLocalTrack(meta);
+  } catch (err) {
+    resultsHeaderText.textContent = 'Could not restore active track';
+    renderSearchState('Track restore failed', String(err?.message ?? err));
+  }
 }
 
 function isSupportedRemoteMediaUrl(value) {
@@ -1010,8 +1065,12 @@ function renderSearchSkeleton() {
 }
 
 renderSearchState('Search the catalog', 'Start typing a song title or alternate name.');
-const initialSearchQuery = new URL(location.href).searchParams.get('q')?.trim() || '';
-if (initialSearchQuery) {
+const initialUrl = new URL(location.href);
+const initialActiveSource = initialUrl.searchParams.get('id')?.trim() || '';
+const initialSearchQuery = initialUrl.searchParams.get('q')?.trim() || '';
+if (initialActiveSource) {
+  setTimeout(() => restoreActiveSource(initialActiveSource), 0);
+} else if (initialSearchQuery) {
   searchInput.value = initialSearchQuery;
   unlockSearchInput();
   setTimeout(() => doSearch(initialSearchQuery), 0);
@@ -1267,6 +1326,7 @@ async function loadSongData(song) {
     nowPlaying.classList.add('visible');
     mainEl.classList.add('song-loaded');
     await refreshVocalReference();
+    setActiveSourceParam(String(song.id));
     setTab('karaoke');
   } catch (e) {
     setSyncStatus('Failed to load song.', 'error');
@@ -3585,6 +3645,7 @@ async function loadLocalTrack(meta) {
   localStorage.setItem('jw_sidebar', '0');
   hideLocalLanding();
   await refreshVocalReference();
+  setActiveSourceParam(meta.source_url || meta.path);
   setTab(!restored && meta.lyrics ? 'plain' : 'karaoke');
   setSyncStatus(restored ? 'Loaded local file + cached processed lyrics ✓'
     : meta.lyrics ? 'Loaded audio + YouTube captions. Review in Lyrics, then Sync to align.'
@@ -3763,13 +3824,33 @@ function buildTTML() {
     '  <body>',
   ];
   const threshold = INTERLUDE_THRESHOLD;
+  const leadingThreshold = 3.0;
   let divOpen = false;
+
+  const shouldEmitBetweenInterlude = (line, gapStart, gapEnd) => {
+    const policy = line?.gap_after?.interlude || 'auto';
+    if (policy === 'force') return gapEnd > gapStart;
+    if (policy === 'forbid') return false;
+    return interludeToggle.checked && gapEnd - gapStart >= threshold;
+  };
+
+  const firstStart = Number(lines[0]?.start) || 0;
+  const leadingHint = lines[0]?.gap_before;
+  if (leadingHint && firstStart > 0) {
+    const policy = leadingHint.interlude || 'auto';
+    const emitLeading = policy === 'force'
+      || (policy !== 'forbid' && interludeToggle.checked && firstStart >= leadingThreshold);
+    if (emitLeading) {
+      out.push(`    <div begin="${fmtTtmlTime(0)}" end="${fmtTtmlTime(firstStart)}" itunes:song-part="Instrumental"></div>`);
+    }
+  }
 
   const openLyricDiv = (index) => {
     let blockEnd = Number(lines[index].end);
     for (let j = index; j + 1 < lines.length; j++) {
-      const gap = Number(lines[j + 1].start) - Number(lines[j].end);
-      if (interludeToggle.checked && gap >= threshold) break;
+      const gapStart = Number(lines[j].end);
+      const gapEnd = Number(lines[j + 1].start);
+      if (shouldEmitBetweenInterlude(lines[j], gapStart, gapEnd)) break;
       blockEnd = Math.max(blockEnd, Number(lines[j + 1].end));
     }
     out.push(`    <div begin="${fmtTtmlTime(lines[index].start)}" end="${fmtTtmlTime(blockEnd)}">`);
@@ -3806,7 +3887,7 @@ function buildTTML() {
         for (let j = 0; j <= i; j++) gapStart = Math.max(gapStart, Number(lines[j].end) || 0);
       }
       const gapEnd = Number(lines[i + 1].start);
-      if (gapEnd - gapStart >= threshold) {
+      if (shouldEmitBetweenInterlude(line, gapStart, gapEnd)) {
         closeLyricDiv();
         out.push(`    <div begin="${fmtTtmlTime(gapStart)}" end="${fmtTtmlTime(gapEnd)}" itunes:song-part="Instrumental"></div>`);
       }

@@ -24,7 +24,7 @@ from collections import deque
 
 from processing_progress import ProcessingProgress, RuntimeHistory
 from youtube_lyrics import extract_youtube_lyrics
-from gap_hints import build_alignment_chunks, find_alignment_anchor, parse_lyrics_gap_hints
+from gap_hints import build_alignment_chunks, find_alignment_anchor, parse_lyrics_gap_hints, should_emit_leading_interlude
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -1422,17 +1422,20 @@ def _serialize_gap_hint(hint) -> dict:
 
 
 def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[dict]:
-    """Attach between-line controls without turning them into lyric content."""
+    """Attach leading/between-line controls without turning them into lyrics."""
     if not lines or not gap_hints:
         return lines
     for hint in gap_hints:
         position = int(hint.get("position", -1))
-        if 0 < position < len(lines):
-            lines[position - 1]["gap_after"] = {
-                "seconds": _gap_hint_seconds(hint),
-                "interlude": str(hint.get("interlude") or "auto"),
-                "source": str(hint.get("source") or "[...]"),
-            }
+        metadata = {
+            "seconds": _gap_hint_seconds(hint),
+            "interlude": str(hint.get("interlude") or "auto"),
+            "source": str(hint.get("source") or "[...]"),
+        }
+        if position == 0:
+            lines[0]["gap_before"] = metadata
+        elif 0 < position < len(lines):
+            lines[position - 1]["gap_after"] = metadata
     return lines
 
 
@@ -3268,13 +3271,14 @@ def _sanitize_timed_lines(
             "end": end,
             "words": valid_words,
         }
-        gap_after = raw.get("gap_after")
-        if isinstance(gap_after, dict):
-            cleaned_line["gap_after"] = {
-                "seconds": _gap_hint_seconds(gap_after),
-                "interlude": str(gap_after.get("interlude") or "auto"),
-                "source": str(gap_after.get("source") or "[...]"),
-            }
+        for gap_key in ("gap_before", "gap_after"):
+            gap_meta = raw.get(gap_key)
+            if isinstance(gap_meta, dict):
+                cleaned_line[gap_key] = {
+                    "seconds": _gap_hint_seconds(gap_meta),
+                    "interlude": str(gap_meta.get("interlude") or "auto"),
+                    "source": str(gap_meta.get("source") or "[...]"),
+                }
         cleaned.append(cleaned_line)
 
     return cleaned
@@ -3378,6 +3382,19 @@ def _build_ttml(
             p.text = line["line"]
 
     threshold = max(0.0, float(interlude_threshold))
+    leading_hint = lines[0].get("gap_before") if isinstance(lines[0].get("gap_before"), dict) else {}
+    leading_policy = str(leading_hint.get("interlude") or "auto")
+    if leading_hint and should_emit_leading_interlude(
+        lines[0]["start"],
+        leading_policy,
+        detect_interludes=detect_interludes,
+    ):
+        ET.SubElement(body, f"{{{TTML_NS}}}div", {
+            "begin": _ttml_time(0.0),
+            "end": _ttml_time(lines[0]["start"]),
+            f"{{{ITUNES_NS}}}song-part": "Instrumental",
+        })
+
     lyric_div = new_lyric_div(lines[0])
     active_block_end = lines[0]["end"]
     for i, line in enumerate(lines):
@@ -3804,6 +3821,7 @@ def _register_local_track(path: pathlib.Path, original_name: str, source_url: st
         "track_hash": track_hash,
         "path": str(path),
         "name": original_name,
+        "source_url": source_url,
         "title": meta["title"],
         "artist": meta["artist"],
         "duration": meta["duration"],
@@ -4073,6 +4091,58 @@ async def vocal_reference_from_url(req: VocalReferenceUrlRequest):
     finally:
         if downloaded is not None:
             downloaded.unlink(missing_ok=True)
+
+
+class LocalRestoreRequest(BaseModel):
+    source: str
+
+
+@app.post("/api/local-restore")
+async def restore_local_track(req: LocalRestoreRequest):
+    source = str(req.source or "").strip()
+    if not source:
+        raise HTTPException(400, "A local source is required.")
+
+    with _db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT track_hash, original_name, source_url, file_path, title, artist,
+                   duration, cover_mime,
+                   CASE WHEN cover_blob IS NULL THEN 0 ELSE 1 END AS has_cover
+            FROM local_tracks
+            WHERE track_hash = ? OR file_path = ? OR source_url = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (source.lower(), source, source),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(404, "That local source is not registered in WRLD Sync.")
+
+    data = dict(row)
+    path = pathlib.Path(data["file_path"])
+    if not path.is_file():
+        raise HTTPException(
+            404,
+            "The registered local audio file is no longer available. Re-open the original file.",
+        )
+
+    track_hash = str(data["track_hash"])
+    return {
+        "track_hash": track_hash,
+        "path": str(path),
+        "name": data["original_name"],
+        "source_url": data["source_url"] or "",
+        "title": data["title"],
+        "artist": data["artist"],
+        "duration": float(data["duration"] or 0.0),
+        "duration_label": _duration_label(data["duration"]),
+        "category": "local_file",
+        "cover_url": f"/api/local/{track_hash}/cover" if data["has_cover"] else "",
+        "audio_url": f"/api/local/{track_hash}/audio",
+        "processed": _get_local_processed(track_hash),
+    }
 
 
 @app.get("/api/local/{track_hash}/cover")

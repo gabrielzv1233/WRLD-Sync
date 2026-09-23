@@ -1,6 +1,6 @@
 import pytest
 
-from gap_hints import build_alignment_chunks, parse_lyrics_gap_hints
+from gap_hints import build_alignment_chunks, parse_lyrics_gap_hints, should_emit_leading_interlude
 
 
 def test_plain_gap_is_removed_from_alignment_text():
@@ -162,3 +162,14 @@ def test_anchor_search_can_tolerate_small_first_word_asr_error():
     ]
 
     assert find_alignment_anchor("gonna make it back", words, start_at=10.0) == 12.0
+
+def test_leading_interlude_auto_requires_three_real_seconds():
+    assert not should_emit_leading_interlude(2.999, "auto")
+    assert should_emit_leading_interlude(3.0, "auto")
+    assert should_emit_leading_interlude(8.5, "auto")
+
+
+def test_leading_interlude_force_and_forbid_override_auto_threshold():
+    assert should_emit_leading_interlude(1.0, "force")
+    assert not should_emit_leading_interlude(8.0, "forbid")
+    assert not should_emit_leading_interlude(8.0, "auto", detect_interludes=False)
