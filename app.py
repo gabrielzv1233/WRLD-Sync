@@ -885,7 +885,7 @@ async def ensure_audio(song_path: str):
             tmp_path = tmp.name
 
         downloaded, last_pct = 0, -1
-        async with httpx.AsyncClient(timeout=180) as client:
+        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
             async with client.stream(
                 "GET", BASE + "/files/download/", params={"path": song_path}
             ) as r:
@@ -3024,7 +3024,7 @@ async def stream_audio(path: str, request: Request):
     if "range" in request.headers:
         req_headers["Range"] = request.headers["range"]
 
-    client = httpx.AsyncClient(timeout=None)
+    client = httpx.AsyncClient(timeout=None, follow_redirects=True)
     try:
         upstream_req = client.build_request(
             "GET", BASE + "/files/download/",
@@ -4034,8 +4034,12 @@ async def local_audio(track_hash: str):
     path = pathlib.Path(row["file_path"])
     if not path.is_file():
         raise HTTPException(404, "The temporary local audio file is no longer available. Re-open it to restore playback.")
-    media_type = mimetypes.guess_type(row.get("original_name") or path.name)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type)
+    media_type = (
+        mimetypes.guess_type(path.name)[0]
+        or mimetypes.guess_type(row.get("original_name") or "")[0]
+        or "application/octet-stream"
+    )
+    return FileResponse(path, media_type=media_type, headers={"Accept-Ranges": "bytes"})
 
 
 # ---------------------------------------------------------------------------

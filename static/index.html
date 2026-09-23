@@ -547,8 +547,11 @@ function startPlayerUiLoop() {
 }
 playerPlayBtn.addEventListener('click', () => {
   if (!audioPlayer.src) return;
-  if (audioPlayer.paused) audioPlayer.play().catch(() => {});
-  else audioPlayer.pause();
+  if (audioPlayer.paused) {
+    audioPlayer.play().catch(err => {
+      setSyncStatus(`Audio playback failed: ${err?.message || err || 'unknown browser media error'}`, 'error');
+    });
+  } else audioPlayer.pause();
 });
 seekRange.addEventListener('input', () => {
   if (!Number.isFinite(audioPlayer.duration) || audioPlayer.duration <= 0) return;
@@ -570,6 +573,17 @@ audioPlayer.addEventListener('play', () => { updateNowPlayingTitleState(); start
 audioPlayer.addEventListener('pause', () => { updateNowPlayingTitleState(); updatePlayerUi(); });
 audioPlayer.addEventListener('ended', () => { updateNowPlayingTitleState(); updatePlayerUi(); });
 audioPlayer.addEventListener('emptied', () => { updateNowPlayingTitleState(); updatePlayerUi(); });
+audioPlayer.addEventListener('error', () => {
+  const err = audioPlayer.error;
+  const messages = {
+    1: 'audio loading was aborted',
+    2: 'network error while loading audio',
+    3: 'audio decoding failed',
+    4: 'audio format or source is not supported',
+  };
+  const detail = messages[err?.code] || 'unknown media error';
+  setSyncStatus(`Audio unavailable: ${detail}`, 'error');
+});
 audioPlayer.addEventListener('loadedmetadata', updatePlayerUi);
 audioPlayer.addEventListener('durationchange', updatePlayerUi);
 audioPlayer.addEventListener('timeupdate', () => { if (audioPlayer.paused) updatePlayerUi(); });
