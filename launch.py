@@ -927,7 +927,7 @@ def run_server(port: int, open_browser: bool) -> int:
         popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
         [str(venv_python()), "-m", "uvicorn", "app:app", "--host", host,
-         "--port", str(port), "--proxy-headers", "--forwarded-allow-ips", "*",
+         "--port", str(port), "--proxy-headers", "--forwarded-allow-ips=*",
          "--no-access-log", "--log-level", "warning"],
         **popen_kwargs,
     )
