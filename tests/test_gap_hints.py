@@ -1,6 +1,6 @@
 import pytest
 
-from gap_hints import parse_lyrics_gap_hints
+from gap_hints import build_alignment_chunks, parse_lyrics_gap_hints
 
 
 def test_plain_gap_is_removed_from_alignment_text():
@@ -62,3 +62,34 @@ def test_conflicting_explicit_controls_are_rejected():
 
     with pytest.raises(ValueError, match="Conflicting gap hint controls"):
         parse_lyrics_gap_hints("A\n+[...]\n-[...]\nB")
+
+
+def test_alignment_chunks_split_at_gap_boundaries():
+    parsed = parse_lyrics_gap_hints(
+        "A one\nA two\n[...]\nB one\n2+[...]\nC one\nC two"
+    )
+    chunks = build_alignment_chunks(parsed)
+
+    assert [chunk.lines for chunk in chunks] == [
+        ("A one", "A two"),
+        ("B one",),
+        ("C one", "C two"),
+    ]
+    assert chunks[0].before_gap is None
+    assert chunks[1].before_gap.position == 2
+    assert chunks[1].before_gap.strength == 1
+    assert chunks[2].before_gap.position == 3
+    assert chunks[2].before_gap.strength == 2
+    assert chunks[2].before_gap.interlude == "force"
+
+
+def test_leading_gap_attaches_to_first_chunk_and_trailing_gap_does_not_make_empty_chunk():
+    parsed = parse_lyrics_gap_hints("+[...]\nFirst\nSecond\n-[...]")
+    chunks = build_alignment_chunks(parsed)
+
+    assert len(chunks) == 1
+    assert chunks[0].lines == ("First", "Second")
+    assert chunks[0].before_gap is not None
+    assert chunks[0].before_gap.interlude == "force"
+    assert parsed.gaps[-1].position == 2
+    assert parsed.gaps[-1].interlude == "forbid"

@@ -24,7 +24,7 @@ from collections import deque
 
 from processing_progress import ProcessingProgress, RuntimeHistory
 from youtube_lyrics import extract_youtube_lyrics
-from gap_hints import parse_lyrics_gap_hints
+from gap_hints import build_alignment_chunks, parse_lyrics_gap_hints
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -808,6 +808,7 @@ def _store_processed_lyrics(task) -> None:
             "nonspeech_skip": 2.0 if fast_mode else 5.0,
             "suppress_silence": True,
             "suppress_word_ts": True,
+            "gap_strategy": "chunked-audio-barriers-v1" if getattr(task, "gap_hints", []) else "none",
         },
     }
     lyrics_text = str(result.get("text") or getattr(task, "lyrics", "") or "")
@@ -1407,17 +1408,102 @@ def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[
     return lines
 
 
-def _align(model_obj, tmp_path: str, lyrics: str, fast_mode: bool = False, progress_callback=None):
+def _gap_hint_guard_seconds(hint: dict | None) -> float:
+    """Small hard barrier before a post-gap chunk may begin.
+
+    Strength is deliberately a bias rather than an expected gap duration. The
+    aligner still chooses the real timestamp later in the remaining audio.
+    """
+    if not hint:
+        return 0.0
+    strength = max(1, int(hint.get("strength", 1) or 1))
+    return min(3.0, 0.35 * strength)
+
+
+def _gap_hint_nonspeech_skip(hint: dict | None) -> float | None:
+    """Make stable-ts more willing to jump over non-vocal audio after a hint."""
+    if not hint:
+        return None
+    strength = max(1, int(hint.get("strength", 1) or 1))
+    return max(0.3, 0.9 / strength)
+
+
+def _slice_alignment_audio(source_path: str, start_seconds: float) -> str:
+    """Create an accurate 16 kHz mono remainder clip beginning at start_seconds."""
+    start_seconds = max(0.0, float(start_seconds))
+    if start_seconds <= 0.001:
+        return source_path
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        sliced_path = tmp.name
+
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", source_path,
+        "-ss", f"{start_seconds:.3f}",
+        "-map", "0:a:0",
+        "-vn", "-sn", "-dn",
+        "-ac", "1", "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        sliced_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+        )
+    except Exception:
+        pathlib.Path(sliced_path).unlink(missing_ok=True)
+        raise
+    if proc.returncode != 0 or not pathlib.Path(sliced_path).is_file() or not pathlib.Path(sliced_path).stat().st_size:
+        pathlib.Path(sliced_path).unlink(missing_ok=True)
+        raise RuntimeError(proc.stderr.strip() or "Could not prepare post-gap alignment audio.")
+    return sliced_path
+
+
+def _offset_timed_lines(lines: list[dict], offset: float) -> list[dict]:
+    offset = max(0.0, float(offset))
+    if offset <= 0.0:
+        return lines
+
+    shifted: list[dict] = []
+    for raw in lines:
+        line = dict(raw)
+        line["start"] = round(float(raw.get("start", 0.0) or 0.0) + offset, 3)
+        line["end"] = round(float(raw.get("end", 0.0) or 0.0) + offset, 3)
+        words = []
+        for raw_word in list(raw.get("words") or []):
+            word = dict(raw_word)
+            word["start"] = round(float(raw_word.get("start", 0.0) or 0.0) + offset, 3)
+            word["end"] = round(float(raw_word.get("end", 0.0) or 0.0) + offset, 3)
+            words.append(word)
+        line["words"] = words
+        shifted.append(line)
+    return shifted
+
+
+def _align(
+    model_obj,
+    tmp_path: str,
+    lyrics: str,
+    fast_mode: bool = False,
+    progress_callback=None,
+    nonspeech_skip_override: float | None = None,
+):
     # original_split=True keeps one output segment per input lyric line.
     # Optional fast alignment remains available internally for compatibility.
-    # The UI Auto action now performs a full transcription instead; Sync uses
-    # the normal alignment path for the raw Lyrics text.
+    # Gap-hinted chunks can lower nonspeech_skip so stable-ts is willing to
+    # traverse instrumental/non-vocal sections instead of compressing lyrics
+    # toward the beginning of the remainder clip.
+    nonspeech_skip = (
+        float(nonspeech_skip_override)
+        if nonspeech_skip_override is not None
+        else (2.0 if fast_mode else 5.0)
+    )
     return model_obj.align(
         tmp_path, lyrics, language="en",
         original_split=True,
-        # Let stable-ts keep real silence between words/lines. The optional
-        # internal fast path uses a 2-second skip threshold; normal Sync uses 5s.
-        nonspeech_skip=2.0 if fast_mode else 5.0,
+        nonspeech_skip=nonspeech_skip,
         fast_mode=fast_mode,
         token_step=200 if fast_mode else 100,
         suppress_silence=True,
@@ -1954,7 +2040,13 @@ async def _selected_verify_worker(task: QueueTask, tmp_path: str, lyrics: str) -
     return await _whisper_verify_worker(task, tmp_path, lyrics)
 
 
-async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast_mode: bool = False) -> list[dict]:
+async def _whisper_sync_worker(
+    task: QueueTask,
+    tmp_path: str,
+    lyrics: str,
+    fast_mode: bool = False,
+    nonspeech_skip_override: float | None = None,
+) -> list[dict]:
     """Use stable-ts callbacks rather than parsing terminal timing strings."""
     label = "Aligning" if lyrics else "Transcribing"
     model_id = (task.sync_model or ALIGN_MODEL_SIZE) if lyrics else (task.transcribe_model or VERIFY_MODEL_SIZE)
@@ -1969,7 +2061,12 @@ async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast
             original_stderr = sys.stderr
             sys.stderr = _TeeStderr(spy, original_stderr)
             try:
-                return _align(model_obj, tmp_path, lyrics, fast_mode=fast_mode, progress_callback=report.update)
+                return _align(
+                    model_obj, tmp_path, lyrics,
+                    fast_mode=fast_mode,
+                    progress_callback=report.update,
+                    nonspeech_skip_override=nonspeech_skip_override,
+                )
             finally:
                 sys.stderr = original_stderr
         return model_obj.transcribe(tmp_path, word_timestamps=True, verbose=None, progress_callback=report.update)
@@ -1983,6 +2080,90 @@ async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast
         _lines_from_alignment(result, lyrics),
         inline_parenthetical_background=task.inline_parenthetical_background,
     )
+
+
+async def _run_sync_model_once(
+    task: QueueTask,
+    tmp_path: str,
+    lyrics: str,
+    *,
+    nonspeech_skip_override: float | None = None,
+) -> list[dict]:
+    sync_model = task.sync_model or ALIGN_MODEL_SIZE
+    if sync_model == "qwen3-forced-aligner-0.6b":
+        return await _qwen_sync_worker(task, tmp_path, lyrics)
+    if sync_model == "hubert-fa-combined":
+        return await _hubertfa_sync_worker(task, tmp_path, lyrics)
+    return await _whisper_sync_worker(
+        task, tmp_path, lyrics,
+        nonspeech_skip_override=nonspeech_skip_override,
+    )
+
+
+async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics) -> list[dict]:
+    """Align each marker-separated lyric chunk only against audio after its barrier."""
+    chunks = build_alignment_chunks(parsed_lyrics)
+    if not chunks:
+        return []
+
+    # Preserve the original one-pass path exactly when there are no alignment
+    # boundaries. A trailing marker alone affects TTML policy but has no lyrics
+    # after it, so it does not need a second alignment pass.
+    has_alignment_boundary = any(chunk.before_gap is not None for chunk in chunks)
+    if not has_alignment_boundary:
+        return await _run_sync_model_once(task, tmp_path, parsed_lyrics.text)
+
+    duration = await asyncio.to_thread(_processing_audio_duration, tmp_path)
+    aligned: list[dict] = []
+    previous_end = 0.0
+
+    for index, chunk in enumerate(chunks):
+        if task.cancel_requested:
+            raise asyncio.CancelledError()
+
+        hint = _serialize_gap_hint(chunk.before_gap) if chunk.before_gap is not None else None
+        search_start = previous_end if index else 0.0
+        if hint is not None:
+            search_start += _gap_hint_guard_seconds(hint)
+
+        if duration > 0 and search_start >= duration - 0.05:
+            raise ValueError(
+                f"Gap hint before lyric line {chunk.start_line + 1} moved alignment past the end of the audio."
+            )
+
+        slice_path = tmp_path
+        cleanup_slice = False
+        if search_start > 0.001:
+            task.progress = {
+                "stage": "gap_boundary",
+                "msg": f"Applying lyric gap boundary {index + 1}/{len(chunks)}…",
+                "step": "aligning",
+                "pct": 54,
+            }
+            await _q_broadcast()
+            slice_path = await asyncio.to_thread(_slice_alignment_audio, tmp_path, search_start)
+            cleanup_slice = True
+
+        try:
+            chunk_lines = await _run_sync_model_once(
+                task,
+                slice_path,
+                chunk.text,
+                nonspeech_skip_override=_gap_hint_nonspeech_skip(hint),
+            )
+        finally:
+            if cleanup_slice:
+                pathlib.Path(slice_path).unlink(missing_ok=True)
+
+        if search_start > 0.0:
+            chunk_lines = _offset_timed_lines(chunk_lines, search_start)
+        if not chunk_lines:
+            raise ValueError(f"Could not align lyrics after gap hint before line {chunk.start_line + 1}.")
+
+        aligned.extend(chunk_lines)
+        previous_end = max(previous_end, max(float(line.get("end", 0.0) or 0.0) for line in chunk_lines))
+
+    return aligned
 
 
 async def _whisper_verify_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
@@ -2046,12 +2227,7 @@ async def _run_sync_task(task: QueueTask) -> None:
     label = get_managed_spec(sync_model).label if sync_model in MODEL_SPECS else f"Whisper {sync_model}"
     task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 52}
     await _q_broadcast()
-    if sync_model == "qwen3-forced-aligner-0.6b":
-        lines = await _qwen_sync_worker(task, tmp_path, lyrics)
-    elif sync_model == "hubert-fa-combined":
-        lines = await _hubertfa_sync_worker(task, tmp_path, lyrics)
-    else:
-        lines = await _whisper_sync_worker(task, tmp_path, lyrics)
+    lines = await _sync_with_gap_hints(task, tmp_path, parsed_lyrics)
     lines = _apply_gap_hints_to_lines(lines, task.gap_hints)
     task.result = {"lines": lines, "text": lyrics, "gap_hints": task.gap_hints}
     task.progress = {"stage": "done", "msg": f"Done — {len(lines)} lines synced", "step": "done", "pct": 100}

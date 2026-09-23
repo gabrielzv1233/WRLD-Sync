@@ -30,6 +30,56 @@ class ParsedLyrics:
     gaps: tuple[GapHint, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class AlignmentChunk:
+    """A contiguous lyric section that can be forced-aligned independently."""
+
+    start_line: int
+    lines: tuple[str, ...]
+    before_gap: GapHint | None = None
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def build_alignment_chunks(parsed: ParsedLyrics) -> tuple[AlignmentChunk, ...]:
+    """Split parsed lyrics at gap hints while preserving each boundary policy.
+
+    A leading marker becomes before_gap on the first chunk. A trailing marker
+    is intentionally not turned into an empty chunk because there are no lyrics
+    after it to align; it is still retained in ParsedLyrics.gaps for output
+    policy and metadata.
+    """
+    if not parsed.lines:
+        return ()
+
+    gaps = {gap.position: gap for gap in parsed.gaps}
+    internal_boundaries = sorted(
+        position for position in gaps
+        if 0 < position < len(parsed.lines)
+    )
+
+    chunks: list[AlignmentChunk] = []
+    start = 0
+    before_gap = gaps.get(0)
+    for boundary in internal_boundaries:
+        chunks.append(AlignmentChunk(
+            start_line=start,
+            lines=parsed.lines[start:boundary],
+            before_gap=before_gap,
+        ))
+        start = boundary
+        before_gap = gaps[boundary]
+
+    chunks.append(AlignmentChunk(
+        start_line=start,
+        lines=parsed.lines[start:],
+        before_gap=before_gap,
+    ))
+    return tuple(chunk for chunk in chunks if chunk.lines)
+
+
 def _parse_marker_line(line: str) -> tuple[int, GapInterludeMode] | None:
     """Parse a line made entirely of one or more gap-control tokens."""
     stripped = line.strip()
