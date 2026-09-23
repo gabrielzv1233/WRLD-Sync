@@ -1096,7 +1096,11 @@ async function doSearch(q) {
   resultsHeaderText.textContent = 'Searching…';
   renderSearchSkeleton();
   try {
-    const data = await api('/api/search?q=' + encodeURIComponent(q));
+    const data = await api('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q, page_size: 20 }),
+    });
     if (generation !== searchGeneration || searchInput.value.trim() !== q || idMode) return;
     const songs = data.results ?? [];
     resultsHeaderText.innerHTML = `<span class="results-query-prefix">${songs.length} result${songs.length !== 1 ? 's' : ''} for &quot;</span><span class="results-query-value">${esc(q)}</span><span class="results-query-quote">&quot;</span>`;
@@ -3880,7 +3884,7 @@ async function api(url, opts = {}, timeout = 30_000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
   try {
-    const r = await fetch(url, { ...opts, signal: ctrl.signal });
+    const r = await fetch(url, { cache: 'no-store', ...opts, signal: ctrl.signal });
     if (!r.ok) { const body = await r.text(); throw new Error(`HTTP ${r.status}: ${body}`); }
     return r.json();
   } finally { clearTimeout(timer); }

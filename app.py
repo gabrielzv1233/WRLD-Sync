@@ -868,9 +868,12 @@ async def ensure_audio(song_path: str):
 
     async with _audio_cache_lock:
         if _audio_cache and _audio_cache["path"] == song_path:
-            yield {"stage": "downloading", "pct": 100, "msg": "Audio already cached ✓"}
-            yield {"_path": _audio_cache["file"]}
-            return
+            cached_file = pathlib.Path(_audio_cache["file"])
+            if cached_file.is_file() and cached_file.stat().st_size > 0:
+                yield {"stage": "downloading", "pct": 100, "msg": "Audio already cached ✓"}
+                yield {"_path": str(cached_file)}
+                return
+            _audio_cache = None
 
         # New song — evict old cached file
         if _audio_cache:
@@ -2589,9 +2592,30 @@ async def jw_get(path: str, params: dict | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 
+class SearchRequest(BaseModel):
+    q: str
+    page_size: int = 20
+
+
+async def _search_catalog(q: str, page_size: int, response: Response) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    clean = str(q or "").strip()
+    if not clean:
+        return {"count": 0, "results": []}
+    return await jw_get(
+        "/songs/",
+        {"search": clean, "page_size": max(1, min(100, int(page_size)))},
+    )
+
+
 @app.get("/api/search")
-async def search(q: str, page_size: int = 20):
-    return await jw_get("/songs/", {"search": q, "page_size": page_size})
+async def search(q: str, response: Response, page_size: int = 20):
+    return await _search_catalog(q, page_size, response)
+
+
+@app.post("/api/search")
+async def search_post(req: SearchRequest, response: Response):
+    return await _search_catalog(req.q, req.page_size, response)
 
 
 @app.get("/api/song/{song_id}")
@@ -3046,41 +3070,45 @@ async def radio_random(
 
 
 @app.get("/api/stream")
-async def stream_audio(path: str, request: Request):
-    # Use httpx params so the path value is properly URL-encoded
-    # (paths can contain '&', spaces, etc. that would break the query string)
-    req_headers = {}
-    if "range" in request.headers:
-        req_headers["Range"] = request.headers["range"]
+async def stream_audio(path: str):
+    """Serve catalog audio as a local seekable file.
 
-    client = httpx.AsyncClient(timeout=None, follow_redirects=True)
+    The old route live-proxied the upstream response to the browser. That made
+    playback depend on every reverse proxy/tunnel preserving Range requests and
+    streaming semantics. Materializing through ensure_audio() gives playback
+    the same known-good bytes used by Sync/Transcribe, then FileResponse handles
+    browser byte ranges locally.
+    """
+    clean_path = str(path or "").strip()
+    if not clean_path:
+        raise HTTPException(400, "An audio path is required.")
+
+    local_path = ""
     try:
-        upstream_req = client.build_request(
-            "GET", BASE + "/files/download/",
-            params={"path": path},
-            headers=req_headers,
-        )
-        upstream = await client.send(upstream_req, stream=True)
+        async for event in ensure_audio(clean_path):
+            if "_path" in event:
+                local_path = str(event["_path"])
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            exc.response.status_code,
+            f"Audio download returned HTTP {exc.response.status_code}.",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Could not download catalog audio: {exc}") from exc
 
-        resp_headers = {"Accept-Ranges": "bytes"}
-        for key in ("content-type", "content-length", "content-range"):
-            if key in upstream.headers:
-                resp_headers[key] = upstream.headers[key]
-        if "content-type" not in resp_headers:
-            resp_headers["content-type"] = "audio/mpeg"
+    file_path = pathlib.Path(local_path)
+    if not local_path or not file_path.is_file() or file_path.stat().st_size <= 0:
+        raise HTTPException(502, "Catalog audio download did not produce a usable file.")
 
-        async def gen():
-            try:
-                async for chunk in upstream.aiter_bytes(32_768):
-                    yield chunk
-            finally:
-                await upstream.aclose()
-                await client.aclose()
-
-        return StreamingResponse(gen(), status_code=upstream.status_code, headers=resp_headers)
-    except Exception as e:
-        await client.aclose()
-        raise HTTPException(502, f"Upstream error: {e}")
+    media_type = mimetypes.guess_type(clean_path)[0] or "audio/mpeg"
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 class SyncRequest(BaseModel):
