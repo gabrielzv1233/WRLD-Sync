@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Literal
 import re
 
@@ -175,3 +176,76 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
         lines=tuple(lyric_lines),
         gaps=tuple(gaps_by_position[position] for position in sorted(gaps_by_position)),
     )
+
+
+def _normalize_anchor_word(value: str) -> str:
+    return re.sub(r"[^a-z0-9']+", "", str(value or "").lower())
+
+
+def find_alignment_anchor(
+    target_text: str,
+    transcript_words: list[dict],
+    *,
+    start_at: float = 0.0,
+    max_target_words: int = 10,
+) -> float | None:
+    """Return the earliest likely timestamp for target_text after start_at.
+
+    The first target word must itself be a close match. That prevents a fuzzy
+    window containing the right phrase later from anchoring on unrelated words
+    that happen to come before it.
+    """
+    target = [
+        _normalize_anchor_word(token)
+        for token in re.findall(r"\S+", str(target_text or ""))
+    ]
+    target = [token for token in target if token][:max(1, int(max_target_words))]
+    if not target:
+        return None
+
+    candidates: list[tuple[str, float, float]] = []
+    for raw in transcript_words:
+        token = _normalize_anchor_word(raw.get("word") or raw.get("text") or "")
+        if not token:
+            continue
+        try:
+            start = float(raw.get("start", 0.0) or 0.0)
+            end = float(raw.get("end", start) or start)
+        except (TypeError, ValueError):
+            continue
+        if end >= start_at:
+            candidates.append((token, start, end))
+
+    if not candidates:
+        return None
+
+    if len(target) == 1:
+        for token, start, _ in candidates:
+            if start >= start_at and token == target[0]:
+                return start
+        return None
+
+    threshold = 0.86 if len(target) == 2 else 0.78 if len(target) == 3 else 0.70
+    min_window = max(1, len(target) - 2)
+    max_window = len(target) + 2
+
+    for index, (first_token, start, _) in enumerate(candidates):
+        if start < start_at:
+            continue
+        first_score = SequenceMatcher(
+            None, target[0], first_token, autojunk=False
+        ).ratio()
+        if first_score < 0.78:
+            continue
+
+        best_score = 0.0
+        for size in range(min_window, max_window + 1):
+            window = [item[0] for item in candidates[index:index + size]]
+            if len(window) < min_window:
+                continue
+            score = SequenceMatcher(None, target, window, autojunk=False).ratio()
+            best_score = max(best_score, score)
+        if best_score >= threshold:
+            return start
+
+    return None

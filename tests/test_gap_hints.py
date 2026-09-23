@@ -93,3 +93,49 @@ def test_leading_gap_attaches_to_first_chunk_and_trailing_gap_does_not_make_empt
     assert chunks[0].before_gap.interlude == "force"
     assert parsed.gaps[-1].position == 2
     assert parsed.gaps[-1].interlude == "forbid"
+
+
+def test_anchor_search_uses_first_matching_phrase_after_barrier():
+    from gap_hints import find_alignment_anchor
+
+    words = [
+        {"word": "this", "start": 1.0, "end": 1.2},
+        {"word": "is", "start": 1.3, "end": 1.4},
+        {"word": "next", "start": 1.5, "end": 1.7},
+        {"word": "noise", "start": 5.0, "end": 5.2},
+        {"word": "this", "start": 8.0, "end": 8.2},
+        {"word": "is", "start": 8.3, "end": 8.4},
+        {"word": "next", "start": 8.5, "end": 8.7},
+    ]
+
+    assert find_alignment_anchor("this is next", words, start_at=0.0) == 1.0
+    assert find_alignment_anchor("this is next", words, start_at=4.0) == 8.0
+
+
+def test_anchor_search_does_not_anchor_on_unrelated_prefix_words():
+    from gap_hints import find_alignment_anchor
+
+    words = [
+        {"word": "blah", "start": 0.0, "end": 0.2},
+        {"word": "blah", "start": 0.3, "end": 0.5},
+        {"word": "this", "start": 2.0, "end": 2.2},
+        {"word": "is", "start": 2.3, "end": 2.4},
+        {"word": "the", "start": 2.5, "end": 2.6},
+        {"word": "next", "start": 2.7, "end": 2.9},
+        {"word": "lyric", "start": 3.0, "end": 3.2},
+    ]
+
+    assert find_alignment_anchor("this is the next lyric", words) == 2.0
+
+
+def test_anchor_search_can_tolerate_small_first_word_asr_error():
+    from gap_hints import find_alignment_anchor
+
+    words = [
+        {"word": "gunna", "start": 12.0, "end": 12.2},
+        {"word": "make", "start": 12.3, "end": 12.5},
+        {"word": "it", "start": 12.6, "end": 12.7},
+        {"word": "back", "start": 12.8, "end": 13.0},
+    ]
+
+    assert find_alignment_anchor("gonna make it back", words, start_at=10.0) == 12.0

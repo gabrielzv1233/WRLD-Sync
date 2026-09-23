@@ -24,7 +24,7 @@ from collections import deque
 
 from processing_progress import ProcessingProgress, RuntimeHistory
 from youtube_lyrics import extract_youtube_lyrics
-from gap_hints import build_alignment_chunks, parse_lyrics_gap_hints
+from gap_hints import build_alignment_chunks, find_alignment_anchor, parse_lyrics_gap_hints
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -1409,15 +1409,16 @@ def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[
 
 
 def _gap_hint_guard_seconds(hint: dict | None) -> float:
-    """Small hard barrier before a post-gap chunk may begin.
+    """Hard minimum before a post-gap lyric can be considered.
 
-    Strength is deliberately a bias rather than an expected gap duration. The
-    aligner still chooses the real timestamp later in the remaining audio.
+    Strength 1 stays permissive for short non-interlude pauses. Extra markers
+    double the guard, so 2[...] / repeated [...] can reject increasingly early
+    false matches without pretending the number is an exact gap duration.
     """
     if not hint:
         return 0.0
-    strength = max(1, int(hint.get("strength", 1) or 1))
-    return min(3.0, 0.35 * strength)
+    strength = max(1, min(7, int(hint.get("strength", 1) or 1)))
+    return min(12.0, 0.25 * (2 ** (strength - 1)))
 
 
 def _gap_hint_nonspeech_skip(hint: dict | None) -> float | None:
@@ -1480,6 +1481,26 @@ def _offset_timed_lines(lines: list[dict], offset: float) -> list[dict]:
         line["words"] = words
         shifted.append(line)
     return shifted
+
+
+def _flatten_timed_words(lines: list[dict]) -> list[dict]:
+    """Flatten timestamped ASR output into the word stream used by gap anchors."""
+    words: list[dict] = []
+    for line in lines:
+        timed_words = list(line.get("words") or [])
+        if timed_words:
+            words.extend(timed_words)
+            continue
+
+        text = str(line.get("line") or "").strip()
+        if not text:
+            continue
+        start = float(line.get("start", 0.0) or 0.0)
+        end = float(line.get("end", start) or start)
+        for token in re.findall(r"\S+", text):
+            words.append({"word": token, "start": start, "end": end})
+
+    return sorted(words, key=lambda item: float(item.get("start", 0.0) or 0.0))
 
 
 def _align(
@@ -2082,6 +2103,42 @@ async def _whisper_sync_worker(
     )
 
 
+async def _gap_anchor_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dict]:
+    """Build one timestamp map used to locate every lyric section after a gap."""
+    sync_model = task.sync_model or ALIGN_MODEL_SIZE
+    if sync_model in WHISPER_MODELS:
+        model_id = sync_model
+        model_obj = await get_align_model(model_id)
+    else:
+        # Qwen FA and HuBERT do not free-transcribe. Whisper base is small,
+        # runtime-managed, and only loaded when the user actually uses a gap.
+        model_id = "base"
+        model_obj = await get_verify_model(model_id)
+
+    def run(report):
+        return model_obj.transcribe(
+            tmp_path,
+            word_timestamps=True,
+            verbose=None,
+            progress_callback=report.update,
+        )
+
+    result = await _run_model_job(
+        task,
+        tmp_path,
+        model_id,
+        run,
+        phase="locating_gaps",
+        label="Locating lyric gap anchors…",
+        start=54,
+        end=68,
+    )
+    return _sanitize_timed_lines(
+        _lines_from_alignment(result, ""),
+        inline_parenthetical_background=task.inline_parenthetical_background,
+    )
+
+
 async def _run_sync_model_once(
     task: QueueTask,
     tmp_path: str,
@@ -2114,6 +2171,8 @@ async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics) ->
         return await _run_sync_model_once(task, tmp_path, parsed_lyrics.text)
 
     duration = await asyncio.to_thread(_processing_audio_duration, tmp_path)
+    anchor_lines = await _gap_anchor_transcribe_worker(task, tmp_path)
+    anchor_words = _flatten_timed_words(anchor_lines)
     aligned: list[dict] = []
     previous_end = 0.0
     first_chunk_to_align = 0
@@ -2145,6 +2204,15 @@ async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics) ->
         search_start = previous_end if index else 0.0
         if hint is not None:
             search_start += _gap_hint_guard_seconds(hint)
+            anchor_start = find_alignment_anchor(
+                chunk.text,
+                anchor_words,
+                start_at=search_start,
+            )
+            if anchor_start is not None:
+                # Give the forced aligner a short lead-in before the located
+                # lyric onset, while never crossing back through the hard guard.
+                search_start = max(search_start, anchor_start - 0.6)
 
         if duration > 0 and search_start >= duration - 0.05:
             raise ValueError(
