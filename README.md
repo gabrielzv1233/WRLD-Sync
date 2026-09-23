@@ -52,6 +52,8 @@ On Windows, the backend also exposes the CUDA PyTorch wheel's bundled `torch/lib
 3. Hit **Auto** to run a full transcription with the selected transcription model, or **Sync** to align the current raw Lyrics text without retranscribing
 4. Copy or propose **Apple TTML** with real line start/end times and optional per-word timing. Legacy LRC import/export remains available.
 
+Manual Sync boundaries like `[...]`, `11.5[...]`, and `+[...]` are documented in [Manual lyric gap hints](docs/gap-hints.md).
+
 For your own audio, click the Local Audio button. It opens a dedicated landing view where you can either browse/upload a file or paste a direct HTTP(S) audio URL. Local files use embedded title/artist/cover tags when available and are identified by a SHA-256 hash of decoded audio rather than filename or metadata.
 
 ## DB Manager

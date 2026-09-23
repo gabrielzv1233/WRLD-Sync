@@ -7,7 +7,12 @@ import re
 
 GapInterludeMode = Literal["auto", "force", "forbid"]
 
-_MARKER_TOKEN_RE = re.compile(r"(?P<count>\d+)?(?P<mode>[+-]?)(?P<marker>\[\.\.\.\])")
+_MARKER_TOKEN_RE = re.compile(
+    r"(?P<seconds>(?:\d+(?:\.\d+)?|\.\d+))?"
+    r"(?P<mode>[+-]?)"
+    r"(?P<marker>\[\.\.\.\])"
+)
+_CONTROLISH_RE = re.compile(r"[0-9.+\-\s\[\]]+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,10 +21,11 @@ class GapHint:
 
     position is the number of lyric lines before this gap. A value of 0 means
     the gap is before the first lyric; len(lyrics) means it is after the last.
+    seconds is a literal minimum forward distance, not the final gap duration.
     """
 
     position: int
-    strength: int = 1
+    seconds: float = 0.25
     interlude: GapInterludeMode = "auto"
     source: str = "[...]"
 
@@ -81,56 +87,54 @@ def build_alignment_chunks(parsed: ParsedLyrics) -> tuple[AlignmentChunk, ...]:
     return tuple(chunk for chunk in chunks if chunk.lines)
 
 
-def _parse_marker_line(line: str) -> tuple[int, GapInterludeMode] | None:
-    """Parse a line made entirely of one or more gap-control tokens."""
+def _parse_marker_line(line: str) -> tuple[float, GapInterludeMode] | None:
+    """Parse one manual gap-control line."""
     stripped = line.strip()
     if not stripped:
         return None
 
-    matches = list(_MARKER_TOKEN_RE.finditer(stripped))
-    if not matches:
+    match = _MARKER_TOKEN_RE.fullmatch(stripped)
+    if not match:
+        # A line that consists only of marker-ish punctuation/numbers is almost
+        # certainly a malformed control. Fail visibly instead of sending it to
+        # the aligner as fake lyric text.
+        if "[...]" in stripped and _CONTROLISH_RE.fullmatch(stripped):
+            raise ValueError(
+                f"Invalid gap hint syntax: {stripped}. "
+                "Use forms such as [...], 1.5[...], 1.5+[...], or 1.5-[...]."
+            )
         return None
 
-    cursor = 0
-    total_strength = 0
-    explicit_modes: set[GapInterludeMode] = set()
-    for match in matches:
-        if stripped[cursor:match.start()].strip():
-            return None
-        cursor = match.end()
-
-        count = int(match.group("count") or "1")
-        if count < 1:
-            raise ValueError("Gap hint strength must be at least 1.")
-        total_strength += count
-
-        marker_mode = match.group("mode")
-        if marker_mode == "+":
-            explicit_modes.add("force")
-        elif marker_mode == "-":
-            explicit_modes.add("forbid")
-
-    if stripped[cursor:].strip():
-        return None
-    if "force" in explicit_modes and "forbid" in explicit_modes:
-        raise ValueError(f"Conflicting gap hint controls on one line: {stripped}")
-
-    interlude: GapInterludeMode = next(iter(explicit_modes), "auto")
-    return total_strength, interlude
+    seconds = float(match.group("seconds") or "0.25")
+    marker_mode = match.group("mode")
+    interlude: GapInterludeMode = (
+        "force" if marker_mode == "+"
+        else "forbid" if marker_mode == "-"
+        else "auto"
+    )
+    return seconds, interlude
 
 
-def _merge_gap(existing: GapHint | None, *, position: int, strength: int,
+def _merge_gap(existing: GapHint | None, *, position: int, seconds: float,
                interlude: GapInterludeMode, source: str) -> GapHint:
     if existing is None:
-        return GapHint(position=position, strength=strength, interlude=interlude, source=source)
+        return GapHint(
+            position=position,
+            seconds=seconds,
+            interlude=interlude,
+            source=source,
+        )
 
     explicit = {mode for mode in (existing.interlude, interlude) if mode != "auto"}
     if "force" in explicit and "forbid" in explicit:
         raise ValueError(f"Conflicting gap hint controls at lyric position {position}.")
     merged_mode: GapInterludeMode = next(iter(explicit), "auto")
+
+    # Consecutive controls refer to the same boundary. The larger minimum is
+    # the stricter constraint, so durations are not added together.
     return GapHint(
         position=position,
-        strength=existing.strength + strength,
+        seconds=max(existing.seconds, seconds),
         interlude=merged_mode,
         source=f"{existing.source}\n{source}",
     )
@@ -140,15 +144,15 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
     """Strip manual gap controls from lyrics and return their timing metadata.
 
     Syntax:
-      [...]       expected gap, automatic interlude decision
-      -[...]      expected gap, never emit an interlude
-      +[...]      expected gap, force an interlude
-      2+[...]     strength 2 forced gap
-      +[...]+[...] equivalent to strength 2 forced gap
+      [...]       0.25s minimum gap, automatic interlude decision
+      -[...]      0.25s minimum gap, never emit an interlude
+      +[...]      0.25s minimum gap, force an interlude
+      2[...]      2s minimum gap
+      11.5+[...]  11.5s minimum gap, force an interlude
+      .5-[...]    0.5s minimum gap, never emit an interlude
 
-    Consecutive marker lines at the same position accumulate strength. Plain
-    lyric lines containing "[...]" are left untouched unless the whole line is
-    composed only of valid gap-control tokens.
+    Consecutive marker lines at the same position keep the larger minimum.
+    Plain lyric lines containing "[...]" inline are left untouched.
     """
     lyric_lines: list[str] = []
     gaps_by_position: dict[int, GapHint] = {}
@@ -156,12 +160,12 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
     for raw_line in str(lyrics or "").splitlines():
         parsed = _parse_marker_line(raw_line)
         if parsed is not None:
-            strength, interlude = parsed
+            seconds, interlude = parsed
             position = len(lyric_lines)
             gaps_by_position[position] = _merge_gap(
                 gaps_by_position.get(position),
                 position=position,
-                strength=strength,
+                seconds=seconds,
                 interlude=interlude,
                 source=raw_line.strip(),
             )

@@ -808,7 +808,7 @@ def _store_processed_lyrics(task) -> None:
             "nonspeech_skip": 2.0 if fast_mode else 5.0,
             "suppress_silence": True,
             "suppress_word_ts": True,
-            "gap_strategy": "chunked-audio-barriers-v1" if getattr(task, "gap_hints", []) else "none",
+            "gap_strategy": "literal-seconds+asr-anchor-v2" if getattr(task, "gap_hints", []) else "none",
         },
     }
     lyrics_text = str(result.get("text") or getattr(task, "lyrics", "") or "")
@@ -1384,10 +1384,28 @@ async def _q_broadcast() -> None:
 
 # ── Shared whisper helpers ────────────────────────────────────────────────
 
+def _gap_hint_seconds(hint: dict | None) -> float:
+    """Read literal seconds, including experimental strength-era metadata."""
+    if not hint:
+        return 0.0
+    if "seconds" in hint:
+        try:
+            return max(0.0, float(hint.get("seconds", 0.25)))
+        except (TypeError, ValueError):
+            return 0.25
+
+    # Compatibility for cached results created before literal-second syntax.
+    try:
+        strength = max(1, min(7, int(hint.get("strength", 1) or 1)))
+    except (TypeError, ValueError):
+        strength = 1
+    return min(12.0, 0.25 * (2 ** (strength - 1)))
+
+
 def _serialize_gap_hint(hint) -> dict:
     return {
         "position": int(hint.position),
-        "strength": max(1, int(hint.strength)),
+        "seconds": max(0.0, float(hint.seconds)),
         "interlude": str(hint.interlude),
         "source": str(hint.source),
     }
@@ -1401,7 +1419,7 @@ def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[
         position = int(hint.get("position", -1))
         if 0 < position < len(lines):
             lines[position - 1]["gap_after"] = {
-                "strength": max(1, int(hint.get("strength", 1) or 1)),
+                "seconds": _gap_hint_seconds(hint),
                 "interlude": str(hint.get("interlude") or "auto"),
                 "source": str(hint.get("source") or "[...]"),
             }
@@ -1409,24 +1427,13 @@ def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[
 
 
 def _gap_hint_guard_seconds(hint: dict | None) -> float:
-    """Hard minimum before a post-gap lyric can be considered.
-
-    Strength 1 stays permissive for short non-interlude pauses. Extra markers
-    double the guard, so 2[...] / repeated [...] can reject increasingly early
-    false matches without pretending the number is an exact gap duration.
-    """
-    if not hint:
-        return 0.0
-    strength = max(1, min(7, int(hint.get("strength", 1) or 1)))
-    return min(12.0, 0.25 * (2 ** (strength - 1)))
+    """Literal minimum time before a post-gap lyric can be considered."""
+    return _gap_hint_seconds(hint)
 
 
 def _gap_hint_nonspeech_skip(hint: dict | None) -> float | None:
-    """Make stable-ts more willing to jump over non-vocal audio after a hint."""
-    if not hint:
-        return None
-    strength = max(1, int(hint.get("strength", 1) or 1))
-    return max(0.3, 0.9 / strength)
+    """Use one gap-friendly stable-ts skip threshold independent of duration."""
+    return 0.5 if hint else None
 
 
 def _slice_alignment_audio(source_path: str, start_seconds: float) -> str:
@@ -3207,7 +3214,7 @@ def _sanitize_timed_lines(
         gap_after = raw.get("gap_after")
         if isinstance(gap_after, dict):
             cleaned_line["gap_after"] = {
-                "strength": max(1, int(gap_after.get("strength", 1) or 1)),
+                "seconds": _gap_hint_seconds(gap_after),
                 "interlude": str(gap_after.get("interlude") or "auto"),
                 "source": str(gap_after.get("source") or "[...]"),
             }
