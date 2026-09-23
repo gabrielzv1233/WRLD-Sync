@@ -51,7 +51,7 @@ import httpx
 import stable_whisper
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from rich.console import Console
@@ -2605,10 +2605,32 @@ async def _search_catalog(q: str, page_size: int, response: Response) -> dict:
     clean = str(q or "").strip()
     if not clean:
         return {"count": 0, "results": []}
-    return await jw_get(
+
+    data = await jw_get(
         "/songs/",
         {"search": clean, "page_size": max(1, min(100, int(page_size)))},
     )
+    raw_results = list(data.get("results") or []) if isinstance(data, dict) else []
+    # Search cards only need lightweight catalog metadata. Do not tunnel full
+    # lyrics/synced-lyrics/version payloads for every result.
+    results = [
+        {
+            "id": row.get("id"),
+            "name": row.get("name") or "",
+            "track_titles": row.get("track_titles") or [],
+            "image_url": row.get("image_url") or "",
+            "era": row.get("era") or {},
+            "category": row.get("category") or "",
+            "length": row.get("length") or "",
+            "path": row.get("path") or "",
+        }
+        for row in raw_results
+        if isinstance(row, dict)
+    ]
+    return {
+        "count": int(data.get("count", len(results)) or len(results)) if isinstance(data, dict) else len(results),
+        "results": results,
+    }
 
 
 @app.get("/api/search")
@@ -3070,6 +3092,24 @@ async def radio_random(
             continue
         return data
     raise HTTPException(404, "No matching song found after 50 attempts — try less restrictive filters.")
+
+
+@app.get("/api/playback")
+async def playback_audio(path: str):
+    """Redirect catalog playback directly to the public audio host.
+
+    This keeps large media bytes out of VS Code/dev tunnels. The frontend falls
+    back to /api/stream when the upstream browser request itself fails.
+    """
+    clean_path = str(path or "").strip()
+    if not clean_path:
+        raise HTTPException(400, "An audio path is required.")
+    upstream = BASE + "/files/download/?" + urllib.parse.urlencode({"path": clean_path})
+    return RedirectResponse(
+        upstream,
+        status_code=307,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/stream")

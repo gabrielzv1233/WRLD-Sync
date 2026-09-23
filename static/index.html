@@ -460,6 +460,9 @@ let lastVerifyResults = [];
 let autoFollow     = true;
 let localFilePath  = '';    // server-side path of uploaded local file (empty = API mode)
 let currentLocalTrack = null; // metadata/hash for local-file mode
+let catalogAudioPath = '';
+let catalogAudioFallbackActive = false;
+let audioPlayIntent = false;
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
 const searchInput      = document.getElementById('searchInput');
@@ -545,19 +548,30 @@ function startPlayerUiLoop() {
   };
   _playerUiRaf = requestAnimationFrame(frame);
 }
+function isBenignPlayInterruption(err) {
+  const message = String(err?.message || err || '');
+  return err?.name === 'AbortError'
+    || /play\(\) request was interrupted by a call to (?:pause|load)\(\)/i.test(message);
+}
 function safePlayAudio() {
   if (!audioPlayer.src) return Promise.resolve(false);
+  audioPlayIntent = true;
   return audioPlayer.play()
     .then(() => true)
     .catch(err => {
+      if (isBenignPlayInterruption(err) || catalogAudioFallbackActive) return false;
       setSyncStatus(`Audio playback failed: ${err?.message || err || 'unknown browser media error'}`, 'error');
       return false;
     });
 }
+function pauseAudio() {
+  audioPlayIntent = false;
+  audioPlayer.pause();
+}
 playerPlayBtn.addEventListener('click', () => {
   if (!audioPlayer.src) return;
   if (audioPlayer.paused) safePlayAudio();
-  else audioPlayer.pause();
+  else pauseAudio();
 });
 seekRange.addEventListener('input', () => {
   if (!Number.isFinite(audioPlayer.duration) || audioPlayer.duration <= 0) return;
@@ -581,6 +595,19 @@ audioPlayer.addEventListener('ended', () => { updateNowPlayingTitleState(); upda
 audioPlayer.addEventListener('emptied', () => { updateNowPlayingTitleState(); updatePlayerUi(); });
 audioPlayer.addEventListener('error', () => {
   const err = audioPlayer.error;
+
+  if (catalogAudioPath && !catalogAudioFallbackActive) {
+    catalogAudioFallbackActive = true;
+    const resumeAfterFallback = audioPlayIntent;
+    setSyncStatus('Direct audio playback failed; retrying through the WRLD Sync cache…');
+    audioPlayer.src = `/api/stream?path=${encodeURIComponent(catalogAudioPath)}`;
+    audioPlayer.load();
+    if (resumeAfterFallback) {
+      audioPlayer.addEventListener('canplay', () => safePlayAudio(), { once: true });
+    }
+    return;
+  }
+
   const messages = {
     1: 'audio loading was aborted',
     2: 'network error while loading audio',
@@ -966,6 +993,7 @@ randomBtn.addEventListener('click', async () => {
 
 // ── Search ────────────────────────────────────────────────────────────────
 let searchTimer = null;
+let searchRequestController = null;
 let idMode = false;
 let searchGeneration = 0;
 
@@ -1152,14 +1180,16 @@ searchDropTarget.addEventListener('drop', async (e) => {
 
 async function doSearch(q) {
   const generation = ++searchGeneration;
+  if (searchRequestController) searchRequestController.abort();
+  const controller = new AbortController();
+  searchRequestController = controller;
   resultsHeaderText.textContent = 'Searching…';
   renderSearchSkeleton();
   try {
-    const data = await api('/api/search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q, page_size: 20 }),
-    });
+    const data = await api(
+      `/api/search?q=${encodeURIComponent(q)}&page_size=20`,
+      { signal: controller.signal },
+    );
     if (generation !== searchGeneration || searchInput.value.trim() !== q || idMode) return;
     const songs = data.results ?? [];
     resultsHeaderText.innerHTML = `<span class="results-query-prefix">${songs.length} result${songs.length !== 1 ? 's' : ''} for &quot;</span><span class="results-query-value">${esc(q)}</span><span class="results-query-quote">&quot;</span>`;
@@ -1172,9 +1202,11 @@ async function doSearch(q) {
       el.addEventListener('click', () => loadSong(Number(el.dataset.id)).catch(() => {}))
     );
   } catch (e) {
-    if (generation !== searchGeneration) return;
+    if (e?.name === 'AbortError' || generation !== searchGeneration) return;
     resultsHeaderText.textContent = 'Search failed — try again';
     renderSearchState('Could not search', 'Check your connection to juicewrldapi.com, then try again.');
+  } finally {
+    if (searchRequestController === controller) searchRequestController = null;
   }
 }
 
@@ -1279,10 +1311,16 @@ async function loadSongData(song) {
     }
 
     if (song.path) {
-      audioPlayer.src = `/api/stream?path=${encodeURIComponent(song.path)}`;
+      catalogAudioPath = song.path;
+      catalogAudioFallbackActive = false;
+      audioPlayIntent = false;
+      audioPlayer.src = `/api/playback?path=${encodeURIComponent(song.path)}`;
       audioPlayer.load();
       updateNowPlayingTitleState();
     } else {
+      catalogAudioPath = '';
+      catalogAudioFallbackActive = false;
+      audioPlayIntent = false;
       audioPlayer.src = '';
       syncBtn.disabled = true; autoWhisperBtn.disabled = true; transcribeBtn.disabled = true;
       setSyncStatus('No audio file for this song.', 'error');
@@ -2726,7 +2764,7 @@ document.addEventListener('keydown', (e) => {
   if (e.target.closest?.('input, textarea, select, button, a, [contenteditable="true"]')) return;
   if (OUR_KEYS.has(e.key)) e.preventDefault();
   if (e.key === '`') { setLyricAutoFollow(!autoFollow, { reanchor: !autoFollow }); return; }
-  if (e.key === ' ') { audioPlayer.paused ? safePlayAudio() : audioPlayer.pause(); return; }
+  if (e.key === ' ') { audioPlayer.paused ? safePlayAudio() : pauseAudio(); return; }
   if (!syncedLines.length) return;
 
   const idx = pinnedIdx >= 0 ? pinnedIdx : activeLineIdx;
@@ -3647,6 +3685,9 @@ function applyCachedLocalProcessing(processed) {
 async function loadLocalTrack(meta) {
   if (!meta?.track_hash || !meta?.path) throw new Error('Local track metadata is incomplete.');
   currentSong = null;
+  catalogAudioPath = '';
+  catalogAudioFallbackActive = false;
+  audioPlayIntent = false;
   currentLocalTrack = meta;
   localFilePath = meta.path;
   syncedLines = []; activeLineIdx = -1; pinnedIdx = -1; customLyrics = ''; currentTtmlSource = '';
@@ -4006,12 +4047,24 @@ function setSyncStatus(html, cls = '') {
 }
 async function api(url, opts = {}, timeout = 30_000) {
   const ctrl = new AbortController();
+  const { signal: externalSignal, ...fetchOpts } = opts;
+  let onExternalAbort = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) ctrl.abort(externalSignal.reason);
+    else {
+      onExternalAbort = () => ctrl.abort(externalSignal.reason);
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+  }
   const timer = setTimeout(() => ctrl.abort(), timeout);
   try {
-    const r = await fetch(url, { cache: 'no-store', ...opts, signal: ctrl.signal });
+    const r = await fetch(url, { cache: 'no-store', ...fetchOpts, signal: ctrl.signal });
     if (!r.ok) { const body = await r.text(); throw new Error(`HTTP ${r.status}: ${body}`); }
     return r.json();
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal && onExternalAbort) externalSignal.removeEventListener('abort', onExternalAbort);
+  }
 }
 </script>
 </body>
