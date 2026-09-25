@@ -24,6 +24,7 @@ from collections import deque
 
 from processing_progress import ProcessingProgress, RuntimeHistory
 from youtube_lyrics import extract_youtube_lyrics
+from gap_hints import build_alignment_chunks, find_alignment_anchor, parse_lyrics_gap_hints, should_emit_leading_interlude
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -50,7 +51,7 @@ import httpx
 import stable_whisper
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from rich.console import Console
@@ -798,6 +799,7 @@ def _store_processed_lyrics(task) -> None:
         "separator_model": str(getattr(task, "separator_model", "") or ""),
         "separator_target": str(getattr(task, "separator_target", "") or "all_vocals"),
         "analysis_source": dict(getattr(task, "analysis_source", {}) or {}),
+        "gap_hints": list(getattr(task, "gap_hints", []) or []),
         "background_vocals": "parenthetical-inline-toggle",
         "alignment": {
             "original_split": True,
@@ -806,6 +808,7 @@ def _store_processed_lyrics(task) -> None:
             "nonspeech_skip": 2.0 if fast_mode else 5.0,
             "suppress_silence": True,
             "suppress_word_ts": True,
+            "gap_strategy": "literal-seconds+asr-anchor-v2" if getattr(task, "gap_hints", []) else "none",
         },
     }
     lyrics_text = str(result.get("text") or getattr(task, "lyrics", "") or "")
@@ -865,9 +868,12 @@ async def ensure_audio(song_path: str):
 
     async with _audio_cache_lock:
         if _audio_cache and _audio_cache["path"] == song_path:
-            yield {"stage": "downloading", "pct": 100, "msg": "Audio already cached ✓"}
-            yield {"_path": _audio_cache["file"]}
-            return
+            cached_file = pathlib.Path(_audio_cache["file"])
+            if cached_file.is_file() and cached_file.stat().st_size > 0:
+                yield {"stage": "downloading", "pct": 100, "msg": "Audio already cached ✓"}
+                yield {"_path": str(cached_file)}
+                return
+            _audio_cache = None
 
         # New song — evict old cached file
         if _audio_cache:
@@ -882,7 +888,7 @@ async def ensure_audio(song_path: str):
             tmp_path = tmp.name
 
         downloaded, last_pct = 0, -1
-        async with httpx.AsyncClient(timeout=180) as client:
+        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
             async with client.stream(
                 "GET", BASE + "/files/download/", params={"path": song_path}
             ) as r:
@@ -1062,7 +1068,14 @@ def _load_parakeet(model_id: str):
 def _load_hubertfa():
     if not hubert_installed():
         raise RuntimeError("HuBERT FA combined is not installed yet. Wait for its model-download queue task.")
-    return HubertFAEngine()
+    engine = HubertFAEngine(device_pref=DEVICE_PREF)
+    active = " → ".join(engine.onnx_active_providers) or "none"
+    available = ", ".join(engine.onnx_available_providers) or "none"
+    CONSOLE.print(
+        f"[green]HuBERT ONNX[/green] · preference {DEVICE_PREF} · active {active} "
+        f"[dim](available: {available})[/dim]"
+    )
+    return engine
 
 
 def _runtime_model_label(model_id: str) -> str:
@@ -1147,6 +1160,7 @@ class QueueTask:
     separator_model: str = "uvr-bs-roformer"
     separator_target: str = "all_vocals"
     analysis_source: dict = dc_field(default_factory=dict)
+    gap_hints: list[dict] = dc_field(default_factory=list)
     status: str = "pending"   # pending|running|done|error|cancelled
     progress: dict = dc_field(default_factory=dict)
     error: str = ""
@@ -1183,6 +1197,7 @@ class QueueTask:
                 "separator_model": self.separator_model,
                 "separator_target": self.separator_target,
                 "analysis_source": self.analysis_source,
+                "gap_hints": self.gap_hints,
                 "sync_model": self.sync_model or ALIGN_MODEL_SIZE,
                 "transcribe_model": self.transcribe_model or VERIFY_MODEL_SIZE,
             },
@@ -1379,17 +1394,157 @@ async def _q_broadcast() -> None:
 
 # ── Shared whisper helpers ────────────────────────────────────────────────
 
-def _align(model_obj, tmp_path: str, lyrics: str, fast_mode: bool = False, progress_callback=None):
+def _gap_hint_seconds(hint: dict | None) -> float:
+    """Read literal seconds, including experimental strength-era metadata."""
+    if not hint:
+        return 0.0
+    if "seconds" in hint:
+        try:
+            return max(0.0, float(hint.get("seconds", 0.25)))
+        except (TypeError, ValueError):
+            return 0.25
+
+    # Compatibility for cached results created before literal-second syntax.
+    try:
+        strength = max(1, min(7, int(hint.get("strength", 1) or 1)))
+    except (TypeError, ValueError):
+        strength = 1
+    return min(12.0, 0.25 * (2 ** (strength - 1)))
+
+
+def _serialize_gap_hint(hint) -> dict:
+    return {
+        "position": int(hint.position),
+        "seconds": max(0.0, float(hint.seconds)),
+        "interlude": str(hint.interlude),
+        "source": str(hint.source),
+    }
+
+
+def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[dict]:
+    """Attach leading/between-line controls without turning them into lyrics."""
+    if not lines or not gap_hints:
+        return lines
+    for hint in gap_hints:
+        position = int(hint.get("position", -1))
+        metadata = {
+            "seconds": _gap_hint_seconds(hint),
+            "interlude": str(hint.get("interlude") or "auto"),
+            "source": str(hint.get("source") or "[...]"),
+        }
+        if position == 0:
+            lines[0]["gap_before"] = metadata
+        elif 0 < position < len(lines):
+            lines[position - 1]["gap_after"] = metadata
+    return lines
+
+
+def _gap_hint_guard_seconds(hint: dict | None) -> float:
+    """Literal minimum time before a post-gap lyric can be considered."""
+    return _gap_hint_seconds(hint)
+
+
+def _gap_hint_nonspeech_skip(hint: dict | None) -> float | None:
+    """Use one gap-friendly stable-ts skip threshold independent of duration."""
+    return 0.5 if hint else None
+
+
+def _slice_alignment_audio(source_path: str, start_seconds: float) -> str:
+    """Create an accurate 16 kHz mono remainder clip beginning at start_seconds."""
+    start_seconds = max(0.0, float(start_seconds))
+    if start_seconds <= 0.001:
+        return source_path
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        sliced_path = tmp.name
+
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", source_path,
+        "-ss", f"{start_seconds:.3f}",
+        "-map", "0:a:0",
+        "-vn", "-sn", "-dn",
+        "-ac", "1", "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        sliced_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+        )
+    except Exception:
+        pathlib.Path(sliced_path).unlink(missing_ok=True)
+        raise
+    if proc.returncode != 0 or not pathlib.Path(sliced_path).is_file() or not pathlib.Path(sliced_path).stat().st_size:
+        pathlib.Path(sliced_path).unlink(missing_ok=True)
+        raise RuntimeError(proc.stderr.strip() or "Could not prepare post-gap alignment audio.")
+    return sliced_path
+
+
+def _offset_timed_lines(lines: list[dict], offset: float) -> list[dict]:
+    offset = max(0.0, float(offset))
+    if offset <= 0.0:
+        return lines
+
+    shifted: list[dict] = []
+    for raw in lines:
+        line = dict(raw)
+        line["start"] = round(float(raw.get("start", 0.0) or 0.0) + offset, 3)
+        line["end"] = round(float(raw.get("end", 0.0) or 0.0) + offset, 3)
+        words = []
+        for raw_word in list(raw.get("words") or []):
+            word = dict(raw_word)
+            word["start"] = round(float(raw_word.get("start", 0.0) or 0.0) + offset, 3)
+            word["end"] = round(float(raw_word.get("end", 0.0) or 0.0) + offset, 3)
+            words.append(word)
+        line["words"] = words
+        shifted.append(line)
+    return shifted
+
+
+def _flatten_timed_words(lines: list[dict]) -> list[dict]:
+    """Flatten timestamped ASR output into the word stream used by gap anchors."""
+    words: list[dict] = []
+    for line in lines:
+        timed_words = list(line.get("words") or [])
+        if timed_words:
+            words.extend(timed_words)
+            continue
+
+        text = str(line.get("line") or "").strip()
+        if not text:
+            continue
+        start = float(line.get("start", 0.0) or 0.0)
+        end = float(line.get("end", start) or start)
+        for token in re.findall(r"\S+", text):
+            words.append({"word": token, "start": start, "end": end})
+
+    return sorted(words, key=lambda item: float(item.get("start", 0.0) or 0.0))
+
+
+def _align(
+    model_obj,
+    tmp_path: str,
+    lyrics: str,
+    fast_mode: bool = False,
+    progress_callback=None,
+    nonspeech_skip_override: float | None = None,
+):
     # original_split=True keeps one output segment per input lyric line.
     # Optional fast alignment remains available internally for compatibility.
-    # The UI Auto action now performs a full transcription instead; Sync uses
-    # the normal alignment path for the raw Lyrics text.
+    # Gap-hinted chunks can lower nonspeech_skip so stable-ts is willing to
+    # traverse instrumental/non-vocal sections instead of compressing lyrics
+    # toward the beginning of the remainder clip.
+    nonspeech_skip = (
+        float(nonspeech_skip_override)
+        if nonspeech_skip_override is not None
+        else (2.0 if fast_mode else 5.0)
+    )
     return model_obj.align(
         tmp_path, lyrics, language="en",
         original_split=True,
-        # Let stable-ts keep real silence between words/lines. The optional
-        # internal fast path uses a 2-second skip threshold; normal Sync uses 5s.
-        nonspeech_skip=2.0 if fast_mode else 5.0,
+        nonspeech_skip=nonspeech_skip,
         fast_mode=fast_mode,
         token_step=200 if fast_mode else 100,
         suppress_silence=True,
@@ -1926,7 +2081,13 @@ async def _selected_verify_worker(task: QueueTask, tmp_path: str, lyrics: str) -
     return await _whisper_verify_worker(task, tmp_path, lyrics)
 
 
-async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast_mode: bool = False) -> list[dict]:
+async def _whisper_sync_worker(
+    task: QueueTask,
+    tmp_path: str,
+    lyrics: str,
+    fast_mode: bool = False,
+    nonspeech_skip_override: float | None = None,
+) -> list[dict]:
     """Use stable-ts callbacks rather than parsing terminal timing strings."""
     label = "Aligning" if lyrics else "Transcribing"
     model_id = (task.sync_model or ALIGN_MODEL_SIZE) if lyrics else (task.transcribe_model or VERIFY_MODEL_SIZE)
@@ -1941,7 +2102,12 @@ async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast
             original_stderr = sys.stderr
             sys.stderr = _TeeStderr(spy, original_stderr)
             try:
-                return _align(model_obj, tmp_path, lyrics, fast_mode=fast_mode, progress_callback=report.update)
+                return _align(
+                    model_obj, tmp_path, lyrics,
+                    fast_mode=fast_mode,
+                    progress_callback=report.update,
+                    nonspeech_skip_override=nonspeech_skip_override,
+                )
             finally:
                 sys.stderr = original_stderr
         return model_obj.transcribe(tmp_path, word_timestamps=True, verbose=None, progress_callback=report.update)
@@ -1955,6 +2121,157 @@ async def _whisper_sync_worker(task: QueueTask, tmp_path: str, lyrics: str, fast
         _lines_from_alignment(result, lyrics),
         inline_parenthetical_background=task.inline_parenthetical_background,
     )
+
+
+async def _gap_anchor_transcribe_worker(task: QueueTask, tmp_path: str) -> list[dict]:
+    """Build one timestamp map used to locate every lyric section after a gap."""
+    sync_model = task.sync_model or ALIGN_MODEL_SIZE
+    if sync_model in WHISPER_MODELS:
+        model_id = sync_model
+        model_obj = await get_align_model(model_id)
+    else:
+        # Qwen FA and HuBERT do not free-transcribe. Whisper base is small,
+        # runtime-managed, and only loaded when the user actually uses a gap.
+        model_id = "base"
+        model_obj = await get_verify_model(model_id)
+
+    def run(report):
+        return model_obj.transcribe(
+            tmp_path,
+            word_timestamps=True,
+            verbose=None,
+            progress_callback=report.update,
+        )
+
+    result = await _run_model_job(
+        task,
+        tmp_path,
+        model_id,
+        run,
+        phase="locating_gaps",
+        label="Locating lyric gap anchors…",
+        start=54,
+        end=68,
+    )
+    return _sanitize_timed_lines(
+        _lines_from_alignment(result, ""),
+        inline_parenthetical_background=task.inline_parenthetical_background,
+    )
+
+
+async def _run_sync_model_once(
+    task: QueueTask,
+    tmp_path: str,
+    lyrics: str,
+    *,
+    nonspeech_skip_override: float | None = None,
+) -> list[dict]:
+    sync_model = task.sync_model or ALIGN_MODEL_SIZE
+    if sync_model == "qwen3-forced-aligner-0.6b":
+        return await _qwen_sync_worker(task, tmp_path, lyrics)
+    if sync_model == "hubert-fa-combined":
+        return await _hubertfa_sync_worker(task, tmp_path, lyrics)
+    return await _whisper_sync_worker(
+        task, tmp_path, lyrics,
+        nonspeech_skip_override=nonspeech_skip_override,
+    )
+
+
+async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics) -> list[dict]:
+    """Align marker-separated lyrics with hard forward-only audio barriers."""
+    chunks = build_alignment_chunks(parsed_lyrics)
+    if not chunks:
+        return []
+
+    # Preserve the original one-pass path exactly when there are no alignment
+    # boundaries. A trailing marker alone affects TTML policy but has no lyrics
+    # after it, so it does not need a second alignment pass.
+    has_alignment_boundary = any(chunk.before_gap is not None for chunk in chunks)
+    if not has_alignment_boundary:
+        return await _run_sync_model_once(task, tmp_path, parsed_lyrics.text)
+
+    duration = await asyncio.to_thread(_processing_audio_duration, tmp_path)
+    anchor_lines = await _gap_anchor_transcribe_worker(task, tmp_path)
+    anchor_words = _flatten_timed_words(anchor_lines)
+    aligned: list[dict] = []
+    previous_end = 0.0
+    first_chunk_to_align = 0
+
+    # When the lyrics do not start with a gap hint, do one normal full-text pass
+    # and keep only the lines before the first marker. This preserves the
+    # aligner's original global context for the pre-gap lyrics while discarding
+    # every timestamp after the boundary that may have been greedily compressed.
+    if chunks[0].before_gap is None and len(chunks) > 1:
+        baseline = await _run_sync_model_once(task, tmp_path, parsed_lyrics.text)
+        first_boundary = chunks[1].start_line
+        initial_lines = baseline[:first_boundary]
+        if len(initial_lines) < first_boundary:
+            # Backend did not preserve enough input lines. Fall back to aligning
+            # only the first chunk rather than manufacturing timestamps.
+            initial_lines = await _run_sync_model_once(task, tmp_path, chunks[0].text)
+        if not initial_lines:
+            raise ValueError("Could not align lyrics before the first gap hint.")
+        aligned.extend(initial_lines)
+        previous_end = max(float(line.get("end", 0.0) or 0.0) for line in initial_lines)
+        first_chunk_to_align = 1
+
+    for index in range(first_chunk_to_align, len(chunks)):
+        chunk = chunks[index]
+        if task.cancel_requested:
+            raise asyncio.CancelledError()
+
+        hint = _serialize_gap_hint(chunk.before_gap) if chunk.before_gap is not None else None
+        search_start = previous_end if index else 0.0
+        if hint is not None:
+            search_start += _gap_hint_guard_seconds(hint)
+            anchor_start = find_alignment_anchor(
+                chunk.text,
+                anchor_words,
+                start_at=search_start,
+            )
+            if anchor_start is not None:
+                # Give the forced aligner a short lead-in before the located
+                # lyric onset, while never crossing back through the hard guard.
+                search_start = max(search_start, anchor_start - 0.6)
+
+        if duration > 0 and search_start >= duration - 0.05:
+            raise ValueError(
+                f"Gap hint before lyric line {chunk.start_line + 1} moved alignment past the end of the audio."
+            )
+
+        slice_path = tmp_path
+        cleanup_slice = False
+        if search_start > 0.001:
+            task.progress = {
+                "stage": "gap_boundary",
+                "msg": f"Applying lyric gap boundary {index + 1}/{len(chunks)}…",
+                "step": "aligning",
+                "pct": 54,
+            }
+            await _q_broadcast()
+            slice_path = await asyncio.to_thread(_slice_alignment_audio, tmp_path, search_start)
+            cleanup_slice = True
+
+        try:
+            chunk_lines = await _run_sync_model_once(
+                task,
+                slice_path,
+                chunk.text,
+                nonspeech_skip_override=_gap_hint_nonspeech_skip(hint),
+            )
+        finally:
+            if cleanup_slice:
+                pathlib.Path(slice_path).unlink(missing_ok=True)
+
+        if search_start > 0.0:
+            chunk_lines = _offset_timed_lines(chunk_lines, search_start)
+        if not chunk_lines:
+            raise ValueError(f"Could not align lyrics after gap hint before line {chunk.start_line + 1}.")
+
+        aligned.extend(chunk_lines)
+        previous_end = max(previous_end, max(float(line.get("end", 0.0) or 0.0) for line in chunk_lines))
+
+    return aligned
 
 
 async def _whisper_verify_worker(task: QueueTask, tmp_path: str, lyrics: str) -> list[dict]:
@@ -2005,7 +2322,13 @@ async def _run_sync_task(task: QueueTask) -> None:
             raise ValueError("No audio file for this song.")
         lyrics   = task.lyrics or song.get("lyrics", "") or ""
         tmp_path = await _download_audio(task, song)
+    source_lyrics = lyrics
+    parsed_lyrics = parse_lyrics_gap_hints(lyrics)
+    lyrics = parsed_lyrics.text
+    task.gap_hints = [_serialize_gap_hint(hint) for hint in parsed_lyrics.gaps]
     task.lyrics = lyrics
+    if not lyrics:
+        raise ValueError("No lyric lines remain after parsing gap controls.")
     if task.cancel_requested:
         raise asyncio.CancelledError()
     tmp_path = await _prepare_analysis_audio(task, tmp_path)
@@ -2013,13 +2336,14 @@ async def _run_sync_task(task: QueueTask) -> None:
     label = get_managed_spec(sync_model).label if sync_model in MODEL_SPECS else f"Whisper {sync_model}"
     task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 52}
     await _q_broadcast()
-    if sync_model == "qwen3-forced-aligner-0.6b":
-        lines = await _qwen_sync_worker(task, tmp_path, lyrics)
-    elif sync_model == "hubert-fa-combined":
-        lines = await _hubertfa_sync_worker(task, tmp_path, lyrics)
-    else:
-        lines = await _whisper_sync_worker(task, tmp_path, lyrics)
-    task.result   = {"lines": lines}
+    lines = await _sync_with_gap_hints(task, tmp_path, parsed_lyrics)
+    lines = _apply_gap_hints_to_lines(lines, task.gap_hints)
+    task.result = {
+        "lines": lines,
+        "text": lyrics,
+        "source_text": source_lyrics,
+        "gap_hints": task.gap_hints,
+    }
     task.progress = {"stage": "done", "msg": f"Done — {len(lines)} lines synced", "step": "done", "pct": 100}
 
 
@@ -2221,13 +2545,35 @@ async def lifespan(app: FastAPI):
     _log_startup_diagnostics()
     global _q_cond
     _q_cond = asyncio.Condition()
+
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+
+    def handle_asyncio_exception(active_loop, context):
+        exc = context.get("exception")
+        if (
+            sys.platform == "win32"
+            and isinstance(exc, ConnectionResetError)
+            and getattr(exc, "winerror", None) == 10054
+        ):
+            CONSOLE.print("[dim]Client connection reset during reload (WinError 10054).[/dim]")
+            return
+        if previous_exception_handler is not None:
+            previous_exception_handler(active_loop, context)
+        else:
+            active_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handle_asyncio_exception)
     proc = asyncio.create_task(_queue_processor())
-    yield
-    proc.cancel()
     try:
-        await proc
-    except asyncio.CancelledError:
-        pass
+        yield
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+        proc.cancel()
+        try:
+            await proc
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="WRLD Sync", lifespan=lifespan)
@@ -2255,9 +2601,52 @@ async def jw_get(path: str, params: dict | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 
+class SearchRequest(BaseModel):
+    q: str
+    page_size: int = 20
+
+
+async def _search_catalog(q: str, page_size: int, response: Response) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    clean = str(q or "").strip()
+    if not clean:
+        return {"count": 0, "results": []}
+
+    data = await jw_get(
+        "/songs/",
+        {"search": clean, "page_size": max(1, min(100, int(page_size)))},
+    )
+    raw_results = list(data.get("results") or []) if isinstance(data, dict) else []
+    # Search cards only need lightweight catalog metadata. Do not tunnel full
+    # lyrics/synced-lyrics/version payloads for every result.
+    results = [
+        {
+            "id": row.get("id"),
+            "name": row.get("name") or "",
+            "track_titles": row.get("track_titles") or [],
+            "image_url": row.get("image_url") or "",
+            "era": row.get("era") or {},
+            "category": row.get("category") or "",
+            "length": row.get("length") or "",
+            "path": row.get("path") or "",
+        }
+        for row in raw_results
+        if isinstance(row, dict)
+    ]
+    return {
+        "count": int(data.get("count", len(results)) or len(results)) if isinstance(data, dict) else len(results),
+        "results": results,
+    }
+
+
 @app.get("/api/search")
-async def search(q: str, page_size: int = 20):
-    return await jw_get("/songs/", {"search": q, "page_size": page_size})
+async def search(q: str, response: Response, page_size: int = 20):
+    return await _search_catalog(q, page_size, response)
+
+
+@app.post("/api/search")
+async def search_post(req: SearchRequest, response: Response):
+    return await _search_catalog(req.q, req.page_size, response)
 
 
 @app.get("/api/song/{song_id}")
@@ -2711,42 +3100,64 @@ async def radio_random(
     raise HTTPException(404, "No matching song found after 50 attempts — try less restrictive filters.")
 
 
+@app.get("/api/playback")
+async def playback_audio(path: str):
+    """Redirect catalog playback directly to the public audio host.
+
+    This keeps large media bytes out of VS Code/dev tunnels. The frontend falls
+    back to /api/stream when the upstream browser request itself fails.
+    """
+    clean_path = str(path or "").strip()
+    if not clean_path:
+        raise HTTPException(400, "An audio path is required.")
+    upstream = BASE + "/files/download/?" + urllib.parse.urlencode({"path": clean_path})
+    return RedirectResponse(
+        upstream,
+        status_code=307,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/stream")
-async def stream_audio(path: str, request: Request):
-    # Use httpx params so the path value is properly URL-encoded
-    # (paths can contain '&', spaces, etc. that would break the query string)
-    req_headers = {}
-    if "range" in request.headers:
-        req_headers["Range"] = request.headers["range"]
+async def stream_audio(path: str):
+    """Serve catalog audio as a local seekable file.
 
-    client = httpx.AsyncClient(timeout=None)
+    The old route live-proxied the upstream response to the browser. That made
+    playback depend on every reverse proxy/tunnel preserving Range requests and
+    streaming semantics. Materializing through ensure_audio() gives playback
+    the same known-good bytes used by Sync/Transcribe, then FileResponse handles
+    browser byte ranges locally.
+    """
+    clean_path = str(path or "").strip()
+    if not clean_path:
+        raise HTTPException(400, "An audio path is required.")
+
+    local_path = ""
     try:
-        upstream_req = client.build_request(
-            "GET", BASE + "/files/download/",
-            params={"path": path},
-            headers=req_headers,
-        )
-        upstream = await client.send(upstream_req, stream=True)
+        async for event in ensure_audio(clean_path):
+            if "_path" in event:
+                local_path = str(event["_path"])
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            exc.response.status_code,
+            f"Audio download returned HTTP {exc.response.status_code}.",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Could not download catalog audio: {exc}") from exc
 
-        resp_headers = {"Accept-Ranges": "bytes"}
-        for key in ("content-type", "content-length", "content-range"):
-            if key in upstream.headers:
-                resp_headers[key] = upstream.headers[key]
-        if "content-type" not in resp_headers:
-            resp_headers["content-type"] = "audio/mpeg"
+    file_path = pathlib.Path(local_path)
+    if not local_path or not file_path.is_file() or file_path.stat().st_size <= 0:
+        raise HTTPException(502, "Catalog audio download did not produce a usable file.")
 
-        async def gen():
-            try:
-                async for chunk in upstream.aiter_bytes(32_768):
-                    yield chunk
-            finally:
-                await upstream.aclose()
-                await client.aclose()
-
-        return StreamingResponse(gen(), status_code=upstream.status_code, headers=resp_headers)
-    except Exception as e:
-        await client.aclose()
-        raise HTTPException(502, f"Upstream error: {e}")
+    media_type = mimetypes.guess_type(clean_path)[0] or "audio/mpeg"
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 class SyncRequest(BaseModel):
@@ -2900,12 +3311,21 @@ def _sanitize_timed_lines(
             candidate_end = max(candidate_end, max(w["end"] for w in valid_words))
 
         end = candidate_end if candidate_end > start else start + min_duration
-        cleaned.append({
+        cleaned_line = {
             "line": text,
             "start": start,
             "end": end,
             "words": valid_words,
-        })
+        }
+        for gap_key in ("gap_before", "gap_after"):
+            gap_meta = raw.get(gap_key)
+            if isinstance(gap_meta, dict):
+                cleaned_line[gap_key] = {
+                    "seconds": _gap_hint_seconds(gap_meta),
+                    "interlude": str(gap_meta.get("interlude") or "auto"),
+                    "source": str(gap_meta.get("source") or "[...]"),
+                }
+        cleaned.append(cleaned_line)
 
     return cleaned
 
@@ -3008,18 +3428,39 @@ def _build_ttml(
             p.text = line["line"]
 
     threshold = max(0.0, float(interlude_threshold))
+    leading_hint = lines[0].get("gap_before") if isinstance(lines[0].get("gap_before"), dict) else {}
+    leading_policy = str(leading_hint.get("interlude") or "auto")
+    if leading_hint and should_emit_leading_interlude(
+        lines[0]["start"],
+        leading_policy,
+        detect_interludes=detect_interludes,
+    ):
+        ET.SubElement(body, f"{{{TTML_NS}}}div", {
+            "begin": _ttml_time(0.0),
+            "end": _ttml_time(lines[0]["start"]),
+            f"{{{ITUNES_NS}}}song-part": "Instrumental",
+        })
+
     lyric_div = new_lyric_div(lines[0])
     active_block_end = lines[0]["end"]
     for i, line in enumerate(lines):
         active_block_end = max(active_block_end, line["end"])
         add_line(lyric_div, line, active_block_end)
-        if not detect_interludes or i + 1 >= len(lines):
+        if i + 1 >= len(lines):
             continue
 
         nxt = lines[i + 1]
         gap_start = active_block_end
         gap_end = nxt["start"]
-        if gap_end - gap_start >= threshold:
+        gap_hint = line.get("gap_after") if isinstance(line.get("gap_after"), dict) else {}
+        interlude_policy = str(gap_hint.get("interlude") or "auto")
+        if interlude_policy == "force":
+            emit_interlude = gap_end > gap_start
+        elif interlude_policy == "forbid":
+            emit_interlude = False
+        else:
+            emit_interlude = detect_interludes and gap_end - gap_start >= threshold
+        if emit_interlude:
             # Apple explicitly defines Instrumental as a song-part value. Start
             # only after every overlapping foreground/background vocal has ended.
             ET.SubElement(body, f"{{{TTML_NS}}}div", {
@@ -3426,6 +3867,7 @@ def _register_local_track(path: pathlib.Path, original_name: str, source_url: st
         "track_hash": track_hash,
         "path": str(path),
         "name": original_name,
+        "source_url": source_url,
         "title": meta["title"],
         "artist": meta["artist"],
         "duration": meta["duration"],
@@ -3697,6 +4139,58 @@ async def vocal_reference_from_url(req: VocalReferenceUrlRequest):
             downloaded.unlink(missing_ok=True)
 
 
+class LocalRestoreRequest(BaseModel):
+    source: str
+
+
+@app.post("/api/local-restore")
+async def restore_local_track(req: LocalRestoreRequest):
+    source = str(req.source or "").strip()
+    if not source:
+        raise HTTPException(400, "A local source is required.")
+
+    with _db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT track_hash, original_name, source_url, file_path, title, artist,
+                   duration, cover_mime,
+                   CASE WHEN cover_blob IS NULL THEN 0 ELSE 1 END AS has_cover
+            FROM local_tracks
+            WHERE track_hash = ? OR file_path = ? OR source_url = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (source.lower(), source, source),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(404, "That local source is not registered in WRLD Sync.")
+
+    data = dict(row)
+    path = pathlib.Path(data["file_path"])
+    if not path.is_file():
+        raise HTTPException(
+            404,
+            "The registered local audio file is no longer available. Re-open the original file.",
+        )
+
+    track_hash = str(data["track_hash"])
+    return {
+        "track_hash": track_hash,
+        "path": str(path),
+        "name": data["original_name"],
+        "source_url": data["source_url"] or "",
+        "title": data["title"],
+        "artist": data["artist"],
+        "duration": float(data["duration"] or 0.0),
+        "duration_label": _duration_label(data["duration"]),
+        "category": "local_file",
+        "cover_url": f"/api/local/{track_hash}/cover" if data["has_cover"] else "",
+        "audio_url": f"/api/local/{track_hash}/audio",
+        "processed": _get_local_processed(track_hash),
+    }
+
+
 @app.get("/api/local/{track_hash}/cover")
 async def local_cover(track_hash: str):
     row = _get_local_track(track_hash, include_cover=True)
@@ -3713,8 +4207,12 @@ async def local_audio(track_hash: str):
     path = pathlib.Path(row["file_path"])
     if not path.is_file():
         raise HTTPException(404, "The temporary local audio file is no longer available. Re-open it to restore playback.")
-    media_type = mimetypes.guess_type(row.get("original_name") or path.name)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type)
+    media_type = (
+        mimetypes.guess_type(path.name)[0]
+        or mimetypes.guess_type(row.get("original_name") or "")[0]
+        or "application/octet-stream"
+    )
+    return FileResponse(path, media_type=media_type, headers={"Accept-Ranges": "bytes"})
 
 
 # ---------------------------------------------------------------------------
