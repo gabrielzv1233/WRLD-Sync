@@ -468,16 +468,77 @@ let lastVerifyResults = [];
 let autoFollow     = true;
 let localFilePath  = '';    // server-side path of uploaded local file (empty = API mode)
 let currentLocalTrack = null; // metadata/hash for local-file mode
+
+const GAP_HINT_LINE_RE = /^(?:(?:\d+(?:\.\d+)?|\.\d+))?[+-]?\[\.\.\.\]$/;
+function isGapHintControlLine(value) {
+  return GAP_HINT_LINE_RE.test(String(value ?? '').trim());
+}
+function stripGapHintControls(value) {
+  return String(value ?? '')
+    .split(/\r?\n/)
+    .filter(line => !isGapHintControlLine(line))
+    .join('\n');
+}
+function restoreCachedGapHints(value, hints) {
+  const raw = String(value ?? '');
+  if (!raw || !Array.isArray(hints) || !hints.length) return raw;
+  if (raw.split(/\r?\n/).some(isGapHintControlLine)) return raw;
+
+  const byPosition = new Map();
+  hints.forEach(hint => {
+    const position = Number(hint?.position);
+    const source = String(hint?.source ?? '').trim();
+    if (!Number.isInteger(position) || position < 0 || !source) return;
+    const existing = byPosition.get(position) ?? [];
+    existing.push(...source.split(/\r?\n/).filter(Boolean));
+    byPosition.set(position, existing);
+  });
+  if (!byPosition.size) return raw;
+
+  const out = [];
+  let lyricPosition = 0;
+  const insertAt = position => {
+    const controls = byPosition.get(position);
+    if (controls) out.push(...controls);
+  };
+
+  String(raw).split(/\r?\n/).forEach(line => {
+    if (line.trim()) {
+      insertAt(lyricPosition);
+      lyricPosition += 1;
+    }
+    out.push(line);
+  });
+  insertAt(lyricPosition);
+  return out.join('\n');
+}
+function mergeVerifiedLyricsWithGapHints(sourceText, verifyResults, keepResult) {
+  const results = Array.isArray(verifyResults) ? verifyResults : [];
+  let resultIndex = 0;
+  const out = [];
+
+  String(sourceText ?? '').split(/\r?\n/).forEach(line => {
+    if (isGapHintControlLine(line) || !line.trim()) {
+      out.push(line);
+      return;
+    }
+
+    const result = results[resultIndex++];
+    if (!result) {
+      out.push(line);
+      return;
+    }
+    if (keepResult(result)) out.push(String(result.line ?? line));
+  });
+
+  return out.join('\n');
+}
 function clearAlignmentLyricsSource() {
   alignmentLyricsSource = '';
   alignmentLyricsDisplay = '';
 }
 function lyricsForSync() {
-  const visible = plainLyricsText.value;
-  if (alignmentLyricsSource && visible === alignmentLyricsDisplay) {
-    return alignmentLyricsSource.trim();
-  }
-  return visible.trim();
+  return plainLyricsText.value.trim();
 }
 let catalogAudioPath = '';
 let catalogAudioFallbackActive = false;
@@ -1458,12 +1519,13 @@ async function loadSongData(song) {
     if (localProcessed?.lines?.length) {
       syncedLines = sanitizeTimedLines(localProcessed.lines);
       currentTtmlSource = localProcessed.ttml || '';
+      const ps = localProcessed.settings ?? {};
       if (localProcessed.lyrics) {
-        plainLyricsText.value = localProcessed.lyrics;
-        customLyrics = localProcessed.lyrics;
+        const restoredLyrics = restoreCachedGapHints(localProcessed.lyrics, ps.gap_hints);
+        plainLyricsText.value = restoredLyrics;
+        customLyrics = restoredLyrics;
         updateLyricsSrc('local', true);
       }
-      const ps = localProcessed.settings ?? {};
       if (typeof ps.word_timing_requested === 'boolean') wordTimingToggle.checked = ps.word_timing_requested;
       else if (typeof ps.word_timing === 'boolean') wordTimingToggle.checked = ps.word_timing;
       if (typeof ps.detect_interludes === 'boolean') interludeToggle.checked = ps.detect_interludes;
@@ -1573,7 +1635,7 @@ function rawLyricEntries(text = plainLyricsText.value) {
 }
 
 function attachMissingLyricSourceReferences(lines, rawText = plainLyricsText.value) {
-  const raw = rawLyricEntries(rawText).filter(x => x.text);
+  const raw = rawLyricEntries(rawText).filter(x => x.text && !isGapHintControlLine(x.text));
   if (!raw.length || !Array.isArray(lines) || !lines.length) return lines;
 
   // If the two views have the same non-empty line count and still resemble one
@@ -2512,14 +2574,18 @@ function _closeVerifyView() {
 }
 
 function applyVerifyFilter(removeStatuses) {
-  const keep = lastVerifyResults.filter(r =>
-    !r._removed && !removeStatuses.includes(r.status)
-  ).map(r => r.line);
-  plainLyricsText.value = keep.join('\n');
+  const shouldKeep = result =>
+    !result._removed && !removeStatuses.includes(result.status);
+  const keptCount = lastVerifyResults.filter(shouldKeep).length;
+  plainLyricsText.value = mergeVerifiedLyricsWithGapHints(
+    plainLyricsText.value,
+    lastVerifyResults,
+    shouldKeep,
+  );
   customLyrics = plainLyricsText.value;
   updateLyricsSrc('edited', !!plainLyricsText.value);
   _closeVerifyView();
-  setSyncStatus(`Removed ${lastVerifyResults.length - keep.length} lines — ready to sync.`, 'ok');
+  setSyncStatus(`Removed ${lastVerifyResults.length - keptCount} lines — ready to sync.`, 'ok');
   lastVerifyResults = [];
 }
 
@@ -2527,12 +2593,17 @@ removeAbsentBtn.addEventListener('click',    () => applyVerifyFilter(['absent'])
 removeUncertainBtn.addEventListener('click', () => applyVerifyFilter(['absent', 'uncertain']));
 
 applyManualBtn.addEventListener('click', () => {
-  const keep = lastVerifyResults.filter(r => !r._removed).map(r => r.line);
-  plainLyricsText.value = keep.join('\n');
+  const shouldKeep = result => !result._removed;
+  const keptCount = lastVerifyResults.filter(shouldKeep).length;
+  plainLyricsText.value = mergeVerifiedLyricsWithGapHints(
+    plainLyricsText.value,
+    lastVerifyResults,
+    shouldKeep,
+  );
   customLyrics = plainLyricsText.value;
   updateLyricsSrc('edited', !!plainLyricsText.value);
   _closeVerifyView();
-  setSyncStatus(`Applied — ${keep.length} lines kept.`, 'ok');
+  setSyncStatus(`Applied — ${keptCount} lines kept.`, 'ok');
   lastVerifyResults = [];
 });
 
@@ -2965,7 +3036,11 @@ async function enqueueTask(type) {
   const songName = currentSong
     ? (currentSong.track_titles?.[0] ?? currentSong.name ?? '')
     : npTitle.textContent;
-  const lyrics = type === 'sync' ? lyricsForSync() : plainLyricsText.value.trim();
+  const lyrics = type === 'sync'
+    ? lyricsForSync()
+    : type === 'verify'
+      ? stripGapHintControls(plainLyricsText.value).trim()
+      : plainLyricsText.value.trim();
   try {
     await api('/api/queue', {
       method: 'POST',
@@ -3208,18 +3283,17 @@ function applyCompletedTasks(state) {
     if (task.local_hash && task.local_hash !== currentLocalTrack?.track_hash) continue;
     if (!task.local_hash && task.song_id !== 0 && task.song_id !== currentSong?.id) continue;
 
-    // Sync consumes timing-control lines, but the Lyrics tab should show only
-    // actual lyrics after alignment. Keep the original hinted source internally
-    // so an unchanged result can be re-synced without losing those controls.
+    // Sync consumes timing-control lines for alignment, but they remain part
+    // of the editable Lyrics source. Preview/TTML/LRC use syncedLines only.
     if (task.type === 'sync' && task.status === 'done' && task.result?.lines?.length) {
       _appliedTaskIds.add(task.id);
       syncedLines = task.result.lines; currentTtmlSource = '';
       const cleanedText = task.result.text || syncedLines.map(l => l.line ?? '').join('\n');
-      alignmentLyricsSource = task.result.source_text || cleanedText;
-      alignmentLyricsDisplay = cleanedText;
-      plainLyricsText.value = cleanedText;
-      customLyrics = cleanedText;
-      updateLyricsSrc('edited', !!cleanedText);
+      const sourceText = task.result.source_text || cleanedText;
+      clearAlignmentLyricsSource();
+      plainLyricsText.value = sourceText;
+      customLyrics = sourceText;
+      updateLyricsSrc('edited', !!sourceText);
       renderKaraoke(syncedLines);
       setTab('karaoke');
       const hintCount = Array.isArray(task.result.gap_hints) ? task.result.gap_hints.length : 0;
@@ -3809,12 +3883,13 @@ function applyCachedLocalProcessing(processed) {
   if (!processed?.lines?.length) return false;
   syncedLines = sanitizeTimedLines(processed.lines);
   currentTtmlSource = processed.ttml || '';
+  const ps = processed.settings ?? {};
   if (processed.lyrics) {
-    plainLyricsText.value = processed.lyrics;
-    customLyrics = processed.lyrics;
+    const restoredLyrics = restoreCachedGapHints(processed.lyrics, ps.gap_hints);
+    plainLyricsText.value = restoredLyrics;
+    customLyrics = restoredLyrics;
     updateLyricsSrc('local', true);
   }
-  const ps = processed.settings ?? {};
   if (typeof ps.word_timing_requested === 'boolean') wordTimingToggle.checked = ps.word_timing_requested;
   else if (typeof ps.word_timing === 'boolean') wordTimingToggle.checked = ps.word_timing;
   if (typeof ps.detect_interludes === 'boolean') interludeToggle.checked = ps.detect_interludes;
@@ -4165,7 +4240,7 @@ proposeBtn.addEventListener('click', async () => {
         song_id: currentSong.id,
         lines: syncedLines,
         token,
-        plain_lyrics: plainLyricsText.value.trim(),
+        plain_lyrics: stripGapHintControls(plainLyricsText.value).trim(),
         word_timing: wordTimingToggle.checked,
         detect_interludes: interludeToggle.checked,
         inline_parenthetical_background: inlineParentheticalBgToggle.checked,
