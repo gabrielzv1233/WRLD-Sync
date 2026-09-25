@@ -216,7 +216,7 @@ def _parse_display_only_fragments(
     -\\{text} keeps the same display-only behavior but leaves it foreground.
     The control wrapper itself is never part of model or rendered lyric text.
     """
-    source = str(line or "")
+    source = str(line or "").strip()
     model_parts: list[str] = []
     display_parts: list[str] = []
     fragments: list[DisplayOnlyFragment] = []
@@ -268,7 +268,7 @@ def _parse_display_only_fragments(
         cursor = close + 1
 
     model_line = re.sub(r"[ \t]{2,}", " ", "".join(model_parts)).strip()
-    display_line = re.sub(r"[ \t]{2,}", " ", "".join(display_parts)).strip()
+    display_line = "".join(display_parts).strip()
 
     if fragments and not model_line:
         raise ValueError(
