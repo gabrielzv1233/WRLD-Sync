@@ -811,7 +811,12 @@ def _store_processed_lyrics(task) -> None:
             "gap_strategy": "literal-seconds+asr-anchor-v2" if getattr(task, "gap_hints", []) else "none",
         },
     }
-    lyrics_text = str(result.get("text") or getattr(task, "lyrics", "") or "")
+    lyrics_text = str(
+        result.get("source_text")
+        or result.get("text")
+        or getattr(task, "lyrics", "")
+        or ""
+    )
     now = time.time()
     with _db_connect() as conn:
         if song_id > 0:
@@ -2326,7 +2331,7 @@ async def _run_sync_task(task: QueueTask) -> None:
     parsed_lyrics = parse_lyrics_gap_hints(lyrics)
     lyrics = parsed_lyrics.text
     task.gap_hints = [_serialize_gap_hint(hint) for hint in parsed_lyrics.gaps]
-    task.lyrics = lyrics
+    task.lyrics = source_lyrics
     if not lyrics:
         raise ValueError("No lyric lines remain after parsing gap controls.")
     if task.cancel_requested:
@@ -2359,6 +2364,7 @@ async def _run_verify_task(task: QueueTask) -> None:
             raise ValueError("No audio file for this song.")
         lyrics = task.lyrics or song.get("lyrics", "") or ""
         tmp_path = await _download_audio(task, song)
+    lyrics = parse_lyrics_gap_hints(lyrics).text
     if not lyrics:
         raise ValueError("No lyrics to verify against.")
     if task.cancel_requested:
@@ -3505,6 +3511,9 @@ async def propose_lyrics(req: ProposeRequest):
         interlude_threshold=req.interlude_threshold,
     )
 
+    # Gap hints are WRLD Sync editor controls, not public lyric content.
+    plain_lyrics = parse_lyrics_gap_hints(req.plain_lyrics).text
+
     # Fetch song name for the proposal title
     song = await jw_get(f"/songs/{req.song_id}/")
 
@@ -3524,7 +3533,7 @@ async def propose_lyrics(req: ProposeRequest):
                 "editor_notes": f"Synced lyrics generated with WRLD Sync (Apple TTML, {'word' if used_word_timing else 'line'} timing)",
                 "proposed_data": {
                     "synced_lyrics": ttml,
-                    **({"lyrics": req.plain_lyrics} if req.plain_lyrics.strip() else {}),
+                    **({"lyrics": plain_lyrics} if plain_lyrics.strip() else {}),
                 },
             },
         )
