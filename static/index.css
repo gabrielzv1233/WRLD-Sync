@@ -4643,10 +4643,25 @@ body.settings-open {
 }
 #ttmlAceEditor .ace_scrollbar {
 	scrollbar-width: thin;
-	scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+	scrollbar-color: rgba(255, 255, 255, 0.5) rgba(255, 255, 255, 0.055);
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar {
+	width: 13px;
+	height: 13px;
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar-track {
+	background: rgba(255, 255, 255, 0.055);
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar-thumb {
+	background: rgba(255, 255, 255, 0.5);
+	border: 3px solid rgba(7, 7, 11, 0.72);
+	border-radius: 999px;
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar-thumb:hover {
+	background: rgba(255, 255, 255, 0.72);
 }
 #ttmlAceEditor .ace_scrollbar::-webkit-scrollbar-corner {
-	background: transparent;
+	background: rgba(7, 7, 11, 0.72);
 }
 .lyrics-controls-area {
 	display: flex;
@@ -5846,8 +5861,7 @@ main.sidebar-collapsed #resultsPanel { transform: translateX(-20px); }
 #resultsList,
 #lyricsSection,
 #plainLyricsText,
-#ttmlEditorText,
-#ttmlAceEditor .ace_scrollbar { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.18) transparent; }
+#ttmlEditorText { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.18) transparent; }
 #ttmlEditorText::-webkit-scrollbar-corner { background: transparent; }
 #plainLyricsText::selection,
 #ttmlEditorText::selection { background: rgba(124,58,237,.35); }
