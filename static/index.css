@@ -940,11 +940,12 @@ main.sidebar-collapsed #expandSidebarBtn {
 	position: relative;
 	transform: translateY(0) scale(1);
 	transform-origin: center 70%;
-	transition: transform 0.12s cubic-bezier(0.2, 0.8, 0.2, 1);
+	transition: transform 0.26s cubic-bezier(0.22, 1, 0.36, 1);
 	will-change: transform;
 }
 .kw.active {
 	transform: translateY(-1px) scale(1.025);
+	transition-duration: 0.18s;
 }
 .kw-base,
 .kw-fill {
