@@ -1828,6 +1828,24 @@ main.sidebar-collapsed #expandSidebarBtn {
 	color: var(--text);
 	background: rgba(255, 255, 255, 0.06);
 }
+.qp-icon-btn {
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	display: grid;
+	place-items: center;
+	flex: 0 0 28px;
+	line-height: 0;
+}
+.qp-icon-btn svg {
+	display: block;
+	width: 14px;
+	height: 14px;
+}
+#closeQueueBtn svg {
+	width: 15px;
+	height: 15px;
+}
 
 #queueContent {
 	flex: 1;
@@ -1919,18 +1937,26 @@ main.sidebar-collapsed #expandSidebarBtn {
 	min-width: 0;
 }
 .tc-cancel-btn {
+	width: 24px;
+	height: 24px;
 	background: none;
 	border: none;
 	color: var(--muted);
 	cursor: pointer;
-	padding: 2px 6px;
+	padding: 0;
 	border-radius: 5px;
-	font-size: 0.9rem;
-	line-height: 1;
-	flex-shrink: 0;
+	display: grid;
+	place-items: center;
+	line-height: 0;
+	flex: 0 0 24px;
 	transition:
 		color 0.12s,
 		background 0.12s;
+}
+.tc-cancel-btn svg {
+	display: block;
+	width: 13px;
+	height: 13px;
 }
 .tc-cancel-btn:hover {
 	color: var(--danger);
@@ -4542,9 +4568,11 @@ body.settings-open {
 	box-shadow: none !important;
 }
 #ttmlView {
+	position: relative;
 	height: 100%;
 	min-height: 0;
 	overflow: hidden;
+	background: rgba(7, 7, 11, 0.58);
 }
 #ttmlEditorText {
 	display: block;
@@ -4554,7 +4582,7 @@ body.settings-open {
 	resize: none;
 	border: 0 !important;
 	outline: 0 !important;
-	background: rgba(7, 7, 11, 0.58) !important;
+	background: transparent !important;
 	color: #d8d5df !important;
 	padding: 20px 26px !important;
 	font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -4565,6 +4593,75 @@ body.settings-open {
 	word-break: normal !important;
 	text-wrap: nowrap !important;
 	overflow: auto !important;
+}
+#ttmlAceEditor {
+	position: absolute;
+	inset: 0;
+	visibility: hidden;
+	pointer-events: none;
+	background: transparent !important;
+	color: #d8d5df;
+	font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+	font-size: 0.73rem;
+}
+#ttmlView.ace-ready #ttmlEditorText {
+	display: none;
+}
+#ttmlView.ace-ready #ttmlAceEditor {
+	visibility: visible;
+	pointer-events: auto;
+}
+#ttmlAceEditor.ace_editor,
+#ttmlAceEditor .ace_scroller,
+#ttmlAceEditor .ace_content {
+	background: transparent !important;
+}
+#ttmlAceEditor .ace_gutter {
+	background: rgba(5, 5, 9, 0.18) !important;
+	color: rgba(255, 255, 255, 0.27) !important;
+	border-right: 1px solid rgba(255, 255, 255, 0.045);
+}
+#ttmlAceEditor .ace_gutter-active-line {
+	background: rgba(124, 58, 237, 0.08) !important;
+}
+#ttmlAceEditor .ace_marker-layer .ace_active-line {
+	background: rgba(255, 255, 255, 0.025) !important;
+}
+#ttmlAceEditor .ace_marker-layer .ace_selection {
+	background: rgba(124, 58, 237, 0.35) !important;
+}
+#ttmlAceEditor .ace_cursor {
+	color: #b99cff !important;
+	border-left-color: #b99cff !important;
+}
+#ttmlAceEditor .ace_indent-guide {
+	opacity: 0.25;
+}
+#ttmlAceEditor .ace_text-layer,
+#ttmlAceEditor .ace_line {
+	white-space: pre !important;
+}
+#ttmlAceEditor .ace_scrollbar {
+	scrollbar-width: thin;
+	scrollbar-color: rgba(255, 255, 255, 0.5) rgba(255, 255, 255, 0.055);
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar {
+	width: 13px;
+	height: 13px;
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar-track {
+	background: rgba(255, 255, 255, 0.055);
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar-thumb {
+	background: rgba(255, 255, 255, 0.5);
+	border: 3px solid rgba(7, 7, 11, 0.72);
+	border-radius: 999px;
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar-thumb:hover {
+	background: rgba(255, 255, 255, 0.72);
+}
+#ttmlAceEditor .ace_scrollbar::-webkit-scrollbar-corner {
+	background: rgba(7, 7, 11, 0.72);
 }
 .lyrics-controls-area {
 	display: flex;
@@ -5759,7 +5856,8 @@ main.sidebar-collapsed #resultsPanel { transform: translateX(-20px); }
 #plainLyricsView { overflow: hidden; }
 .lyrics-edit-bar { min-height: 42px; }
 #plainLyricsText { flex: 1 1 0; }
-#ttmlEditorText { border-radius: 0; tab-size: 2; }
+#ttmlEditorText,
+#ttmlAceEditor { border-radius: 0; tab-size: 2; }
 #resultsList,
 #lyricsSection,
 #plainLyricsText,
