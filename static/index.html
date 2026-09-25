@@ -319,7 +319,10 @@
               <textarea id="plainLyricsText" spellcheck="false" placeholder="No lyrics — paste here or search Genius above…"></textarea>
             </div>
 
-            <div id="ttmlView" role="tabpanel" hidden><textarea id="ttmlEditorText" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Run Auto/Sync or paste Apple TTML here…" wrap="off"></textarea></div>
+            <div id="ttmlView" role="tabpanel" hidden>
+              <textarea id="ttmlEditorText" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Run Auto/Sync or paste Apple TTML here…" wrap="off"></textarea>
+              <div id="ttmlAceEditor" aria-label="Apple TTML editor"></div>
+            </div>
           </div>
         </div><!-- /lyricsSection -->
 
@@ -445,6 +448,9 @@
   </button>
 </main>
 
+<script src="https://cdn.jsdelivr.net/npm/ace-builds@1.44.0/src-min-noconflict/ace.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ace-builds@1.44.0/src-min-noconflict/mode-xml.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ace-builds@1.44.0/src-min-noconflict/theme-tomorrow_night.js"></script>
 <script>
 // ── State ─────────────────────────────────────────────────────────────────
 let currentSong    = null;
@@ -658,6 +664,7 @@ const lrcPasteArea     = document.getElementById('lrcPasteArea');
 const lrcTextarea      = document.getElementById('lrcTextarea');
 const ttmlView         = document.getElementById('ttmlView');
 const ttmlEditorText   = document.getElementById('ttmlEditorText');
+const ttmlAceEditorHost= document.getElementById('ttmlAceEditor');
 const saveTtmlBtn      = document.getElementById('saveTtmlBtn');
 const refreshTtmlBtn   = document.getElementById('refreshTtmlBtn');
 const lyricsSrcTag     = document.getElementById('lyricsSrcTag');
@@ -673,6 +680,69 @@ const applyManualBtn   = document.getElementById('applyManualBtn');
 const dismissVerifyBtn = document.getElementById('dismissVerifyBtn');
 const verifyAbsentLines= document.getElementById('verifyAbsentLines');
 const verifyLinesView  = document.getElementById('verifyLinesView');
+
+let ttmlAceEditor = null;
+function ensureTtmlAceEditor() {
+  if (ttmlAceEditor || !ttmlAceEditorHost || !window.ace) return ttmlAceEditor;
+
+  ace.config.set('basePath', 'https://cdn.jsdelivr.net/npm/ace-builds@1.44.0/src-min-noconflict');
+  const editor = ace.edit(ttmlAceEditorHost);
+  editor.setTheme('ace/theme/tomorrow_night');
+  editor.session.setMode('ace/mode/xml');
+  editor.session.setUseWorker(false);
+  editor.session.setUseWrapMode(false);
+  editor.setOptions({
+    showPrintMargin: false,
+    showGutter: true,
+    highlightActiveLine: true,
+    highlightGutterLine: true,
+    displayIndentGuides: true,
+    showFoldWidgets: true,
+    tabSize: 2,
+    useSoftTabs: true,
+    fontSize: '0.73rem',
+    scrollPastEnd: 0.12,
+  });
+  editor.renderer.setPadding(26);
+  editor.renderer.setScrollMargin(18, 18, 0, 0);
+  editor.setValue(ttmlEditorText.value || '', -1);
+
+  editor.on('change', () => {
+    ttmlEditorText.value = editor.getValue();
+  });
+
+  const input = editor.textInput?.getElement?.();
+  if (input) {
+    input.setAttribute('aria-label', 'Apple TTML editor');
+    input.setAttribute('spellcheck', 'false');
+    input.setAttribute('autocapitalize', 'off');
+    input.setAttribute('autocomplete', 'off');
+  }
+
+  ttmlAceEditor = editor;
+  ttmlView.classList.add('ace-ready');
+  requestAnimationFrame(() => editor.resize(true));
+  return editor;
+}
+function getTtmlEditorValue() {
+  return ttmlAceEditor ? ttmlAceEditor.getValue() : ttmlEditorText.value;
+}
+function setTtmlEditorValue(value) {
+  const next = String(value ?? '');
+  ttmlEditorText.value = next;
+  if (ttmlAceEditor && ttmlAceEditor.getValue() !== next) {
+    const cursor = ttmlAceEditor.getCursorPosition();
+    ttmlAceEditor.setValue(next, -1);
+    ttmlAceEditor.moveCursorTo(
+      Math.min(cursor.row, Math.max(0, ttmlAceEditor.session.getLength() - 1)),
+      cursor.column,
+    );
+    ttmlAceEditor.clearSelection();
+  }
+}
+function isTtmlEditorFocused() {
+  return ttmlAceEditor ? ttmlAceEditor.isFocused() : ttmlEditorText.matches(':focus');
+}
 const progRich         = document.getElementById('progRich');
 const progDone         = document.getElementById('progDone');
 const progEta          = document.getElementById('progEta');
@@ -2566,9 +2636,11 @@ function queueProcessedSave(sourceType = 'editor') {
   clearTimeout(_processedSaveTimer);
   _processedSaveTimer = setTimeout(() => saveProcessedState(sourceType), 450);
 }
-refreshTtmlBtn.addEventListener('click', () => { ttmlEditorText.value = syncedLines.length ? buildTTML().text : ''; });
+refreshTtmlBtn.addEventListener('click', () => {
+  setTtmlEditorValue(syncedLines.length ? buildTTML().text : '');
+});
 saveTtmlBtn.addEventListener('click', async () => {
-  const raw = ttmlEditorText.value.trim();
+  const raw = getTtmlEditorValue().trim();
   if (!/<tt(?:\s|>)/i.test(raw)) { setSyncStatus('TTML editor expects Apple TTML.', 'error'); return; }
   const lines = parseTTML(raw);
   if (!lines.length) { setSyncStatus('Could not parse any timed lyric lines from that TTML.', 'error'); return; }
@@ -2612,15 +2684,17 @@ function setTab(tab) {
   karaokeView.hidden = tab !== 'karaoke';
   plainLyricsView.hidden = tab !== 'plain';
   ttmlView.hidden = tab !== 'ttml';
+  if (tab === 'ttml') ensureTtmlAceEditor();
   shortcutsHint?.classList.toggle('hidden', tab === 'ttml');
   refreshTtmlBtn.classList.toggle('hidden', tab !== 'ttml');
   saveTtmlBtn.classList.toggle('hidden', tab !== 'ttml');
-  if (tab === 'ttml' && syncedLines.length && !ttmlEditorText.matches(':focus'))
-    ttmlEditorText.value = currentTtmlSource || buildTTML().text;
+  if (tab === 'ttml' && syncedLines.length && !isTtmlEditorFocused())
+    setTtmlEditorValue(currentTtmlSource || buildTTML().text);
 
   requestAnimationFrame(() => {
     if (activeTab !== tab) return;
     lyricsSection.scrollTop = Math.max(0, tabScrollPositions[tab] ?? 0);
+    if (tab === 'ttml') ttmlAceEditor?.resize(true);
     if (tab === 'karaoke' && syncedLines.length) {
       const idx = computeActiveIdx();
       const gap = computeGapState(audioPlayer.currentTime, idx);
