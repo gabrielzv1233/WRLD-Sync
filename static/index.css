@@ -935,14 +935,9 @@ main.sidebar-collapsed #expandSidebarBtn {
 }
 .kw {
 	--fill: 0%;
-	--word-scale: 1;
 	display: inline-grid;
 	grid-template-areas: "word";
 	position: relative;
-	transform: scale(var(--word-scale));
-	transform-origin: center 70%;
-	transition: transform 0.075s linear;
-	will-change: transform;
 }
 .kw-base,
 .kw-fill {
