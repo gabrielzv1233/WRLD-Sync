@@ -455,11 +455,24 @@ let pinnedIdx      = -1;
 let activeTab      = 'karaoke';
 const tabScrollPositions = { karaoke: 0, plain: 0, ttml: 0 };
 let customLyrics   = '';
+let alignmentLyricsSource = '';
+let alignmentLyricsDisplay = '';
 let currentTtmlSource = '';
 let lastVerifyResults = [];
 let autoFollow     = true;
 let localFilePath  = '';    // server-side path of uploaded local file (empty = API mode)
 let currentLocalTrack = null; // metadata/hash for local-file mode
+function clearAlignmentLyricsSource() {
+  alignmentLyricsSource = '';
+  alignmentLyricsDisplay = '';
+}
+function lyricsForSync() {
+  const visible = plainLyricsText.value;
+  if (alignmentLyricsSource && visible === alignmentLyricsDisplay) {
+    return alignmentLyricsSource.trim();
+  }
+  return visible.trim();
+}
 let catalogAudioPath = '';
 let catalogAudioFallbackActive = false;
 let audioPlayIntent = false;
@@ -1279,7 +1292,7 @@ async function loadSongData(song) {
   localFilePath = '';  // clear any previous local file override
   currentLocalTrack = null;
   nowPlaying.classList.remove('local-track');
-  syncedLines = []; activeLineIdx = -1; customLyrics = ''; currentTtmlSource = '';
+  syncedLines = []; activeLineIdx = -1; customLyrics = ''; clearAlignmentLyricsSource(); currentTtmlSource = '';
   tabScrollPositions.karaoke = 0; tabScrollPositions.plain = 0; tabScrollPositions.ttml = 0;
   setSyncStatus('');
   syncBtn.disabled = false; autoWhisperBtn.disabled = false; transcribeBtn.disabled = false;
@@ -2426,6 +2439,7 @@ function updateLyricsSrc(src, hasContent) {
   resetLyricsBtn.style.display = (hasContent && plainLyricsText.value === defaults) || !defaults ? 'none' : '';
 }
 plainLyricsText.addEventListener('input', () => {
+  clearAlignmentLyricsSource();
   const val = plainLyricsText.value;
   customLyrics = val;
   const src = val === (currentSong?.lyrics || currentLocalTrack?.lyrics || '') ? (currentLocalTrack?.lyrics_source || 'api') : 'edited';
@@ -2434,6 +2448,7 @@ plainLyricsText.addEventListener('input', () => {
 resetLyricsBtn.addEventListener('click', () => {
   const defaults = currentSong?.lyrics || currentLocalTrack?.lyrics || '';
   if (!defaults) return;
+  clearAlignmentLyricsSource();
   plainLyricsText.value = defaults;
   customLyrics = '';
   updateLyricsSrc(currentLocalTrack?.lyrics_source || 'api', true);
@@ -2441,6 +2456,7 @@ resetLyricsBtn.addEventListener('click', () => {
 
 async function fetchFromGenius(params) {
   const data = await api('/api/genius?' + new URLSearchParams(params).toString());
+  clearAlignmentLyricsSource();
   plainLyricsText.value = data.lyrics || '';
   customLyrics = plainLyricsText.value;
   updateLyricsSrc('genius', !!data.lyrics);
@@ -2834,7 +2850,7 @@ async function enqueueTask(type) {
   const songName = currentSong
     ? (currentSong.track_titles?.[0] ?? currentSong.name ?? '')
     : npTitle.textContent;
-  const lyrics = plainLyricsText.value.trim();
+  const lyrics = type === 'sync' ? lyricsForSync() : plainLyricsText.value.trim();
   try {
     await api('/api/queue', {
       method: 'POST',
@@ -3077,13 +3093,23 @@ function applyCompletedTasks(state) {
     if (task.local_hash && task.local_hash !== currentLocalTrack?.track_hash) continue;
     if (!task.local_hash && task.song_id !== 0 && task.song_id !== currentSong?.id) continue;
 
-    // Sync uses the existing raw Lyrics text and only aligns it to audio.
+    // Sync consumes timing-control lines, but the Lyrics tab should show only
+    // actual lyrics after alignment. Keep the original hinted source internally
+    // so an unchanged result can be re-synced without losing those controls.
     if (task.type === 'sync' && task.status === 'done' && task.result?.lines?.length) {
       _appliedTaskIds.add(task.id);
       syncedLines = task.result.lines; currentTtmlSource = '';
+      const cleanedText = task.result.text || syncedLines.map(l => l.line ?? '').join('\n');
+      alignmentLyricsSource = task.result.source_text || cleanedText;
+      alignmentLyricsDisplay = cleanedText;
+      plainLyricsText.value = cleanedText;
+      customLyrics = cleanedText;
+      updateLyricsSrc('edited', !!cleanedText);
       renderKaraoke(syncedLines);
       setTab('karaoke');
-      setSyncStatus(`Synced ${syncedLines.length} lyric lines ✓`, 'ok');
+      const hintCount = Array.isArray(task.result.gap_hints) ? task.result.gap_hints.length : 0;
+      const hintLabel = hintCount ? ` · ${hintCount} timing hint${hintCount === 1 ? '' : 's'} applied` : '';
+      setSyncStatus(`Synced ${syncedLines.length} lyric lines ✓${hintLabel}`, 'ok');
       maybeShowPropose();
     }
 
@@ -3094,6 +3120,7 @@ function applyCompletedTasks(state) {
       const text = task.result.text || syncedLines.map(l => l.line ?? '').join('\n');
       const transcribeModel = task.settings?.transcribe_model || 'whisper';
       const isWhisper = !['qwen3-asr-0.6b','qwen3-asr-1.7b','parakeet-tdt-0.6b-v3'].includes(transcribeModel);
+      clearAlignmentLyricsSource();
       plainLyricsText.value = text; customLyrics = text; updateLyricsSrc(isWhisper ? 'whisper' : 'model', true);
       renderKaraoke(syncedLines); setTab('karaoke'); maybeShowPropose();
       const modelLabel = document.querySelector(`#verifyModelSelect option[value="${CSS.escape(transcribeModel)}"]`)?.dataset.baseLabel || transcribeModel;
@@ -3103,6 +3130,7 @@ function applyCompletedTasks(state) {
     // Transcribe — fill lyrics textarea with plain text + apply as synced lines
     if (task.type === 'transcribe' && task.status === 'done' && task.result?.text) {
       _appliedTaskIds.add(task.id);
+      clearAlignmentLyricsSource();
       plainLyricsText.value = task.result.text;
       customLyrics = task.result.text;
       const transcribeModel = task.settings?.transcribe_model || 'whisper';
@@ -3690,7 +3718,7 @@ async function loadLocalTrack(meta) {
   audioPlayIntent = false;
   currentLocalTrack = meta;
   localFilePath = meta.path;
-  syncedLines = []; activeLineIdx = -1; pinnedIdx = -1; customLyrics = ''; currentTtmlSource = '';
+  syncedLines = []; activeLineIdx = -1; pinnedIdx = -1; customLyrics = ''; clearAlignmentLyricsSource(); currentTtmlSource = '';
   tabScrollPositions.karaoke = 0; tabScrollPositions.plain = 0; tabScrollPositions.ttml = 0;
   plainLyricsText.value = meta.lyrics || '';
   updateLyricsSrc(meta.lyrics_source || 'manual', !!meta.lyrics);

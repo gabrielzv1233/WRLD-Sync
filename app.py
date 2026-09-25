@@ -2322,6 +2322,7 @@ async def _run_sync_task(task: QueueTask) -> None:
             raise ValueError("No audio file for this song.")
         lyrics   = task.lyrics or song.get("lyrics", "") or ""
         tmp_path = await _download_audio(task, song)
+    source_lyrics = lyrics
     parsed_lyrics = parse_lyrics_gap_hints(lyrics)
     lyrics = parsed_lyrics.text
     task.gap_hints = [_serialize_gap_hint(hint) for hint in parsed_lyrics.gaps]
@@ -2337,7 +2338,12 @@ async def _run_sync_task(task: QueueTask) -> None:
     await _q_broadcast()
     lines = await _sync_with_gap_hints(task, tmp_path, parsed_lyrics)
     lines = _apply_gap_hints_to_lines(lines, task.gap_hints)
-    task.result = {"lines": lines, "text": lyrics, "gap_hints": task.gap_hints}
+    task.result = {
+        "lines": lines,
+        "text": lyrics,
+        "source_text": source_lyrics,
+        "gap_hints": task.gap_hints,
+    }
     task.progress = {"stage": "done", "msg": f"Done — {len(lines)} lines synced", "step": "done", "pct": 100}
 
 
