@@ -1697,14 +1697,14 @@ function resolveRawLyricReference(previewIndex) {
   if (!line) return null;
   const entries = rawLyricEntries();
   if (!entries.length) return null;
-  const nonempty = entries.filter(x => x.text);
+  const nonempty = entries.filter(x => x.text && !isGapHintControlLine(x.text));
   const storedIndex = Number.isInteger(line.source_line_index) ? line.source_line_index : -1;
   const storedText = String(line.source_line_text ?? '').trim();
   const previewText = String(line.line ?? '').trim();
 
   // Best case: the originally referenced line is still there and still looks
   // like the source text we recorded.
-  if (storedIndex >= 0 && entries[storedIndex]?.text) {
+  if (storedIndex >= 0 && entries[storedIndex]?.text && !isGapHintControlLine(entries[storedIndex].text)) {
     const now = normalizeLyricReference(entries[storedIndex].text);
     if (!storedText || now === normalizeLyricReference(storedText)) return entries[storedIndex];
   }
