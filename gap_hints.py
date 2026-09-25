@@ -104,6 +104,17 @@ def build_alignment_chunks(parsed: ParsedLyrics) -> tuple[AlignmentChunk, ...]:
     return tuple(chunk for chunk in chunks if chunk.lines)
 
 
+def _marker_values(match: re.Match[str]) -> tuple[float, GapInterludeMode]:
+    seconds = float(match.group("seconds") or "0.25")
+    marker_mode = match.group("mode")
+    interlude: GapInterludeMode = (
+        "force" if marker_mode == "+"
+        else "forbid" if marker_mode == "-"
+        else "auto"
+    )
+    return seconds, interlude
+
+
 def _parse_marker_line(line: str) -> tuple[float, GapInterludeMode] | None:
     """Parse one manual gap-control line."""
     stripped = line.strip()
@@ -122,14 +133,35 @@ def _parse_marker_line(line: str) -> tuple[float, GapInterludeMode] | None:
             )
         return None
 
-    seconds = float(match.group("seconds") or "0.25")
-    marker_mode = match.group("mode")
-    interlude: GapInterludeMode = (
-        "force" if marker_mode == "+"
-        else "forbid" if marker_mode == "-"
-        else "auto"
-    )
-    return seconds, interlude
+    return _marker_values(match)
+
+
+def _parse_trailing_marker(
+    line: str,
+) -> tuple[str, float, GapInterludeMode, str] | None:
+    """Parse a gap hint appended to the end of a lyric line.
+
+    Example: "Last lyric 2-[...]" keeps "Last lyric" as lyric text and applies
+    a 2 second, no-interlude boundary immediately after that lyric.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    matches = list(_MARKER_TOKEN_RE.finditer(stripped))
+    if not matches:
+        return None
+
+    match = matches[-1]
+    if match.end() != len(stripped):
+        return None
+
+    lyric = stripped[:match.start()].rstrip()
+    if not lyric:
+        return None
+
+    seconds, interlude = _marker_values(match)
+    return lyric, seconds, interlude, match.group(0)
 
 
 def _merge_gap(existing: GapHint | None, *, position: int, seconds: float,
@@ -169,7 +201,9 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
       .5-[...]    0.5s minimum gap, never emit an interlude
 
     Consecutive marker lines at the same position keep the larger minimum.
-    Plain lyric lines containing "[...]" inline are left untouched.
+    A marker appended to the end of a lyric line applies immediately after that
+    lyric and is stripped from the alignment text. Marker-like text in the
+    middle of a lyric remains literal text.
     """
     lyric_lines: list[str] = []
     gaps_by_position: dict[int, GapHint] = {}
@@ -185,6 +219,20 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
                 seconds=seconds,
                 interlude=interlude,
                 source=raw_line.strip(),
+            )
+            continue
+
+        inline = _parse_trailing_marker(raw_line)
+        if inline is not None:
+            line, seconds, interlude, source = inline
+            lyric_lines.append(line)
+            position = len(lyric_lines)
+            gaps_by_position[position] = _merge_gap(
+                gaps_by_position.get(position),
+                position=position,
+                seconds=seconds,
+                interlude=interlude,
+                source=source,
             )
             continue
 

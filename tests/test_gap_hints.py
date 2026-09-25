@@ -59,11 +59,38 @@ def test_auto_marker_does_not_override_explicit_policy():
     assert parsed.gaps[0].interlude == "forbid"
 
 
-def test_marker_like_text_inside_a_lyric_is_not_control_syntax():
+def test_marker_like_text_in_middle_of_lyric_is_not_control_syntax():
     parsed = parse_lyrics_gap_hints("I waited [...] forever\nNext line")
 
     assert parsed.text == "I waited [...] forever\nNext line"
     assert parsed.gaps == ()
+
+
+def test_trailing_inline_gap_is_stripped_and_applied_after_lyric():
+    parsed = parse_lyrics_gap_hints(
+        "Uh, I wanna tell y'all a story about this girl I met 2-[...]\n"
+        "I don't know if it was in person or if it was in one of my dreams"
+    )
+
+    assert parsed.text == (
+        "Uh, I wanna tell y'all a story about this girl I met\n"
+        "I don't know if it was in person or if it was in one of my dreams"
+    )
+    assert parsed.lines[0] == "Uh, I wanna tell y'all a story about this girl I met"
+    assert len(parsed.gaps) == 1
+    assert parsed.gaps[0].position == 1
+    assert parsed.gaps[0].seconds == 2.0
+    assert parsed.gaps[0].interlude == "forbid"
+    assert parsed.gaps[0].source == "2-[...]"
+
+
+def test_trailing_inline_plain_marker_uses_default_gap():
+    parsed = parse_lyrics_gap_hints("Line one [...]\nLine two")
+
+    assert parsed.text == "Line one\nLine two"
+    assert parsed.gaps[0].position == 1
+    assert parsed.gaps[0].seconds == 0.25
+    assert parsed.gaps[0].interlude == "auto"
 
 
 def test_old_repeated_token_syntax_is_rejected_instead_of_becoming_lyrics():

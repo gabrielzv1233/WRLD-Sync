@@ -1,6 +1,6 @@
 # Manual lyric gap hints
 
-Gap hints are optional control lines in the raw lyrics used by **Sync** when you know there is a real break between two lyric sections.
+Gap hints are optional timing controls in the raw lyrics used by **Sync** when you know there is a real break between two lyric sections. They can occupy their own line or be appended to the end of the lyric immediately before the gap.
 
 They are control metadata, not lyrics. WRLD Sync removes them before forced alignment, and they do not appear as lyric text in Preview or generated TTML.
 
@@ -87,9 +87,24 @@ The old repeated-token form such as `+[...]+[...]` is not part of the literal-se
 
 ## Where hints are recognized
 
-A hint must occupy its own line. Surrounding indentation is fine, but the control itself should be written without spaces, such as `11.5+[...]`.
+A hint can occupy its own line:
 
-Marker-looking text inside an ordinary lyric is left alone:
+```text
+Last line before the gap
+2-[...]
+First line after the gap
+```
+
+or it can be appended directly to the end of the lyric immediately before the gap:
+
+```text
+Last line before the gap 2-[...]
+First line after the gap
+```
+
+Both forms describe the same boundary. The inline control is stripped before alignment, so the lyric becomes just `Last line before the gap`.
+
+Marker-looking text in the **middle** of a lyric is still left alone because treating it as a boundary would be ambiguous:
 
 ```text
 I waited [...] forever
