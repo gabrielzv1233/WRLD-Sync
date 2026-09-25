@@ -1605,7 +1605,8 @@ function isWholeLineParenthetical(line) {
 function effectiveWordBackground(line, word) {
   if (!word?.background) return false;
   const source = String(word.background_source ?? word.backgroundSource ?? '');
-  if (source === 'explicit') return true;
+  if (source === 'explicit' || source === 'display-only') return true;
+  if (source === 'display-only-foreground') return false;
   if (source === 'parenthetical-line' || isWholeLineParenthetical(line)) return true;
   if (source === 'parenthetical-inline') return inlineParentheticalBgToggle.checked;
   // Backward compatibility for cached rows created before background_source
@@ -4115,6 +4116,29 @@ function xmlEsc(value) {
   return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function lineTimedTtmlContent(line) {
+  const text = String(line?.line ?? '');
+  const fragments = Array.isArray(line?.display_only_fragments)
+    ? [...line.display_only_fragments].sort((a, b) => Number(a.display_start) - Number(b.display_start))
+    : [];
+  if (!fragments.length) return xmlEsc(text);
+
+  const out = [];
+  let cursor = 0;
+  fragments.forEach(fragment => {
+    const start = Math.max(cursor, Math.min(text.length, Number(fragment.display_start) || 0));
+    const end = Math.max(start, Math.min(text.length, Number(fragment.display_end) || start));
+    if (start > cursor) out.push(xmlEsc(text.slice(cursor, start)));
+    const fragmentText = xmlEsc(text.slice(start, end) || fragment.text || '');
+    out.push(fragment.background
+      ? `<span ttm:role="x-bg">${fragmentText}</span>`
+      : fragmentText);
+    cursor = end;
+  });
+  if (cursor < text.length) out.push(xmlEsc(text.slice(cursor)));
+  return out.join('');
+}
+
 function buildTTML() {
   const lines = sanitizeTimedLines(syncedLines);
   const lyricLines = lines.filter(l => l.line.trim());
@@ -4178,7 +4202,7 @@ function buildTTML() {
       }
       out.push(`      <p begin="${begin}" end="${end}">${chunks.join(' ')}</p>`);
     } else {
-      out.push(`      <p begin="${begin}" end="${end}">${xmlEsc(line.line)}</p>`);
+      out.push(`      <p begin="${begin}" end="${end}">${lineTimedTtmlContent(line)}</p>`);
     }
 
     if (i + 1 < lines.length) {

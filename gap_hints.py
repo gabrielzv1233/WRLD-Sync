@@ -48,10 +48,26 @@ class GapHint:
 
 
 @dataclass(frozen=True, slots=True)
+class DisplayOnlyFragment:
+    """Text kept for lyric display/output but excluded from model alignment."""
+
+    line_index: int
+    after_word: int
+    display_start: int
+    display_end: int
+    text: str
+    background: bool = True
+    source: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedLyrics:
     text: str
     lines: tuple[str, ...]
     gaps: tuple[GapHint, ...]
+    display_text: str = ""
+    display_lines: tuple[str, ...] = ()
+    display_fragments: tuple[DisplayOnlyFragment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +205,79 @@ def _merge_gap(existing: GapHint | None, *, position: int, seconds: float,
     )
 
 
+def _parse_display_only_fragments(
+    line: str,
+    *,
+    line_index: int,
+) -> tuple[str, str, tuple[DisplayOnlyFragment, ...]]:
+    """Parse inline text that should be displayed but not sent to the aligner.
+
+    -{text} marks a full-line-overlap background fragment.
+    -\\{text} keeps the same display-only behavior but leaves it foreground.
+    The control wrapper itself is never part of model or rendered lyric text.
+    """
+    source = str(line or "")
+    model_parts: list[str] = []
+    display_parts: list[str] = []
+    fragments: list[DisplayOnlyFragment] = []
+    cursor = 0
+
+    while cursor < len(source):
+        bg_at = source.find("-{", cursor)
+        fg_at = source.find("-\\{", cursor)
+        candidates = [(pos, background) for pos, background in ((bg_at, True), (fg_at, False)) if pos >= 0]
+        if not candidates:
+            model_parts.append(source[cursor:])
+            display_parts.append(source[cursor:])
+            break
+
+        start, background = min(candidates, key=lambda item: item[0])
+        prefix = source[cursor:start]
+        model_parts.append(prefix)
+        display_parts.append(prefix)
+
+        opener_len = 2 if background else 3
+        content_start = start + opener_len
+        close = source.find("}", content_start)
+        if close < 0:
+            raise ValueError(
+                f"Unclosed display-only lyric control in: {source.strip()}. "
+                "Use -{text} for background or -\\{text} for foreground."
+            )
+        if "{" in source[content_start:close]:
+            raise ValueError("Nested braces are not supported inside display-only lyric controls.")
+
+        text = source[content_start:close].strip()
+        if not text:
+            raise ValueError("Display-only lyric controls cannot be empty.")
+
+        model_prefix = "".join(model_parts).strip()
+        after_word = len(re.findall(r"\S+", model_prefix))
+        display_start = len("".join(display_parts))
+        display_parts.append(text)
+        display_end = len("".join(display_parts))
+        fragments.append(DisplayOnlyFragment(
+            line_index=line_index,
+            after_word=after_word,
+            display_start=display_start,
+            display_end=display_end,
+            text=text,
+            background=background,
+            source=source[start:close + 1],
+        ))
+        cursor = close + 1
+
+    model_line = re.sub(r"[ \t]{2,}", " ", "".join(model_parts)).strip()
+    display_line = re.sub(r"[ \t]{2,}", " ", "".join(display_parts)).strip()
+
+    if fragments and not model_line:
+        raise ValueError(
+            "A display-only lyric fragment needs normal lyric text on the same line "
+            "so WRLD Sync has something to align."
+        )
+    return model_line, display_line, tuple(fragments)
+
+
 def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
     """Strip manual gap controls from lyrics and return their timing metadata.
 
@@ -204,8 +293,14 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
     A marker appended to the end of a lyric line applies immediately after that
     lyric and is stripped from the alignment text. Marker-like text in the
     middle of a lyric remains literal text.
+
+    Inline display-only controls are also parsed:
+      -{text}    display text as background, but do not align it
+      -\\{text} display text as foreground, but do not align it
     """
     lyric_lines: list[str] = []
+    display_lines: list[str] = []
+    display_fragments: list[DisplayOnlyFragment] = []
     gaps_by_position: dict[int, GapHint] = {}
 
     for raw_line in str(lyrics or "").splitlines():
@@ -222,28 +317,44 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
             )
             continue
 
-        inline = _parse_trailing_marker(raw_line)
-        if inline is not None:
-            line, seconds, interlude, source = inline
-            lyric_lines.append(line)
-            position = len(lyric_lines)
-            gaps_by_position[position] = _merge_gap(
-                gaps_by_position.get(position),
-                position=position,
-                seconds=seconds,
-                interlude=interlude,
-                source=source,
-            )
+        working_line = raw_line
+        trailing_gap = _parse_trailing_marker(working_line)
+        if trailing_gap is not None:
+            working_line, seconds, interlude, source = trailing_gap
+
+        line_index = len(lyric_lines)
+        model_line, display_line, fragments = _parse_display_only_fragments(
+            working_line,
+            line_index=line_index,
+        )
+        if model_line:
+            lyric_lines.append(model_line)
+            display_lines.append(display_line)
+            display_fragments.extend(fragments)
+
+            if trailing_gap is not None:
+                position = len(lyric_lines)
+                gaps_by_position[position] = _merge_gap(
+                    gaps_by_position.get(position),
+                    position=position,
+                    seconds=seconds,
+                    interlude=interlude,
+                    source=source,
+                )
             continue
 
-        line = raw_line.strip()
+        line = working_line.strip()
         if line:
             lyric_lines.append(line)
+            display_lines.append(line)
 
     return ParsedLyrics(
         text="\n".join(lyric_lines),
         lines=tuple(lyric_lines),
         gaps=tuple(gaps_by_position[position] for position in sorted(gaps_by_position)),
+        display_text="\n".join(display_lines),
+        display_lines=tuple(display_lines),
+        display_fragments=tuple(display_fragments),
     )
 
 

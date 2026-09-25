@@ -200,3 +200,60 @@ def test_leading_interlude_force_and_forbid_override_auto_threshold():
     assert should_emit_leading_interlude(1.0, "force")
     assert not should_emit_leading_interlude(8.0, "forbid")
     assert not should_emit_leading_interlude(8.0, "auto", detect_interludes=False)
+
+
+def test_display_only_background_is_removed_from_alignment_but_kept_for_display():
+    parsed = parse_lyrics_gap_hints("I hear -{(yeah)} you")
+
+    assert parsed.text == "I hear you"
+    assert parsed.display_text == "I hear (yeah) you"
+    assert parsed.lines == ("I hear you",)
+    assert parsed.display_lines == ("I hear (yeah) you",)
+    assert len(parsed.display_fragments) == 1
+    fragment = parsed.display_fragments[0]
+    assert fragment.line_index == 0
+    assert fragment.after_word == 2
+    assert fragment.text == "(yeah)"
+    assert fragment.background is True
+
+
+def test_display_only_foreground_escape_is_not_background():
+    parsed = parse_lyrics_gap_hints(r"I hear -\{spoken note} you")
+
+    assert parsed.text == "I hear you"
+    assert parsed.display_text == "I hear spoken note you"
+    fragment = parsed.display_fragments[0]
+    assert fragment.after_word == 2
+    assert fragment.text == "spoken note"
+    assert fragment.background is False
+
+
+def test_multiple_display_only_fragments_keep_source_order():
+    parsed = parse_lyrics_gap_hints(r"A -{(bg one)} B -\{note} C")
+
+    assert parsed.text == "A B C"
+    assert parsed.display_text == "A (bg one) B note C"
+    assert [(f.after_word, f.text, f.background) for f in parsed.display_fragments] == [
+        (1, "(bg one)", True),
+        (2, "note", False),
+    ]
+
+
+def test_display_only_can_coexist_with_trailing_gap_hint():
+    parsed = parse_lyrics_gap_hints("Line -{(ad-lib)} 2-[...]\nNext")
+
+    assert parsed.text == "Line\nNext"
+    assert parsed.display_text == "Line (ad-lib)\nNext"
+    assert parsed.gaps[0].position == 1
+    assert parsed.gaps[0].seconds == 2.0
+    assert parsed.gaps[0].interlude == "forbid"
+
+
+def test_display_only_fragment_requires_aligned_text_on_same_line():
+    with pytest.raises(ValueError, match="needs normal lyric text"):
+        parse_lyrics_gap_hints("-{(only background)}")
+
+
+def test_unclosed_display_only_fragment_is_rejected():
+    with pytest.raises(ValueError, match="Unclosed display-only lyric control"):
+        parse_lyrics_gap_hints("Main lyric -{oops")

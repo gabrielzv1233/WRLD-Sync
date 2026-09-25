@@ -132,3 +132,39 @@ Opening Instrumental output is intentionally conservative:
 - disabling interlude detection suppresses automatic opening Instrumentals, but an explicit `+` still forces one
 
 A trailing hint is retained as metadata, but with no following lyric it does not create another alignment section.
+
+
+## Display-only overlapping lyrics
+
+For background/ad-lib text that overlaps a normal lyric line but should **not** be
+sent to the alignment model, wrap the text with a display-only control:
+
+```text
+Main lyric here -{(background ad-lib)}
+```
+
+WRLD Sync aligns only `Main lyric here`. After alignment, the excluded text is
+restored on that same timed line and is treated as background audio for Preview
+and Apple TTML:
+
+- `-{text}` — exclude `text` from model input, keep it visible, and mark it as background/`x-bg`
+- `-\{text}` — exclude `text` from model input and keep it visible as normal foreground text
+
+The wrapper characters themselves are editor controls and do not appear in
+Preview, TTML, LRC, copied output, or proposals.
+
+Because the model never aligns the wrapped fragment, WRLD Sync intentionally
+does **not** invent a precise word timestamp for it. The fragment inherits the
+start/end range of its containing lyric line, which matches the intended use:
+audio that overlaps the full line.
+
+Display-only controls must share a line with normal lyric text. A line containing
+only `-{...}` or `-\{...}` has no foreground text for the aligner to anchor and
+is rejected instead of receiving a fabricated timestamp.
+
+Examples:
+
+```text
+Ridin' 'round with the burner -{(Brrt, let's go)}
+I heard it -\{spoken note} clearly
+```

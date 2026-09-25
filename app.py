@@ -1444,6 +1444,62 @@ def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[
     return lines
 
 
+def _apply_display_only_fragments_to_lines(lines: list[dict], parsed_lyrics) -> list[dict]:
+    """Restore non-aligned inline fragments using the containing line's timing."""
+    if not lines or not getattr(parsed_lyrics, "display_fragments", None):
+        return lines
+
+    by_line: dict[int, list] = {}
+    for fragment in parsed_lyrics.display_fragments:
+        by_line.setdefault(int(fragment.line_index), []).append(fragment)
+
+    for line_index, fragments in by_line.items():
+        if not (0 <= line_index < len(lines)):
+            continue
+        line = lines[line_index]
+        if line_index < len(parsed_lyrics.display_lines):
+            line["line"] = parsed_lyrics.display_lines[line_index]
+
+        line_start = max(0.0, float(line.get("start", 0.0) or 0.0))
+        line_end = max(line_start + 0.001, float(line.get("end", line_start + 0.001) or line_start + 0.001))
+        serialized = [
+            {
+                "after_word": int(fragment.after_word),
+                "display_start": int(fragment.display_start),
+                "display_end": int(fragment.display_end),
+                "text": str(fragment.text),
+                "background": bool(fragment.background),
+                "source": str(fragment.source),
+            }
+            for fragment in fragments
+        ]
+        line["display_only_fragments"] = serialized
+
+        real_words = list(line.get("words") or [])
+        if not real_words:
+            continue
+
+        merged: list[dict] = []
+        real_index = 0
+        for fragment in sorted(fragments, key=lambda item: item.after_word):
+            target = max(0, min(len(real_words), int(fragment.after_word)))
+            while real_index < target:
+                merged.append(real_words[real_index])
+                real_index += 1
+            merged.append({
+                "word": str(fragment.text),
+                "start": line_start,
+                "end": line_end,
+                "background": bool(fragment.background),
+                "background_source": "display-only" if fragment.background else "display-only-foreground",
+                "display_only": True,
+            })
+        merged.extend(real_words[real_index:])
+        line["words"] = merged
+
+    return lines
+
+
 def _gap_hint_guard_seconds(hint: dict | None) -> float:
     """Literal minimum time before a post-gap lyric can be considered."""
     return _gap_hint_seconds(hint)
@@ -2343,9 +2399,11 @@ async def _run_sync_task(task: QueueTask) -> None:
     await _q_broadcast()
     lines = await _sync_with_gap_hints(task, tmp_path, parsed_lyrics)
     lines = _apply_gap_hints_to_lines(lines, task.gap_hints)
+    lines = _apply_display_only_fragments_to_lines(lines, parsed_lyrics)
     task.result = {
         "lines": lines,
         "text": lyrics,
+        "display_text": parsed_lyrics.display_text or lyrics,
         "source_text": source_lyrics,
         "gap_hints": task.gap_hints,
     }
@@ -3512,7 +3570,8 @@ async def propose_lyrics(req: ProposeRequest):
     )
 
     # Gap hints are WRLD Sync editor controls, not public lyric content.
-    plain_lyrics = parse_lyrics_gap_hints(req.plain_lyrics).text
+    parsed_plain_lyrics = parse_lyrics_gap_hints(req.plain_lyrics)
+    plain_lyrics = parsed_plain_lyrics.display_text or parsed_plain_lyrics.text
 
     # Fetch song name for the proposal title
     song = await jw_get(f"/songs/{req.song_id}/")
