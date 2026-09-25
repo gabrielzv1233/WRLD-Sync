@@ -1828,6 +1828,24 @@ main.sidebar-collapsed #expandSidebarBtn {
 	color: var(--text);
 	background: rgba(255, 255, 255, 0.06);
 }
+.qp-icon-btn {
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	display: grid;
+	place-items: center;
+	flex: 0 0 28px;
+	line-height: 0;
+}
+.qp-icon-btn svg {
+	display: block;
+	width: 14px;
+	height: 14px;
+}
+#closeQueueBtn svg {
+	width: 15px;
+	height: 15px;
+}
 
 #queueContent {
 	flex: 1;
@@ -1919,18 +1937,26 @@ main.sidebar-collapsed #expandSidebarBtn {
 	min-width: 0;
 }
 .tc-cancel-btn {
+	width: 24px;
+	height: 24px;
 	background: none;
 	border: none;
 	color: var(--muted);
 	cursor: pointer;
-	padding: 2px 6px;
+	padding: 0;
 	border-radius: 5px;
-	font-size: 0.9rem;
-	line-height: 1;
-	flex-shrink: 0;
+	display: grid;
+	place-items: center;
+	line-height: 0;
+	flex: 0 0 24px;
 	transition:
 		color 0.12s,
 		background 0.12s;
+}
+.tc-cancel-btn svg {
+	display: block;
+	width: 13px;
+	height: 13px;
 }
 .tc-cancel-btn:hover {
 	color: var(--danger);
@@ -4610,6 +4636,10 @@ body.settings-open {
 }
 #ttmlAceEditor .ace_indent-guide {
 	opacity: 0.25;
+}
+#ttmlAceEditor .ace_text-layer,
+#ttmlAceEditor .ace_line {
+	white-space: pre !important;
 }
 #ttmlAceEditor .ace_scrollbar {
 	scrollbar-width: thin;

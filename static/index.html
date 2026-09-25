@@ -72,8 +72,8 @@
 <div id="queuePanel" role="dialog" aria-label="Task queue">
   <div class="qp-header">
     <span class="qp-title">Task Queue</span>
-    <button class="qp-hbtn" id="clearDoneBtn" type="button">Clear done</button>
-    <button class="qp-hbtn" id="closeQueueBtn" style="font-size:1rem;padding:1px 8px" type="button" aria-label="Close task queue">×</button>
+    <button class="qp-hbtn qp-icon-btn" id="clearDoneBtn" type="button" title="Clear completed tasks" aria-label="Clear completed tasks"><svg class="feather feather-trash" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
+    <button class="qp-hbtn qp-icon-btn" id="closeQueueBtn" type="button" title="Close task queue" aria-label="Close task queue"><svg class="feather feather-x" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
   </div>
   <div id="queueContent">
     <div class="qp-empty">No tasks yet — processing jobs and model downloads will appear here.</div>
@@ -692,6 +692,7 @@ function ensureTtmlAceEditor() {
   editor.session.setUseWorker(false);
   editor.session.setUseWrapMode(false);
   editor.setOptions({
+    wrap: 'off',
     showPrintMargin: false,
     showGutter: true,
     highlightActiveLine: true,
@@ -705,7 +706,14 @@ function ensureTtmlAceEditor() {
   });
   editor.renderer.setPadding(26);
   editor.renderer.setScrollMargin(18, 18, 0, 0);
-  editor.setValue(ttmlEditorText.value || '', -1);
+  editor.session.setUseWrapMode(false);
+  editor.setValue(formatTtmlForEditor(ttmlEditorText.value || ''), -1);
+
+  // TTML word-timed <p> lines can be extremely long. Keep them as physical
+  // source lines with horizontal scrolling instead of Ace soft-wrapping them.
+  editor.session.on('changeWrapMode', () => {
+    if (editor.session.getUseWrapMode()) editor.session.setUseWrapMode(false);
+  });
 
   editor.on('change', () => {
     ttmlEditorText.value = editor.getValue();
@@ -724,15 +732,48 @@ function ensureTtmlAceEditor() {
   requestAnimationFrame(() => editor.resize(true));
   return editor;
 }
+function formatTtmlForEditor(value) {
+  const raw = String(value ?? '').replace(/\r\n?/g, '\n').trim();
+  if (!raw || !/<tt(?:\s|>)/i.test(raw)) return raw;
+
+  // Preserve already-formatted TTML exactly. Older cached/imported TTML can
+  // be minified onto one source line, so only expand that specific case.
+  const declaration = raw.match(/^(<\?xml[^>]*\?>)\s*/i);
+  const xmlDeclaration = declaration?.[1] || '';
+  const body = declaration ? raw.slice(declaration[0].length).trim() : raw;
+  if (body.includes('\n')) return raw;
+
+  const expanded = body
+    .replace(/>\s*(?=<(?:body|div|p)\b)/gi, '>\n')
+    .replace(/(<\/p>)\s*(?=<(?:p|div|\/div|\/body|\/tt)\b)/gi, '$1\n')
+    .replace(/(<\/div>)\s*(?=<(?:div|\/div|\/body|\/tt)\b)/gi, '$1\n')
+    .replace(/(<\/body>)\s*(?=<\/tt>)/gi, '$1\n');
+
+  let depth = 0;
+  const lines = expanded.split('\n').map(line => line.trim()).filter(Boolean);
+  const formatted = lines.map(line => {
+    const leadingClose = /^<\/(?:tt|body|div)\b/i.test(line);
+    if (leadingClose) depth = Math.max(0, depth - 1);
+
+    const rendered = `${'  '.repeat(depth)}${line}`;
+    const opens = (line.match(/<(?:tt|body|div)\b[^>]*>/gi) || []).length;
+    const closes = (line.match(/<\/(?:tt|body|div)>/gi) || []).length;
+    depth = Math.max(0, depth + opens - closes + (leadingClose ? 1 : 0));
+    return rendered;
+  }).join('\n');
+
+  return xmlDeclaration ? `${xmlDeclaration}\n${formatted}` : formatted;
+}
 function getTtmlEditorValue() {
   return ttmlAceEditor ? ttmlAceEditor.getValue() : ttmlEditorText.value;
 }
 function setTtmlEditorValue(value) {
-  const next = String(value ?? '');
+  const next = formatTtmlForEditor(value);
   ttmlEditorText.value = next;
   if (ttmlAceEditor && ttmlAceEditor.getValue() !== next) {
     const cursor = ttmlAceEditor.getCursorPosition();
     ttmlAceEditor.setValue(next, -1);
+    ttmlAceEditor.session.setUseWrapMode(false);
     ttmlAceEditor.moveCursorTo(
       Math.min(cursor.row, Math.max(0, ttmlAceEditor.session.getLength() - 1)),
       cursor.column,
@@ -3085,7 +3126,7 @@ function renderTask(task, isActive) {
       <span class="tc-name" title="${esc(task.song_name)}">${esc(task.song_name)}</span>
       ${canPause ? `<button class="tc-pause-btn" data-task-id="${task.id}" title="Pause download">Ⅱ</button>` : ''}
       ${canResume ? `<button class="tc-resume-btn" data-task-id="${task.id}" title="Resume download">▶</button>` : ''}
-      ${canCancel ? `<button class="tc-cancel-btn" data-task-id="${task.id}" title="Cancel">×</button>` : ''}
+      ${canCancel ? `<button class="tc-cancel-btn" data-task-id="${task.id}" title="Cancel task" aria-label="Cancel task"><svg class="feather feather-trash-2" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></button>` : ''}
     </div>
     ${bodyHtml}
   </div>`;
