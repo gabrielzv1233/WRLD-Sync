@@ -1906,9 +1906,8 @@ function fmtTime(s) {
   return `${neg ? '-' : ''}${m}:${(s % 60).toFixed(1).padStart(4, '0')}`;
 }
 
-function setWordFill(wordEl, fill, scale = 1, active = false) {
+function setWordFill(wordEl, fill, active = false) {
   wordEl.style.setProperty('--fill', `${Math.max(0, Math.min(100, fill)).toFixed(2)}%`);
-  wordEl.style.setProperty('--word-scale', String(scale));
   wordEl.classList.toggle('active', active);
 }
 
@@ -2308,16 +2307,15 @@ function updateActiveWordAnimation(t, idx = activeLineIdx) {
     const end = Number(el.dataset.wEnd);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
     if (t >= end) {
-      setWordFill(el, 100, 1, false);
+      setWordFill(el, 100, false);
     } else if (t <= start) {
-      setWordFill(el, 0, 1, false);
+      setWordFill(el, 0, false);
     } else {
       const progress = (t - start) / (end - start);
-      // The span itself owns its measured start/end. Silence after this word is
-      // intentionally left dark until the next word begins instead of stretching
-      // the highlight through the gap.
-      const pulse = Math.sin(progress * Math.PI);
-      setWordFill(el, progress * 100, 1 + pulse * 0.055, true);
+      // Keep the glyph geometry fixed while the fill sweeps across it. Scaling
+      // a word during its own timestamp made short, wide words visibly jump.
+      // Silence after this word stays dark until the next word begins.
+      setWordFill(el, progress * 100, true);
     }
   });
 }

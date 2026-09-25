@@ -935,14 +935,17 @@ main.sidebar-collapsed #expandSidebarBtn {
 }
 .kw {
 	--fill: 0%;
-	--word-scale: 1;
 	display: inline-grid;
 	grid-template-areas: "word";
 	position: relative;
-	transform: scale(var(--word-scale));
+	transform: translateY(0) scale(1);
 	transform-origin: center 70%;
-	transition: transform 0.075s linear;
+	transition: transform 0.26s cubic-bezier(0.22, 1, 0.36, 1);
 	will-change: transform;
+}
+.kw.active {
+	transform: translateY(-1px) scale(1.025);
+	transition-duration: 0.18s;
 }
 .kw-base,
 .kw-fill {
