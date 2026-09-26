@@ -271,7 +271,7 @@ def test_mixed_controls_keep_model_and_display_order():
 
 
 def test_lyric_controls_can_coexist_with_trailing_gap_hint():
-    parsed = parse_lyrics_gap_hints(r"Line +\{ad-lib} 2-[...]\nNext")
+    parsed = parse_lyrics_gap_hints("Line +\\{ad-lib} 2-[...]\nNext")
 
     assert parsed.text == "Line\nNext"
     assert parsed.display_text == "Line ad-lib\nNext"
