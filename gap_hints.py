@@ -48,15 +48,17 @@ class GapHint:
 
 
 @dataclass(frozen=True, slots=True)
-class DisplayOnlyFragment:
-    """Text kept for lyric display/output but excluded from model alignment."""
+class LyricControlFragment:
+    """Inline lyric-role/alignment control removed from visible output."""
 
     line_index: int
     after_word: int
+    word_count: int
     display_start: int
     display_end: int
     text: str
-    background: bool = True
+    align: bool
+    background_mode: Literal["auto", "force"] = "auto"
     source: str = ""
 
 
@@ -67,7 +69,7 @@ class ParsedLyrics:
     gaps: tuple[GapHint, ...]
     display_text: str = ""
     display_lines: tuple[str, ...] = ()
-    display_fragments: tuple[DisplayOnlyFragment, ...] = ()
+    control_fragments: tuple[LyricControlFragment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,64 +207,79 @@ def _merge_gap(existing: GapHint | None, *, position: int, seconds: float,
     )
 
 
-def _parse_display_only_fragments(
+def _parse_lyric_control_fragments(
     line: str,
     *,
     line_index: int,
-) -> tuple[str, str, tuple[DisplayOnlyFragment, ...]]:
-    """Parse inline text that should be displayed but not sent to the aligner.
+) -> tuple[str, str, tuple[LyricControlFragment, ...]]:
+    """Parse inline role/alignment controls while preserving visible text.
 
-    -{text} marks a full-line-overlap background fragment.
-    -\\{text} keeps the same display-only behavior but leaves it foreground.
-    The control wrapper itself is never part of model or rendered lyric text.
+    -\\{text}  do not align; keep normal automatic background detection
+    +\\{text}  do not align; force background
+    +{text}    align normally; force background
+    -{text}    legacy alias for +\\{text}
     """
     source = str(line or "").strip()
     model_parts: list[str] = []
     display_parts: list[str] = []
-    fragments: list[DisplayOnlyFragment] = []
+    fragments: list[LyricControlFragment] = []
     cursor = 0
+    openers = (
+        ("+\\{", False, "force"),
+        ("-\\{", False, "auto"),
+        ("+{", True, "force"),
+        ("-{", False, "force"),  # compatibility with the first display-only syntax
+    )
 
     while cursor < len(source):
-        bg_at = source.find("-{", cursor)
-        fg_at = source.find("-\\{", cursor)
-        candidates = [(pos, background) for pos, background in ((bg_at, True), (fg_at, False)) if pos >= 0]
+        candidates: list[tuple[int, str, bool, Literal["auto", "force"]]] = []
+        for opener, align, background_mode in openers:
+            pos = source.find(opener, cursor)
+            if pos >= 0:
+                candidates.append((pos, opener, align, background_mode))
         if not candidates:
             model_parts.append(source[cursor:])
             display_parts.append(source[cursor:])
             break
 
-        start, background = min(candidates, key=lambda item: item[0])
+        start, opener, align, background_mode = min(candidates, key=lambda item: item[0])
         prefix = source[cursor:start]
         model_parts.append(prefix)
         display_parts.append(prefix)
 
-        opener_len = 2 if background else 3
-        content_start = start + opener_len
+        content_start = start + len(opener)
         close = source.find("}", content_start)
         if close < 0:
             raise ValueError(
-                f"Unclosed display-only lyric control in: {source.strip()}. "
-                "Use -{text} for background or -\\{text} for foreground."
+                f"Unclosed lyric control in: {source.strip()}. "
+                "Use -\\{text}, +\\{text}, or +{text}."
             )
         if "{" in source[content_start:close]:
-            raise ValueError("Nested braces are not supported inside display-only lyric controls.")
+            raise ValueError("Nested braces are not supported inside lyric controls.")
 
         text = source[content_start:close].strip()
         if not text:
-            raise ValueError("Display-only lyric controls cannot be empty.")
+            raise ValueError("Lyric controls cannot be empty.")
 
         model_prefix = "".join(model_parts).strip()
         after_word = len(re.findall(r"\S+", model_prefix))
+        word_count = len(re.findall(r"\S+", text)) if align else 0
+
         display_start = len("".join(display_parts))
         display_parts.append(text)
         display_end = len("".join(display_parts))
-        fragments.append(DisplayOnlyFragment(
+        if align:
+            model_parts.append(text)
+
+        fragments.append(LyricControlFragment(
             line_index=line_index,
             after_word=after_word,
+            word_count=word_count,
             display_start=display_start,
             display_end=display_end,
             text=text,
-            background=background,
+            align=align,
+            background_mode=background_mode,
             source=source[start:close + 1],
         ))
         cursor = close + 1
@@ -272,7 +289,7 @@ def _parse_display_only_fragments(
 
     if fragments and not model_line:
         raise ValueError(
-            "A display-only lyric fragment needs normal lyric text on the same line "
+            "A non-aligned lyric fragment needs normal lyric text on the same line "
             "so WRLD Sync has something to align."
         )
     return model_line, display_line, tuple(fragments)
@@ -294,13 +311,15 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
     lyric and is stripped from the alignment text. Marker-like text in the
     middle of a lyric remains literal text.
 
-    Inline display-only controls are also parsed:
-      -{text}    display text as background, but do not align it
-      -\\{text} display text as foreground, but do not align it
+    Inline lyric controls are also parsed:
+      -\\{text} do not align; use normal background detection
+      +\\{text} do not align; force background
+      +{text}   align normally; force background
+      -{text}   legacy alias for +\\{text}
     """
     lyric_lines: list[str] = []
     display_lines: list[str] = []
-    display_fragments: list[DisplayOnlyFragment] = []
+    control_fragments: list[LyricControlFragment] = []
     gaps_by_position: dict[int, GapHint] = {}
 
     for raw_line in str(lyrics or "").splitlines():
@@ -323,14 +342,14 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
             working_line, seconds, interlude, source = trailing_gap
 
         line_index = len(lyric_lines)
-        model_line, display_line, fragments = _parse_display_only_fragments(
+        model_line, display_line, fragments = _parse_lyric_control_fragments(
             working_line,
             line_index=line_index,
         )
         if model_line:
             lyric_lines.append(model_line)
             display_lines.append(display_line)
-            display_fragments.extend(fragments)
+            control_fragments.extend(fragments)
 
             if trailing_gap is not None:
                 position = len(lyric_lines)
@@ -354,7 +373,7 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
         gaps=tuple(gaps_by_position[position] for position in sorted(gaps_by_position)),
         display_text="\n".join(display_lines),
         display_lines=tuple(display_lines),
-        display_fragments=tuple(display_fragments),
+        control_fragments=tuple(control_fragments),
     )
 
 

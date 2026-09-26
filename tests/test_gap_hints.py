@@ -202,58 +202,97 @@ def test_leading_interlude_force_and_forbid_override_auto_threshold():
     assert not should_emit_leading_interlude(8.0, "auto", detect_interludes=False)
 
 
-def test_display_only_background_is_removed_from_alignment_but_kept_for_display():
-    parsed = parse_lyrics_gap_hints("I hear -{(yeah)} you")
+
+def test_no_sync_auto_role_keeps_parenthetical_background_detection():
+    parsed = parse_lyrics_gap_hints(r"I hear -\{(yeah)} you")
 
     assert parsed.text == "I hear you"
     assert parsed.display_text == "I hear (yeah) you"
-    assert parsed.lines == ("I hear you",)
-    assert parsed.display_lines == ("I hear (yeah) you",)
-    assert len(parsed.display_fragments) == 1
-    fragment = parsed.display_fragments[0]
-    assert fragment.line_index == 0
+    fragment = parsed.control_fragments[0]
     assert fragment.after_word == 2
+    assert fragment.word_count == 0
     assert fragment.text == "(yeah)"
-    assert fragment.background is True
+    assert fragment.align is False
+    assert fragment.background_mode == "auto"
 
 
-def test_display_only_foreground_escape_is_not_background():
+def test_no_sync_auto_role_does_not_force_plain_text_background():
     parsed = parse_lyrics_gap_hints(r"I hear -\{spoken note} you")
 
     assert parsed.text == "I hear you"
     assert parsed.display_text == "I hear spoken note you"
-    fragment = parsed.display_fragments[0]
+    fragment = parsed.control_fragments[0]
+    assert fragment.align is False
+    assert fragment.background_mode == "auto"
+
+
+def test_no_sync_forced_background():
+    parsed = parse_lyrics_gap_hints(r"I hear +\{spoken note} you")
+
+    assert parsed.text == "I hear you"
+    assert parsed.display_text == "I hear spoken note you"
+    fragment = parsed.control_fragments[0]
     assert fragment.after_word == 2
-    assert fragment.text == "spoken note"
-    assert fragment.background is False
+    assert fragment.align is False
+    assert fragment.background_mode == "force"
 
 
-def test_multiple_display_only_fragments_keep_source_order():
-    parsed = parse_lyrics_gap_hints(r"A -{(bg one)} B -\{note} C")
+def test_sync_forced_background_stays_in_model_text():
+    parsed = parse_lyrics_gap_hints("I hear +{spoken note} you")
 
-    assert parsed.text == "A B C"
-    assert parsed.display_text == "A (bg one) B note C"
-    assert [(f.after_word, f.text, f.background) for f in parsed.display_fragments] == [
-        (1, "(bg one)", True),
-        (2, "note", False),
+    assert parsed.text == "I hear spoken note you"
+    assert parsed.display_text == "I hear spoken note you"
+    fragment = parsed.control_fragments[0]
+    assert fragment.after_word == 2
+    assert fragment.word_count == 2
+    assert fragment.align is True
+    assert fragment.background_mode == "force"
+
+
+def test_legacy_minus_braces_remains_no_sync_forced_background():
+    parsed = parse_lyrics_gap_hints("I hear -{legacy bg} you")
+
+    assert parsed.text == "I hear you"
+    fragment = parsed.control_fragments[0]
+    assert fragment.align is False
+    assert fragment.background_mode == "force"
+
+
+def test_mixed_controls_keep_model_and_display_order():
+    parsed = parse_lyrics_gap_hints(r"A -\{(auto)} B +{forced sync} C +\{forced overlay} D")
+
+    assert parsed.text == "A B forced sync C D"
+    assert parsed.display_text == "A (auto) B forced sync C forced overlay D"
+    assert [(f.after_word, f.word_count, f.align, f.background_mode) for f in parsed.control_fragments] == [
+        (1, 0, False, "auto"),
+        (2, 2, True, "force"),
+        (5, 0, False, "force"),
     ]
 
 
-def test_display_only_can_coexist_with_trailing_gap_hint():
-    parsed = parse_lyrics_gap_hints("Line -{(ad-lib)} 2-[...]\nNext")
+def test_lyric_controls_can_coexist_with_trailing_gap_hint():
+    parsed = parse_lyrics_gap_hints(r"Line +\{ad-lib} 2-[...]\nNext")
 
     assert parsed.text == "Line\nNext"
-    assert parsed.display_text == "Line (ad-lib)\nNext"
+    assert parsed.display_text == "Line ad-lib\nNext"
     assert parsed.gaps[0].position == 1
     assert parsed.gaps[0].seconds == 2.0
     assert parsed.gaps[0].interlude == "forbid"
 
 
-def test_display_only_fragment_requires_aligned_text_on_same_line():
+def test_non_aligned_fragment_requires_aligned_text_on_same_line():
     with pytest.raises(ValueError, match="needs normal lyric text"):
-        parse_lyrics_gap_hints("-{(only background)}")
+        parse_lyrics_gap_hints(r"+\{only background}")
 
 
-def test_unclosed_display_only_fragment_is_rejected():
-    with pytest.raises(ValueError, match="Unclosed display-only lyric control"):
-        parse_lyrics_gap_hints("Main lyric -{oops")
+def test_sync_forced_background_can_be_the_entire_line():
+    parsed = parse_lyrics_gap_hints("+{weird background lyric}")
+
+    assert parsed.text == "weird background lyric"
+    assert parsed.display_text == "weird background lyric"
+    assert parsed.control_fragments[0].align is True
+
+
+def test_unclosed_lyric_control_is_rejected():
+    with pytest.raises(ValueError, match="Unclosed lyric control"):
+        parse_lyrics_gap_hints(r"Main lyric +\{oops")

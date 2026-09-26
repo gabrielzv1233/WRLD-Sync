@@ -134,37 +134,58 @@ Opening Instrumental output is intentionally conservative:
 A trailing hint is retained as metadata, but with no following lyric it does not create another alignment section.
 
 
-## Display-only overlapping lyrics
 
-For background/ad-lib text that overlaps a normal lyric line but should **not** be
-sent to the alignment model, wrap the text with a display-only control:
+## Inline alignment and background-role controls
 
-```text
-Main lyric here -{(background ad-lib)}
-```
+These controls separate two independent decisions: whether text is sent to the
+alignment model, and whether its output is forced to Apple `x-bg`.
 
-WRLD Sync aligns only `Main lyric here`. After alignment, the excluded text is
-restored on that same timed line and is treated as background audio for Preview
-and Apple TTML:
+| Syntax | Sent to aligner? | Background role |
+| --- | --- | --- |
+| `-\{text}` | No | Automatic, using the normal parenthesis rules |
+| `+\{text}` | No | Forced `x-bg` |
+| `+{text}` | Yes | Forced `x-bg` |
+| `-{text}` | No | Forced `x-bg` (legacy alias for `+\{text}`) |
 
-- `-{text}` — exclude `text` from model input, keep it visible, and mark it as background/`x-bg`
-- `-\{text}` — exclude `text` from model input and keep it visible as normal foreground text
+The braces, sign, and backslash are editor controls only. They do not appear in
+Preview, generated TTML/LRC, copied output, or proposals.
 
-The wrapper characters themselves are editor controls and do not appear in
-Preview, TTML, LRC, copied output, or proposals.
-
-Because the model never aligns the wrapped fragment, WRLD Sync intentionally
-does **not** invent a precise word timestamp for it. The fragment inherits the
-start/end range of its containing lyric line, which matches the intended use:
-audio that overlaps the full line.
-
-Display-only controls must share a line with normal lyric text. A line containing
-only `-{...}` or `-\{...}` has no foreground text for the aligner to anchor and
-is rejected instead of receiving a fabricated timestamp.
-
-Examples:
+### Skip alignment but keep automatic background detection
 
 ```text
-Ridin' 'round with the burner -{(Brrt, let's go)}
-I heard it -\{spoken note} clearly
+Main lyric -\{(background ad-lib)}
 ```
+
+The model receives only `Main lyric`. The parenthesized fragment is restored
+afterward and the existing parenthesis logic can render it as background. Plain
+text such as `-\{spoken note}` is also withheld from alignment but is not
+forced to background.
+
+Because a backslash form is never aligned, WRLD Sync does not invent precise
+word timing for it. The restored fragment spans the containing lyric line.
+
+### Skip alignment and force background
+
+```text
+Main lyric +\{background words without parentheses}
+```
+
+The model receives only `Main lyric`, while the restored text is always emitted
+as background/`x-bg`, regardless of parentheses or the inline-parenthetical
+toggle.
+
+### Align normally and force background
+
+```text
+Main +{oddly written background lyric} lyric
+```
+
+The model receives `Main oddly written background lyric lyric`. Those words keep
+their real aligned word timestamps, but WRLD Sync forces that controlled range
+to `x-bg`. This is useful when parentheses would look wrong in the displayed
+lyrics but the vocal is still semantically background.
+
+A non-aligned control must share its line with some normal alignable lyric text.
+A line made only from `+\{...}` or `-\{...}` is rejected because there is no
+anchor from which to obtain the line timing. A line made entirely from
+`+{...}` is valid because that text is sent to the aligner.

@@ -1605,8 +1605,8 @@ function isWholeLineParenthetical(line) {
 function effectiveWordBackground(line, word) {
   if (!word?.background) return false;
   const source = String(word.background_source ?? word.backgroundSource ?? '');
-  if (source === 'explicit' || source === 'display-only') return true;
-  if (source === 'display-only-foreground') return false;
+  if (source === 'explicit' || source === 'forced-background' || source === 'display-only') return true;
+  if (source === 'display-only-auto' || source === 'display-only-foreground') return false;
   if (source === 'parenthetical-line' || isWholeLineParenthetical(line)) return true;
   if (source === 'parenthetical-inline') return inlineParentheticalBgToggle.checked;
   // Backward compatibility for cached rows created before background_source
@@ -4118,9 +4118,12 @@ function xmlEsc(value) {
 
 function lineTimedTtmlContent(line) {
   const text = String(line?.line ?? '');
-  const fragments = Array.isArray(line?.display_only_fragments)
-    ? [...line.display_only_fragments].sort((a, b) => Number(a.display_start) - Number(b.display_start))
-    : [];
+  const rawFragments = Array.isArray(line?.lyric_control_fragments)
+    ? line.lyric_control_fragments
+    : Array.isArray(line?.display_only_fragments)
+      ? line.display_only_fragments
+      : [];
+  const fragments = [...rawFragments].sort((a, b) => Number(a.display_start) - Number(b.display_start));
   if (!fragments.length) return xmlEsc(text);
 
   const out = [];
@@ -4130,7 +4133,13 @@ function lineTimedTtmlContent(line) {
     const end = Math.max(start, Math.min(text.length, Number(fragment.display_end) || start));
     if (start > cursor) out.push(xmlEsc(text.slice(cursor, start)));
     const fragmentText = xmlEsc(text.slice(start, end) || fragment.text || '');
-    out.push(fragment.background
+    const source = String(fragment.background_source ?? '');
+    const background = source === 'forced-background' || source === 'display-only'
+      ? true
+      : source === 'parenthetical-inline'
+        ? !!fragment.background && inlineParentheticalBgToggle.checked
+        : !!fragment.background;
+    out.push(background
       ? `<span ttm:role="x-bg">${fragmentText}</span>`
       : fragmentText);
     cursor = end;

@@ -1444,16 +1444,17 @@ def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[
     return lines
 
 
-def _apply_display_only_fragments_to_lines(lines: list[dict], parsed_lyrics) -> list[dict]:
-    """Restore non-aligned inline fragments using the containing line's timing."""
-    if not lines or not getattr(parsed_lyrics, "display_fragments", None):
+def _apply_lyric_control_fragments_to_lines(lines: list[dict], parsed_lyrics) -> list[dict]:
+    """Apply forced roles and restore text intentionally withheld from alignment."""
+    fragments = list(getattr(parsed_lyrics, "control_fragments", ()) or ())
+    if not lines or not fragments:
         return lines
 
     by_line: dict[int, list] = {}
-    for fragment in parsed_lyrics.display_fragments:
+    for fragment in fragments:
         by_line.setdefault(int(fragment.line_index), []).append(fragment)
 
-    for line_index, fragments in by_line.items():
+    for line_index, line_fragments in by_line.items():
         if not (0 <= line_index < len(lines)):
             continue
         line = lines[line_index]
@@ -1462,26 +1463,50 @@ def _apply_display_only_fragments_to_lines(lines: list[dict], parsed_lyrics) -> 
 
         line_start = max(0.0, float(line.get("start", 0.0) or 0.0))
         line_end = max(line_start + 0.001, float(line.get("end", line_start + 0.001) or line_start + 0.001))
-        serialized = [
-            {
+        real_words = list(line.get("words") or [])
+
+        # +{...} stays in the aligner input, so keep its real word timestamps and
+        # only force the corresponding aligned words to x-bg.
+        for fragment in line_fragments:
+            if not fragment.align or fragment.background_mode != "force" or not real_words:
+                continue
+            start = max(0, min(len(real_words), int(fragment.after_word)))
+            stop = max(start, min(len(real_words), start + int(fragment.word_count)))
+            for word in real_words[start:stop]:
+                word["background"] = True
+                word["background_source"] = "forced-background"
+
+        serialized = []
+        for fragment in line_fragments:
+            if fragment.background_mode == "force":
+                background = True
+                background_source = "forced-background"
+            else:
+                stripped = str(fragment.text).strip()
+                background = len(stripped) >= 2 and stripped.startswith("(") and stripped.endswith(")")
+                background_source = "parenthetical-inline" if background else "display-only-auto"
+            serialized.append({
                 "after_word": int(fragment.after_word),
+                "word_count": int(fragment.word_count),
                 "display_start": int(fragment.display_start),
                 "display_end": int(fragment.display_end),
                 "text": str(fragment.text),
-                "background": bool(fragment.background),
+                "align": bool(fragment.align),
+                "background": background,
+                "background_source": background_source,
                 "source": str(fragment.source),
-            }
-            for fragment in fragments
-        ]
-        line["display_only_fragments"] = serialized
+            })
+        line["lyric_control_fragments"] = serialized
 
-        real_words = list(line.get("words") or [])
+        # Backslash forms were withheld from the model. Reinsert each as one
+        # line-spanning overlay token rather than fabricating word precision.
         if not real_words:
             continue
-
         merged: list[dict] = []
         real_index = 0
-        for fragment in sorted(fragments, key=lambda item: item.after_word):
+        for fragment, metadata in zip(line_fragments, serialized):
+            if fragment.align:
+                continue
             target = max(0, min(len(real_words), int(fragment.after_word)))
             while real_index < target:
                 merged.append(real_words[real_index])
@@ -1490,8 +1515,8 @@ def _apply_display_only_fragments_to_lines(lines: list[dict], parsed_lyrics) -> 
                 "word": str(fragment.text),
                 "start": line_start,
                 "end": line_end,
-                "background": bool(fragment.background),
-                "background_source": "display-only" if fragment.background else "display-only-foreground",
+                "background": bool(metadata["background"]),
+                "background_source": str(metadata["background_source"]),
                 "display_only": True,
             })
         merged.extend(real_words[real_index:])
@@ -2399,7 +2424,7 @@ async def _run_sync_task(task: QueueTask) -> None:
     await _q_broadcast()
     lines = await _sync_with_gap_hints(task, tmp_path, parsed_lyrics)
     lines = _apply_gap_hints_to_lines(lines, task.gap_hints)
-    lines = _apply_display_only_fragments_to_lines(lines, parsed_lyrics)
+    lines = _apply_lyric_control_fragments_to_lines(lines, parsed_lyrics)
     task.result = {
         "lines": lines,
         "text": lyrics,
@@ -3321,7 +3346,13 @@ def _sanitize_timed_lines(
             opens_bg = "(" in word_text
             closes_bg = ")" in word_text
 
-            if existing_source == "explicit":
+            if existing_source in ("forced-background", "display-only"):
+                background = bool(explicit_bg)
+                background_source = "forced-background" if background else ""
+            elif existing_source == "display-only-auto":
+                background = bool(explicit_bg)
+                background_source = "display-only-auto"
+            elif existing_source == "explicit":
                 background = bool(explicit_bg)
                 background_source = "explicit" if background else ""
             elif existing_source == "parenthetical-line":
@@ -3360,6 +3391,8 @@ def _sanitize_timed_lines(
             }
             if "probability" in raw_word:
                 item["probability"] = raw_word["probability"]
+            if raw_word.get("display_only"):
+                item["display_only"] = True
             valid_words.append(item)
 
             if explicit_bg is None and not whole_line_parenthetical:
@@ -3381,6 +3414,12 @@ def _sanitize_timed_lines(
             "end": end,
             "words": valid_words,
         }
+        lyric_controls = raw.get("lyric_control_fragments")
+        if isinstance(lyric_controls, list):
+            cleaned_line["lyric_control_fragments"] = [
+                dict(fragment) for fragment in lyric_controls if isinstance(fragment, dict)
+            ]
+
         for gap_key in ("gap_before", "gap_after"):
             gap_meta = raw.get(gap_key)
             if isinstance(gap_meta, dict):
@@ -3445,8 +3484,10 @@ def _build_ttml(
         if not word.get("background"):
             return False
         source = str(word.get("background_source") or "")
-        if source == "explicit":
+        if source in ("explicit", "forced-background", "display-only"):
             return True
+        if source == "display-only-auto":
+            return False
         if source == "parenthetical-line":
             return True
         if source == "parenthetical-inline":
@@ -3456,6 +3497,49 @@ def _build_ttml(
         if not whole_line and "(" in line_text and ")" in line_text:
             return bool(inline_parenthetical_background)
         return True
+
+    def add_line_timed_content(p, line: dict) -> None:
+        text = str(line.get("line") or "")
+        fragments = [
+            fragment for fragment in (line.get("lyric_control_fragments") or [])
+            if isinstance(fragment, dict)
+        ]
+        fragments.sort(key=lambda fragment: int(fragment.get("display_start", 0) or 0))
+        if not fragments:
+            p.text = text
+            return
+
+        cursor = 0
+        last_child = None
+
+        def append_text(value: str) -> None:
+            nonlocal last_child
+            if not value:
+                return
+            if last_child is None:
+                p.text = (p.text or "") + value
+            else:
+                last_child.tail = (last_child.tail or "") + value
+
+        for fragment in fragments:
+            start = max(cursor, min(len(text), int(fragment.get("display_start", 0) or 0)))
+            end = max(start, min(len(text), int(fragment.get("display_end", start) or start)))
+            append_text(text[cursor:start])
+            fragment_text = text[start:end] or str(fragment.get("text") or "")
+            source = str(fragment.get("background_source") or "")
+            background = bool(fragment.get("background"))
+            if source == "parenthetical-inline":
+                background = background and bool(inline_parenthetical_background)
+            if background:
+                bg = ET.SubElement(p, f"{{{TTML_NS}}}span", {
+                    f"{{{TTM_NS}}}role": "x-bg",
+                })
+                bg.text = fragment_text
+                last_child = bg
+            else:
+                append_text(fragment_text)
+            cursor = end
+        append_text(text[cursor:])
 
     def add_line(div, line: dict, block_end: float | None = None) -> None:
         # Overlapping lines can end out of order. A parent lyric div must remain
@@ -3489,7 +3573,7 @@ def _build_ttml(
                 if i < len(line["words"]):
                     span.tail = " "
         else:
-            p.text = line["line"]
+            add_line_timed_content(p, line)
 
     threshold = max(0.0, float(interlude_threshold))
     leading_hint = lines[0].get("gap_before") if isinstance(lines[0].get("gap_before"), dict) else {}
