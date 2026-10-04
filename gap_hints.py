@@ -30,6 +30,9 @@ _MARKER_TOKEN_RE = re.compile(
     r"(?P<marker>\[\.\.\.\])"
 )
 _CONTROLISH_RE = re.compile(r"[0-9.+\-\s\[\]]+")
+_BACKWARD_LINE_RE = re.compile(
+    r"-(?P<seconds>(?:\d+(?:\.\d+)?|\.\d+))-\[\.\.\.\]"
+)
 _INLINE_TIMING_RE = re.compile(
     r"(?P<backward>-(?P<back_seconds>(?:\d+(?:\.\d+)?|\.\d+))-\[\.\.\.\])"
     r"|(?P<ordinary>(?P<seconds>(?:\d+(?:\.\d+)?|\.\d+))?(?P<mode>[+-]?)\[\.\.\.\])"
@@ -50,6 +53,13 @@ class GapHint:
     seconds: float = 0.25
     interlude: GapInterludeMode = "auto"
     source: str = "[...]"
+
+
+@dataclass(frozen=True, slots=True)
+class BackwardLineHint:
+    position: int
+    seconds: float
+    source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +96,7 @@ class ParsedLyrics:
     display_lines: tuple[str, ...] = ()
     control_fragments: tuple[LyricControlFragment, ...] = ()
     inline_hints: tuple[InlineTimingHint, ...] = ()
+    backward_line_hints: tuple[BackwardLineHint, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,9 +407,18 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
     display_lines: list[str] = []
     control_fragments: list[LyricControlFragment] = []
     inline_hints: list[InlineTimingHint] = []
+    backward_line_hints: list[BackwardLineHint] = []
     gaps_by_position: dict[int, GapHint] = {}
 
     for raw_line in str(lyrics or "").splitlines():
+        backward_line = _BACKWARD_LINE_RE.fullmatch(raw_line.strip())
+        if backward_line is not None:
+            backward_line_hints.append(BackwardLineHint(
+                position=len(lyric_lines),
+                seconds=float(backward_line.group("seconds")),
+                source=backward_line.group(0),
+            ))
+            continue
         parsed = _parse_marker_line(raw_line)
         if parsed is not None:
             seconds, interlude = parsed
@@ -413,11 +433,15 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
             continue
 
         working_line = raw_line
-        if re.search(r"-(?:\d+(?:\.\d+)?|\.\d+)-\[\.\.\.\]\s*$", working_line):
-            raise ValueError(
-                "A backward -2-[...] correction must be followed by lyric text "
-                "on the same line."
-            )
+        stripped_working = working_line.rstrip()
+        trailing_backward = _BACKWARD_LINE_RE.search(stripped_working)
+        backward_seconds = None
+        if trailing_backward is not None and trailing_backward.end() == len(stripped_working):
+            prefix = stripped_working[:trailing_backward.start()].rstrip()
+            if prefix:
+                backward_seconds = float(trailing_backward.group("seconds"))
+                working_line = prefix
+
         trailing_gap = _parse_trailing_marker(working_line)
         if trailing_gap is not None:
             working_line, seconds, interlude, source = trailing_gap
@@ -439,6 +463,12 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
             display_lines.append(display_line)
             control_fragments.extend(fragments)
             inline_hints.extend(inline)
+            if backward_seconds is not None:
+                backward_line_hints.append(BackwardLineHint(
+                    position=len(lyric_lines),
+                    seconds=backward_seconds,
+                    source=trailing_backward.group(0),
+                ))
 
             if trailing_gap is not None:
                 position = len(lyric_lines)
@@ -456,6 +486,13 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
             lyric_lines.append(line)
             display_lines.append(line)
 
+    if any(hint.position >= len(lyric_lines) for hint in backward_line_hints):
+        raise ValueError("A backward correction needs lyrics after the marker.")
+    if any(hint.position in gaps_by_position for hint in backward_line_hints):
+        raise ValueError(
+            "A forward gap and backward correction cannot occupy the same line boundary."
+        )
+
     return ParsedLyrics(
         text="\n".join(lyric_lines),
         lines=tuple(lyric_lines),
@@ -464,6 +501,7 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
         display_lines=tuple(display_lines),
         control_fragments=tuple(control_fragments),
         inline_hints=tuple(inline_hints),
+        backward_line_hints=tuple(backward_line_hints),
     )
 
 

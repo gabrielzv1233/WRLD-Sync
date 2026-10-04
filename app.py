@@ -2274,12 +2274,18 @@ def _virtualize_inline_timing(parsed_lyrics):
         by_line.setdefault(hint.line_index, []).append(hint)
 
     original_gaps = {hint.position: hint for hint in parsed_lyrics.gaps}
+    line_shifts: dict[int, float] = {}
+    for hint in parsed_lyrics.backward_line_hints:
+        line_shifts[hint.position] = line_shifts.get(hint.position, 0.0) - hint.seconds
     virtual_lines: list[str] = []
     source_indices: list[int] = []
     virtual_gaps: list[GapHint] = []
     backward_at: dict[int, float] = {}
 
     for line_index, text in enumerate(parsed_lyrics.lines):
+        if line_index in line_shifts:
+            at = len(virtual_lines)
+            backward_at[at] = backward_at.get(at, 0.0) + line_shifts[line_index]
         original = original_gaps.get(line_index)
         if original is not None:
             virtual_gaps.append(dc_replace(original, position=len(virtual_lines)))
@@ -2318,6 +2324,7 @@ def _virtualize_inline_timing(parsed_lyrics):
         lines=tuple(virtual_lines),
         gaps=tuple(sorted(virtual_gaps, key=lambda hint: hint.position)),
         inline_hints=(),
+        backward_line_hints=(),
     )
     return virtual, source_indices, backward_at
 
@@ -2528,7 +2535,7 @@ async def _run_sync_task(task: QueueTask) -> None:
     label = get_managed_spec(sync_model).label if sync_model in MODEL_SPECS else f"Whisper {sync_model}"
     task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 52}
     await _q_broadcast()
-    if parsed_lyrics.inline_hints:
+    if parsed_lyrics.inline_hints or parsed_lyrics.backward_line_hints:
         virtual, source_indices, backward_at = _virtualize_inline_timing(parsed_lyrics)
         virtual_lines = await _sync_with_gap_hints(
             task, tmp_path, virtual, preserve_pre_gap_context=False,

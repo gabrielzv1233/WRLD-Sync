@@ -221,3 +221,16 @@ place content before 00:00 is rejected, not clamped.
 Internal timing markers must have actual alignable words on both sides.
 `2+[...] ` (forced Instrumental) is restricted to boundaries between whole
 lines: a single TTML lyric paragraph cannot also be an Instrumental section.
+
+
+Backward corrections also work **between whole lines**, either appended to the
+preceding line or on their own line:
+
+```text
+First line
+-2-[...]
+Second line
+```
+
+In that case the negative correction begins with `Second line`. A trailing
+negative correction without any subsequent lyrics is an error.

@@ -333,7 +333,7 @@ def test_multiple_inline_timing_hints_and_trailing_gap():
 
 
 def test_inline_timing_with_role_controls_counts_only_aligned_words():
-    parsed = parse_lyrics_gap_hints(r"A -\\{overlay} 2-[...]B +{forced words} C")
+    parsed = parse_lyrics_gap_hints(r"A -\{overlay} 2-[...]B +{forced words} C")
     assert parsed.text == "A B forced words C"
     assert parsed.inline_hints[0].after_word == 1
     assert parsed.control_fragments[0].text == "overlay"
@@ -351,6 +351,29 @@ def test_reject_forced_instrumental_mid_line():
         parse_lyrics_gap_hints("A 2+[...]B")
 
 
-def test_backward_requires_following_same_line_text():
-    with pytest.raises(ValueError, match="must be followed"):
+def test_backward_at_end_requires_a_following_lyric_line():
+    with pytest.raises(ValueError, match="needs lyrics after"):
         parse_lyrics_gap_hints("A -2-[...]")
+
+
+
+def test_backward_correction_on_its_own_line():
+    parsed = parse_lyrics_gap_hints("First line\n-2-[...]\nSecond line")
+    assert parsed.text == "First line\nSecond line"
+    assert parsed.inline_hints == ()
+    assert [(hint.position, hint.seconds) for hint in parsed.backward_line_hints] == [
+        (1, 2.0)
+    ]
+
+
+def test_backward_correction_after_end_of_line():
+    parsed = parse_lyrics_gap_hints("First line -1.5-[...]\nSecond line")
+    assert parsed.text == "First line\nSecond line"
+    assert [(hint.position, hint.seconds) for hint in parsed.backward_line_hints] == [
+        (1, 1.5)
+    ]
+
+
+def test_backward_correction_needs_following_line():
+    with pytest.raises(ValueError, match="needs lyrics after"):
+        parse_lyrics_gap_hints("First line\n-2-[...]")
