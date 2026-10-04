@@ -492,7 +492,9 @@ function stripGapHintControls(value) {
 function restoreCachedGapHints(value, hints) {
   const raw = String(value ?? '');
   if (!raw || !Array.isArray(hints) || !hints.length) return raw;
-  if (raw.split(/\r?\n/).some(isGapHintControlLine)) return raw;
+  // Current caches already persist the exact editable source, including
+  // intra-line markers. Never reinsert old line-boundary metadata into it.
+  if (TIMING_CONTROL_TOKEN_RE.test(raw)) return raw;
 
   const byPosition = new Map();
   hints.forEach(hint => {
@@ -3338,7 +3340,9 @@ function applyCompletedTasks(state) {
       updateLyricsSrc('edited', !!sourceText);
       renderKaraoke(syncedLines);
       setTab('karaoke');
-      const hintCount = Array.isArray(task.result.gap_hints) ? task.result.gap_hints.length : 0;
+      const hintCount = Number.isInteger(task.result.timing_hint_count)
+        ? task.result.timing_hint_count
+        : Array.isArray(task.result.gap_hints) ? task.result.gap_hints.length : 0;
       const hintLabel = hintCount ? ` · ${hintCount} timing hint${hintCount === 1 ? '' : 's'} applied` : '';
       setSyncStatus(`Synced ${syncedLines.length} lyric lines ✓${hintLabel}`, 'ok');
       maybeShowPropose();
