@@ -473,6 +473,16 @@ const GAP_HINT_LINE_RE = /^(?:(?:\d+(?:\.\d+)?|\.\d+))?[+-]?\[\.\.\.\]$/;
 function isGapHintControlLine(value) {
   return GAP_HINT_LINE_RE.test(String(value ?? '').trim());
 }
+// Check processed/output lyrics only. Never strip controls from the editable source.
+// A leaked timed marker means the backend aligned control syntax as a vocal word;
+// deleting that word now would NOT apply its requested timing correction.
+const TIMING_CONTROL_TOKEN_RE = /(?:-(?:\d+(?:\.\d+)?|\.\d+)-|(?:\d+(?:\.\d+)?|\.\d+)?[+-]?)\[\.\.\.\]/;
+function hasLeakedTimingControls(lines) {
+  return Array.isArray(lines) && lines.some(line =>
+    TIMING_CONTROL_TOKEN_RE.test(String(line?.line ?? ''))
+    || (Array.isArray(line?.words) && line.words.some(word =>
+      TIMING_CONTROL_TOKEN_RE.test(String(word?.word ?? word?.text ?? '')))));
+}
 function stripGapHintControls(value) {
   return String(value ?? '')
     .split(/\r?\n/)
@@ -1516,7 +1526,19 @@ async function loadSongData(song) {
     updateLyricsSrc('api', !!song.lyrics);
 
     const localProcessed = song._local_processed;
-    if (localProcessed?.lines?.length) {
+    if (localProcessed?.lines?.length && hasLeakedTimingControls(localProcessed.lines)) {
+      // Old cached output must not be confused with a correctly applied timing hint.
+      // Keep the raw editor text verbatim, including every marker, for another Sync.
+      if (localProcessed.lyrics) {
+        const restoredLyrics = restoreCachedGapHints(localProcessed.lyrics, localProcessed.settings?.gap_hints);
+        plainLyricsText.value = restoredLyrics;
+        customLyrics = restoredLyrics;
+        updateLyricsSrc('local', true);
+      }
+      currentTtmlSource = '';
+      setKaraokeDefault();
+      setSyncStatus('Cached alignment contains a literal timing marker. Original Lyrics retained. Restart the updated inline-timing-hints backend, then Sync again.', 'error');
+    } else if (localProcessed?.lines?.length) {
       syncedLines = sanitizeTimedLines(localProcessed.lines);
       currentTtmlSource = localProcessed.ttml || '';
       const ps = localProcessed.settings ?? {};
@@ -2748,13 +2770,18 @@ function queueProcessedSave(sourceType = 'editor') {
   _processedSaveTimer = setTimeout(() => saveProcessedState(sourceType), 450);
 }
 refreshTtmlBtn.addEventListener('click', () => {
-  setTtmlEditorValue(syncedLines.length ? buildTTML().text : '');
+  try { setTtmlEditorValue(syncedLines.length ? buildTTML().text : ''); }
+  catch (error) { setSyncStatus(error.message, 'error'); }
 });
 saveTtmlBtn.addEventListener('click', async () => {
   const raw = getTtmlEditorValue().trim();
   if (!/<tt(?:\s|>)/i.test(raw)) { setSyncStatus('TTML editor expects Apple TTML.', 'error'); return; }
   const lines = parseTTML(raw);
   if (!lines.length) { setSyncStatus('Could not parse any timed lyric lines from that TTML.', 'error'); return; }
+  if (hasLeakedTimingControls(lines)) {
+    setSyncStatus('This TTML contains literal timing controls. Edit the raw Lyrics source and run Sync instead of importing invalid timing.', 'error');
+    return;
+  }
   syncedLines = lines;
   renderKaraoke(syncedLines);
   maybeShowPropose();
@@ -3286,6 +3313,22 @@ function applyCompletedTasks(state) {
     // of the editable Lyrics source. Preview/TTML/LRC use syncedLines only.
     if (task.type === 'sync' && task.status === 'done' && task.result?.lines?.length) {
       _appliedTaskIds.add(task.id);
+      if (hasLeakedTimingControls(task.result.lines)) {
+        // Fail closed: this was aligned by a stale/broken server. Sanitizing
+        // the marker out of its word list would not fix the actual timestamps.
+        // In particular, do not overwrite plainLyricsText.value with cleaned text.
+        if (!plainLyricsText.value.trim() && task.result.source_text) {
+          plainLyricsText.value = task.result.source_text;
+          customLyrics = plainLyricsText.value;
+          updateLyricsSrc('edited', true);
+        }
+        syncedLines = [];
+        currentTtmlSource = '';
+        setKaraokeDefault();
+        maybeShowPropose();
+        setSyncStatus('Sync returned literal timing controls as words. Your Lyrics source is preserved. Restart the backend using inline-timing-hints and re-run Sync.', 'error');
+        continue;
+      }
       syncedLines = task.result.lines; currentTtmlSource = '';
       const cleanedText = task.result.text || syncedLines.map(l => l.line ?? '').join('\n');
       const sourceText = task.result.source_text || cleanedText;
@@ -3880,6 +3923,18 @@ localBrowseBtn.addEventListener('click', () => localFileInput.click());
 
 function applyCachedLocalProcessing(processed) {
   if (!processed?.lines?.length) return false;
+  if (hasLeakedTimingControls(processed.lines)) {
+    if (processed.lyrics) {
+      const source = restoreCachedGapHints(processed.lyrics, processed.settings?.gap_hints);
+      plainLyricsText.value = source;
+      customLyrics = source;
+      updateLyricsSrc('local', true);
+    }
+    syncedLines = [];
+    currentTtmlSource = '';
+    setKaraokeDefault();
+    return 'invalid';
+  }
   syncedLines = sanitizeTimedLines(processed.lines);
   currentTtmlSource = processed.ttml || '';
   const ps = processed.settings ?? {};
@@ -3947,10 +4002,12 @@ async function loadLocalTrack(meta) {
   hideLocalLanding();
   await refreshVocalReference();
   setActiveSourceParam(meta.source_url || meta.path);
-  setTab(!restored && meta.lyrics ? 'plain' : 'karaoke');
-  setSyncStatus(restored ? 'Loaded local file + cached processed lyrics ✓'
+  setTab(restored === 'invalid' || (!restored && plainLyricsText.value) ? 'plain' : 'karaoke');
+  setSyncStatus(restored === 'invalid'
+    ? 'Cached alignment contains literal timing controls. Original Lyrics retained. Restart the updated inline-timing-hints backend and re-run Sync.'
+    : restored ? 'Loaded local file + cached processed lyrics ✓'
     : meta.lyrics ? 'Loaded audio + YouTube captions. Review in Lyrics, then Sync to align.'
-    : meta.lyrics_notice || `Loaded local file · ${meta.track_hash.slice(0, 12)}…`, 'ok');
+    : meta.lyrics_notice || `Loaded local file · ${meta.track_hash.slice(0, 12)}…`, restored === 'invalid' ? 'error' : 'ok');
   animateSidebarReturn();
 }
 
@@ -4091,13 +4148,14 @@ tokenInput.addEventListener('keydown', (e) => {
 
 // ── Propose & copy ────────────────────────────────────────────────────────
 function maybeShowPropose() {
-  const has = syncedLines.length > 0;
+  const has = syncedLines.length > 0 && !hasLeakedTimingControls(syncedLines);
   proposeBtn.classList.toggle('visible', has);
   copyTtmlBtn.classList.toggle('visible', has);
   copyLrcBtn.classList.toggle('visible', has);
 }
 
 function buildLrc() {
+  if (hasLeakedTimingControls(syncedLines)) throw new Error('Timing markers leaked into synced lyrics. Re-run Sync before exporting.');
   return sanitizeTimedLines(syncedLines).map(l => {
     const s = l.start ?? 0; const m = Math.floor(s / 60);
     return `[${m}:${(s % 60).toFixed(2).padStart(5, '0')}] ${l.line ?? ''}`;
@@ -4149,6 +4207,7 @@ function lineTimedTtmlContent(line) {
 }
 
 function buildTTML() {
+  if (hasLeakedTimingControls(syncedLines)) throw new Error('Timing markers leaked into synced lyrics. Re-run Sync before exporting.');
   const lines = sanitizeTimedLines(syncedLines);
   const lyricLines = lines.filter(l => l.line.trim());
   const useWords = wordTimingToggle.checked && lyricLines.length > 0 && lyricLines.every(l => l.words?.length);
@@ -4261,6 +4320,10 @@ proposeBtn.addEventListener('click', async () => {
     openSettings({ focusToken: true }); return;
   }
   if (!currentSong || !syncedLines.length) return;
+  if (hasLeakedTimingControls(syncedLines)) {
+    setSyncStatus('Timing markers leaked into processed lyrics. Re-run Sync before proposing.', 'error');
+    return;
+  }
   proposeBtn.disabled = true;
   setSyncStatus('<span class="spinner"></span> Submitting proposal…', '');
   try {
