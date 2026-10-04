@@ -469,7 +469,7 @@ let autoFollow     = true;
 let localFilePath  = '';    // server-side path of uploaded local file (empty = API mode)
 let currentLocalTrack = null; // metadata/hash for local-file mode
 
-const GAP_HINT_LINE_RE = /^(?:(?:\d+(?:\.\d+)?|\.\d+))?[+-]?\[\.\.\.\]$/;
+const GAP_HINT_LINE_RE = /^(?:-(?:\d+(?:\.\d+)?|\.\d+)-|(?:\d+(?:\.\d+)?|\.\d+)?[+-]?)\[\.\.\.\]$/;
 function isGapHintControlLine(value) {
   return GAP_HINT_LINE_RE.test(String(value ?? '').trim());
 }
@@ -540,7 +540,10 @@ function mergeVerifiedLyricsWithGapHints(sourceText, verifyResults, keepResult) 
       out.push(line);
       return;
     }
-    if (keepResult(result)) out.push(String(result.line ?? line));
+    // Verify evaluates cleaned lyrics, but is only allowed to REMOVE rows.
+    // Always retain the untouched raw source for kept rows, including any
+    // inline timing markers, role controls, and original user formatting.
+    if (keepResult(result)) out.push(line);
   });
 
   return out.join('\n');
