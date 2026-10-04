@@ -1426,6 +1426,39 @@ def _serialize_gap_hint(hint) -> dict:
     }
 
 
+def _assert_timing_hints_consumed(lines: list[dict], parsed_lyrics) -> None:
+    """Do not cache/export a Sync result that aligned source controls as words.
+
+    The original input is separately retained as source_text for the Lyrics tab.
+    Dropping an already-aligned marker would hide the symptom without applying
+    its timing adjustment, so fail the task and require correct re-alignment.
+    """
+    tokens = {
+        token.strip()
+        for hint in (
+            *parsed_lyrics.gaps,
+            *parsed_lyrics.inline_hints,
+            *parsed_lyrics.backward_line_hints,
+        )
+        for token in str(hint.source).splitlines()
+        if token.strip()
+    }
+    if not tokens:
+        return
+
+    for line in lines:
+        rendered = (
+            str(line.get("line") or ""),
+            *(str(w.get("word") or w.get("text") or "") for w in (line.get("words") or ())),
+        )
+        if any(token in value for value in rendered for token in tokens):
+            raise ValueError(
+                "A lyric timing marker reached the alignment output as text. "
+                "The original Lyrics input has been preserved; retry Sync using "
+                "the updated inline-timing-hints backend."
+            )
+
+
 def _apply_gap_hints_to_lines(lines: list[dict], gap_hints: list[dict]) -> list[dict]:
     """Attach leading/between-line controls without turning them into lyrics."""
     if not lines or not gap_hints:
@@ -2547,12 +2580,18 @@ async def _run_sync_task(task: QueueTask) -> None:
         lines = await _sync_with_gap_hints(task, tmp_path, parsed_lyrics)
     lines = _apply_gap_hints_to_lines(lines, task.gap_hints)
     lines = _apply_lyric_control_fragments_to_lines(lines, parsed_lyrics)
+    _assert_timing_hints_consumed(lines, parsed_lyrics)
     task.result = {
         "lines": lines,
         "text": lyrics,
         "display_text": parsed_lyrics.display_text or lyrics,
         "source_text": source_lyrics,
         "gap_hints": task.gap_hints,
+        "timing_hint_count": (
+            len(parsed_lyrics.gaps)
+            + len(parsed_lyrics.inline_hints)
+            + len(parsed_lyrics.backward_line_hints)
+        ),
     }
     task.progress = {"stage": "done", "msg": f"Done — {len(lines)} lines synced", "step": "done", "pct": 100}
 
