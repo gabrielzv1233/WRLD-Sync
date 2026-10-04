@@ -104,13 +104,28 @@ First line after the gap
 
 Both forms describe the same boundary. The inline control is stripped before alignment, so the lyric becomes just `Last line before the gap`.
 
-Marker-looking text in the **middle** of a lyric is still left alone because treating it as a boundary would be ambiguous:
+Markers can also occur **between words in the same lyric line**. The
+alignment is split into temporary segments, while Preview and TTML retain
+the original lyric row:
 
 ```text
-I waited [...] forever
+Ah, 2-[...]pour up, pour up
 ```
 
-That line remains normal lyric text.
+This displays as `Ah, pour up, pour up`. The second segment is searched for
+at least two seconds after the first segment ends, with no Instrumental emitted.
+No spaces around the marker are necessary.
+
+A leading minus on the number is different from the interlude-policy minus:
+
+```text
+Ah, -2-[...]pour up, pour up
+```
+
+This shifts the following segment and all subsequent lyric timestamps exactly
+two seconds earlier, without altering `Ah,`. A correction that would move any
+timestamp before 00:00 is rejected. See [Mid-line timing adjustments](#mid-line-timing-adjustments)
+for restrictions and examples.
 
 ## Leading hints and opening instrumentals
 
