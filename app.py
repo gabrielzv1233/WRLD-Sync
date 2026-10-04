@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass, field as dc_field, replace as dc_replace
 from contextlib import asynccontextmanager
 import xml.etree.ElementTree as ET
 import urllib.parse
@@ -24,7 +24,7 @@ from collections import deque
 
 from processing_progress import ProcessingProgress, RuntimeHistory
 from youtube_lyrics import extract_youtube_lyrics
-from gap_hints import build_alignment_chunks, find_alignment_anchor, parse_lyrics_gap_hints, should_emit_leading_interlude
+from gap_hints import GapHint, build_alignment_chunks, find_alignment_anchor, parse_lyrics_gap_hints, should_emit_leading_interlude
 
 # ---------------------------------------------------------------------------
 # Windows: shut down cleanly when the console window is closed
@@ -2263,7 +2263,113 @@ async def _run_sync_model_once(
     )
 
 
-async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics) -> list[dict]:
+def _virtualize_inline_timing(parsed_lyrics):
+    """Split internally controlled input into virtual rows while retaining source rows.
+
+    The aligner operates on the virtual rows, but Preview/TTML never sees them.
+    Ordinary inter-line gap positions are remapped into virtual-row positions.
+    """
+    by_line: dict[int, list] = {}
+    for hint in parsed_lyrics.inline_hints:
+        by_line.setdefault(hint.line_index, []).append(hint)
+
+    original_gaps = {hint.position: hint for hint in parsed_lyrics.gaps}
+    virtual_lines: list[str] = []
+    source_indices: list[int] = []
+    virtual_gaps: list[GapHint] = []
+    backward_at: dict[int, float] = {}
+
+    for line_index, text in enumerate(parsed_lyrics.lines):
+        original = original_gaps.get(line_index)
+        if original is not None:
+            virtual_gaps.append(dc_replace(original, position=len(virtual_lines)))
+
+        words = text.split()
+        cursor = 0
+        for hint in sorted(by_line.get(line_index, ()), key=lambda value: value.after_word):
+            boundary = int(hint.after_word)
+            if not (cursor < boundary < len(words)):
+                raise ValueError(
+                    f"Invalid timing boundary inside source lyric line {line_index + 1}."
+                )
+            virtual_lines.append(" ".join(words[cursor:boundary]))
+            source_indices.append(line_index)
+            position = len(virtual_lines)
+            if hint.backward:
+                backward_at[position] = backward_at.get(position, 0.0) - float(hint.seconds)
+            else:
+                virtual_gaps.append(GapHint(
+                    position=position,
+                    seconds=hint.seconds,
+                    interlude=hint.interlude,
+                    source=hint.source,
+                ))
+            cursor = boundary
+        virtual_lines.append(" ".join(words[cursor:]))
+        source_indices.append(line_index)
+
+    trailing = original_gaps.get(len(parsed_lyrics.lines))
+    if trailing is not None:
+        virtual_gaps.append(dc_replace(trailing, position=len(virtual_lines)))
+
+    virtual = dc_replace(
+        parsed_lyrics,
+        text="\\n".join(virtual_lines),
+        lines=tuple(virtual_lines),
+        gaps=tuple(sorted(virtual_gaps, key=lambda hint: hint.position)),
+        inline_hints=(),
+    )
+    return virtual, source_indices, backward_at
+
+
+def _merge_virtual_timing_rows(rows: list[dict], parsed_lyrics,
+                               source_indices: list[int],
+                               backward_at: dict[int, float]) -> list[dict]:
+    """Apply cumulative negative timing corrections and rejoin original lyric rows."""
+    if len(rows) != len(source_indices):
+        raise ValueError(
+            "The aligner did not preserve the inline timing segments; cannot "
+            "safely restore the original lyric rows."
+        )
+
+    grouped: list[list[dict]] = [[] for _ in parsed_lyrics.lines]
+    offset = 0.0
+    for index, (source_index, raw) in enumerate(zip(source_indices, rows)):
+        offset += backward_at.get(index, 0.0)
+        line = dict(raw)
+        words = [dict(word) for word in (raw.get("words") or [])]
+        if offset:
+            timestamps = [float(line.get("start", 0.0)), float(line.get("end", 0.0))]
+            for word in words:
+                timestamps.extend((float(word.get("start", 0.0)), float(word.get("end", 0.0))))
+            if min(timestamps) + offset < -0.000001:
+                raise ValueError(
+                    "A negative timing correction would move lyric content before 00:00."
+                )
+            line["start"] = round(timestamps[0] + offset, 3)
+            line["end"] = round(timestamps[1] + offset, 3)
+            for word in words:
+                word["start"] = round(float(word.get("start", 0.0)) + offset, 3)
+                word["end"] = round(float(word.get("end", 0.0)) + offset, 3)
+        line["words"] = words
+        grouped[source_index].append(line)
+
+    output: list[dict] = []
+    for source_index, pieces in enumerate(grouped):
+        if not pieces:
+            raise ValueError(f"Missing aligned pieces for source lyric line {source_index + 1}.")
+        all_words = [word for piece in pieces for word in piece["words"]]
+        output.append({
+            "line": parsed_lyrics.lines[source_index],
+            "start": min(float(piece["start"]) for piece in pieces),
+            "end": max(float(piece["end"]) for piece in pieces),
+            "words": all_words,
+        })
+    return output
+
+
+async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics,
+                              *, preserve_pre_gap_context: bool = True) -> list[dict]:
     """Align marker-separated lyrics with hard forward-only audio barriers."""
     chunks = build_alignment_chunks(parsed_lyrics)
     if not chunks:
@@ -2287,7 +2393,7 @@ async def _sync_with_gap_hints(task: QueueTask, tmp_path: str, parsed_lyrics) ->
     # and keep only the lines before the first marker. This preserves the
     # aligner's original global context for the pre-gap lyrics while discarding
     # every timestamp after the boundary that may have been greedily compressed.
-    if chunks[0].before_gap is None and len(chunks) > 1:
+    if preserve_pre_gap_context and chunks[0].before_gap is None and len(chunks) > 1:
         baseline = await _run_sync_model_once(task, tmp_path, parsed_lyrics.text)
         first_boundary = chunks[1].start_line
         initial_lines = baseline[:first_boundary]
@@ -2422,7 +2528,16 @@ async def _run_sync_task(task: QueueTask) -> None:
     label = get_managed_spec(sync_model).label if sync_model in MODEL_SPECS else f"Whisper {sync_model}"
     task.progress = {"stage": "loading", "msg": f"Loading {label}…", "step": "loading", "pct": 52}
     await _q_broadcast()
-    lines = await _sync_with_gap_hints(task, tmp_path, parsed_lyrics)
+    if parsed_lyrics.inline_hints:
+        virtual, source_indices, backward_at = _virtualize_inline_timing(parsed_lyrics)
+        virtual_lines = await _sync_with_gap_hints(
+            task, tmp_path, virtual, preserve_pre_gap_context=False,
+        )
+        lines = _merge_virtual_timing_rows(
+            virtual_lines, parsed_lyrics, source_indices, backward_at,
+        )
+    else:
+        lines = await _sync_with_gap_hints(task, tmp_path, parsed_lyrics)
     lines = _apply_gap_hints_to_lines(lines, task.gap_hints)
     lines = _apply_lyric_control_fragments_to_lines(lines, parsed_lyrics)
     task.result = {
