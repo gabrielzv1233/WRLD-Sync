@@ -59,11 +59,11 @@ def test_auto_marker_does_not_override_explicit_policy():
     assert parsed.gaps[0].interlude == "forbid"
 
 
-def test_marker_like_text_in_middle_of_lyric_is_not_control_syntax():
-    parsed = parse_lyrics_gap_hints("I waited [...] forever\nNext line")
-
-    assert parsed.text == "I waited [...] forever\nNext line"
+def test_bare_marker_in_middle_now_splits_alignment():
+    parsed = parse_lyrics_gap_hints("I waited [...] forever\\nNext line")
+    assert parsed.text == "I waited forever\\nNext line"
     assert parsed.gaps == ()
+    assert parsed.inline_hints[0].after_word == 2
 
 
 def test_trailing_inline_gap_is_stripped_and_applied_after_lyric():
@@ -296,3 +296,61 @@ def test_sync_forced_background_can_be_the_entire_line():
 def test_unclosed_lyric_control_is_rejected():
     with pytest.raises(ValueError, match="Unclosed lyric control"):
         parse_lyrics_gap_hints(r"Main lyric +\{oops")
+
+
+
+def test_middle_of_line_forward_gap_is_removed_and_mapped_to_word_boundary():
+    parsed = parse_lyrics_gap_hints("Ah, 2-[...]pour up, pour up")
+    assert parsed.text == "Ah, pour up, pour up"
+    assert parsed.display_text == parsed.text
+    assert parsed.gaps == ()
+    assert [(h.line_index, h.after_word, h.seconds, h.interlude, h.backward)
+            for h in parsed.inline_hints] == [(0, 1, 2.0, "forbid", False)]
+
+
+def test_inline_gap_does_not_require_spaces():
+    parsed = parse_lyrics_gap_hints("Ah,2-[...]pour")
+    assert parsed.text == "Ah, pour"
+    assert parsed.inline_hints[0].after_word == 1
+
+
+def test_inline_backward_is_distinct_from_forward_forbid():
+    parsed = parse_lyrics_gap_hints("Ah, -2-[...]pour up")
+    assert parsed.text == "Ah, pour up"
+    assert parsed.inline_hints[0].backward is True
+    assert parsed.inline_hints[0].seconds == 2.0
+    assert parse_lyrics_gap_hints("Ah, 2-[...]pour").inline_hints[0].backward is False
+
+
+def test_multiple_inline_timing_hints_and_trailing_gap():
+    parsed = parse_lyrics_gap_hints("A .5-[...]B -1.25-[...]C 3-[...]\\nD")
+    assert parsed.text == "A B C\\nD"
+    assert [(h.after_word, h.seconds, h.backward) for h in parsed.inline_hints] == [
+        (1, 0.5, False), (2, 1.25, True),
+    ]
+    assert parsed.gaps[0].position == 1
+    assert parsed.gaps[0].seconds == 3.0
+
+
+def test_inline_timing_with_role_controls_counts_only_aligned_words():
+    parsed = parse_lyrics_gap_hints(r"A -\\{overlay} 2-[...]B +{forced words} C")
+    assert parsed.text == "A B forced words C"
+    assert parsed.inline_hints[0].after_word == 1
+    assert parsed.control_fragments[0].text == "overlay"
+    assert parsed.control_fragments[1].after_word == 2
+
+
+def test_literal_gap_inside_role_control_is_not_parsed():
+    parsed = parse_lyrics_gap_hints("A +{2-[...]} B")
+    assert parsed.inline_hints == ()
+    assert parsed.text == "A 2-[...] B"
+
+
+def test_reject_forced_instrumental_mid_line():
+    with pytest.raises(ValueError, match="forced instrumental"):
+        parse_lyrics_gap_hints("A 2+[...]B")
+
+
+def test_backward_requires_following_same_line_text():
+    with pytest.raises(ValueError, match="must be followed"):
+        parse_lyrics_gap_hints("A -2-[...]")

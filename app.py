@@ -2314,7 +2314,7 @@ def _virtualize_inline_timing(parsed_lyrics):
 
     virtual = dc_replace(
         parsed_lyrics,
-        text="\\n".join(virtual_lines),
+        text="\n".join(virtual_lines),
         lines=tuple(virtual_lines),
         gaps=tuple(sorted(virtual_gaps, key=lambda hint: hint.position)),
         inline_hints=(),

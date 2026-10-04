@@ -189,3 +189,35 @@ A non-aligned control must share its line with some normal alignable lyric text.
 A line made only from `+\{...}` or `-\{...}` is rejected because there is no
 anchor from which to obtain the line timing. A line made entirely from
 `+{...}` is valid because that text is sent to the aligner.
+
+
+## Mid-line timing adjustments
+
+You can put a gap control between alignable words **on the same original lyric
+line**. The parser splits only the alignment into virtual segments, then merges
+the real timestamps back into one Preview/TTML line. No spaces are required
+around the control, and the control is not shown in output:
+
+```text
+Ah, 2-[...]pour up, pour up
+```
+
+As elsewhere, `2-[...]` means a **minimum forward boundary of two seconds**
+from the preceding aligned segment end to the following segment's alignment
+search. The minus *after* the number forbids an Instrumental; it is not a
+negative offset. The resulting displayed text remains `Ah, pour up, pour up`.
+
+A new prefix minus creates an **exact backward correction**:
+
+```text
+Ah, -2-[...]pour up, pour up
+```
+
+`-2-[...]` moves the resulting timestamps of the following alignment segment
+and all later text **two seconds earlier**, without moving preceding word
+timestamps. Further backward controls accumulate. A correction that would
+place content before 00:00 is rejected, not clamped.
+
+Internal timing markers must have actual alignable words on both sides.
+`2+[...] ` (forced Instrumental) is restricted to boundaries between whole
+lines: a single TTML lyric paragraph cannot also be an Instrumental section.
