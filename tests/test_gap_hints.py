@@ -60,8 +60,8 @@ def test_auto_marker_does_not_override_explicit_policy():
 
 
 def test_bare_marker_in_middle_now_splits_alignment():
-    parsed = parse_lyrics_gap_hints("I waited [...] forever\\nNext line")
-    assert parsed.text == "I waited forever\\nNext line"
+    parsed = parse_lyrics_gap_hints("I waited [...] forever\nNext line")
+    assert parsed.text == "I waited forever\nNext line"
     assert parsed.gaps == ()
     assert parsed.inline_hints[0].after_word == 2
 
@@ -323,8 +323,8 @@ def test_inline_backward_is_distinct_from_forward_forbid():
 
 
 def test_multiple_inline_timing_hints_and_trailing_gap():
-    parsed = parse_lyrics_gap_hints("A .5-[...]B -1.25-[...]C 3-[...]\\nD")
-    assert parsed.text == "A B C\\nD"
+    parsed = parse_lyrics_gap_hints("A .5-[...]B -1.25-[...]C 3-[...]\nD")
+    assert parsed.text == "A B C\nD"
     assert [(h.after_word, h.seconds, h.backward) for h in parsed.inline_hints] == [
         (1, 0.5, False), (2, 1.25, True),
     ]
