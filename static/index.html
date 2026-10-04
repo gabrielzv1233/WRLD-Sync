@@ -1531,7 +1531,9 @@ async function loadSongData(song) {
     updateLyricsSrc('api', !!song.lyrics);
 
     const localProcessed = song._local_processed;
+    let invalidCachedAlignment = false;
     if (localProcessed?.lines?.length && hasLeakedTimingControls(localProcessed.lines)) {
+      invalidCachedAlignment = true;
       // Old cached output must not be confused with a correctly applied timing hint.
       // Keep the raw editor text verbatim, including every marker, for another Sync.
       if (localProcessed.lyrics) {
@@ -1578,7 +1580,7 @@ async function loadSongData(song) {
     mainEl.classList.add('song-loaded');
     await refreshVocalReference();
     setActiveSourceParam(String(song.id));
-    setTab('karaoke');
+    setTab(invalidCachedAlignment ? 'plain' : 'karaoke');
   } catch (e) {
     setSyncStatus('Failed to load song.', 'error');
   }
@@ -2733,6 +2735,10 @@ function loadSyncedLyrics() {
   const isTtml = /<tt(?:\s|>)/i.test(raw);
   const lines = parseSyncedLyrics(raw);
   if (!lines.length) { setSyncStatus('No valid TTML/LRC timestamps found.', 'error'); return; }
+  if (hasLeakedTimingControls(lines)) {
+    setSyncStatus('Imported timing contains literal control markers. Keep these in the Lyrics tab and run Sync again instead.', 'error');
+    return;
+  }
   syncedLines = lines;
   currentTtmlSource = isTtml ? raw : '';
   renderKaraoke(syncedLines);
@@ -3331,6 +3337,7 @@ function applyCompletedTasks(state) {
         currentTtmlSource = '';
         setKaraokeDefault();
         maybeShowPropose();
+        setTab('plain');
         setSyncStatus('Sync returned literal timing controls as words. Your Lyrics source is preserved. Restart the backend using inline-timing-hints and re-run Sync.', 'error');
         continue;
       }
@@ -4307,7 +4314,7 @@ copyTtmlBtn.addEventListener('click', async () => {
     if (wordTimingToggle.checked && !built.usedWordTiming)
       setSyncStatus('Copied TTML with line timing. This source has no real per-word timestamps.', 'ok');
     setTimeout(() => { copyTtmlBtn.innerHTML = orig; }, 1800);
-  } catch { setSyncStatus('Clipboard copy failed.', 'error'); }
+  } catch (error) { setSyncStatus(error?.message || 'Clipboard copy failed.', 'error'); }
 });
 
 copyLrcBtn.addEventListener('click', async () => {
@@ -4317,7 +4324,7 @@ copyLrcBtn.addEventListener('click', async () => {
     const orig = copyLrcBtn.innerHTML;
     copyLrcBtn.textContent = 'Copied!';
     setTimeout(() => { copyLrcBtn.innerHTML = orig; }, 1800);
-  } catch { setSyncStatus('Clipboard copy failed.', 'error'); }
+  } catch (error) { setSyncStatus(error?.message || 'Clipboard copy failed.', 'error'); }
 });
 
 proposeBtn.addEventListener('click', async () => {
