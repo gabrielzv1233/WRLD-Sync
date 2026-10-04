@@ -30,6 +30,11 @@ _MARKER_TOKEN_RE = re.compile(
     r"(?P<marker>\[\.\.\.\])"
 )
 _CONTROLISH_RE = re.compile(r"[0-9.+\-\s\[\]]+")
+_INLINE_TIMING_RE = re.compile(
+    r"(?P<backward>-(?P<back_seconds>(?:\d+(?:\.\d+)?|\.\d+))-\[\.\.\.\])"
+    r"|(?P<ordinary>(?P<seconds>(?:\d+(?:\.\d+)?|\.\d+))?(?P<mode>[+-]?)\[\.\.\.\])"
+)
+_ROLE_CONTROL_RE = re.compile(r"[+-]\\?\{[^{}]*\}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +50,16 @@ class GapHint:
     seconds: float = 0.25
     interlude: GapInterludeMode = "auto"
     source: str = "[...]"
+
+
+@dataclass(frozen=True, slots=True)
+class InlineTimingHint:
+    line_index: int
+    after_word: int
+    seconds: float
+    interlude: GapInterludeMode
+    backward: bool
+    source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +85,7 @@ class ParsedLyrics:
     display_text: str = ""
     display_lines: tuple[str, ...] = ()
     control_fragments: tuple[LyricControlFragment, ...] = ()
+    inline_hints: tuple[InlineTimingHint, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +311,65 @@ def _parse_lyric_control_fragments(
     return model_line, display_line, tuple(fragments)
 
 
+def _extract_inline_timing_hints(
+    line: str, *, line_index: int,
+) -> tuple[str, tuple[InlineTimingHint, ...]]:
+    """Strip internal timing controls, retaining model-word boundary locations.
+
+    A marker inside a +{...}/-\\{...} payload is literal text.
+    """
+    source = str(line or "")
+    protected = [(m.start(), m.end()) for m in _ROLE_CONTROL_RE.finditer(source)]
+    output: list[str] = []
+    found: list[InlineTimingHint] = []
+    cursor = 0
+
+    for match in _INLINE_TIMING_RE.finditer(source):
+        if any(start <= match.start() < end for start, end in protected):
+            continue
+        if not source[:match.start()].strip() or not source[match.end():].strip():
+            continue
+
+        output.append(source[cursor:match.start()])
+        prefix = "".join(output)
+
+        def model_words(m: re.Match[str]) -> str:
+            token = m.group(0)
+            return token[2:-1] if token.startswith("+{") else ""
+
+        bare_prefix = _ROLE_CONTROL_RE.sub(model_words, prefix)
+        after_word = len(re.findall(r"\S+", bare_prefix))
+        if after_word <= 0:
+            raise ValueError("A mid-line timing control needs alignable text before it.")
+
+        backward = match.group("backward") is not None
+        seconds = float(
+            match.group("back_seconds") if backward
+            else match.group("seconds") or "0.25"
+        )
+        mode: GapInterludeMode = (
+            "forbid" if backward else
+            "force" if match.group("mode") == "+" else
+            "forbid" if match.group("mode") == "-" else "auto"
+        )
+        if not backward and mode == "force":
+            raise ValueError(
+                "A forced instrumental cannot be emitted in the middle of one "
+                "lyric line. Put the +[...] marker between two lines instead."
+            )
+        found.append(InlineTimingHint(
+            line_index=line_index, after_word=after_word, seconds=seconds,
+            interlude=mode, backward=backward, source=match.group(0),
+        ))
+
+        if prefix and not prefix[-1].isspace() and not source[match.end()].isspace():
+            output.append(" ")
+        cursor = match.end()
+
+    output.append(source[cursor:])
+    return "".join(output), tuple(found)
+
+
 def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
     """Strip manual gap controls from lyrics and return their timing metadata.
 
@@ -320,6 +395,7 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
     lyric_lines: list[str] = []
     display_lines: list[str] = []
     control_fragments: list[LyricControlFragment] = []
+    inline_hints: list[InlineTimingHint] = []
     gaps_by_position: dict[int, GapHint] = {}
 
     for raw_line in str(lyrics or "").splitlines():
@@ -337,19 +413,32 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
             continue
 
         working_line = raw_line
+        if re.search(r"-(?:\d+(?:\.\d+)?|\.\d+)-\[\.\.\.\]\s*$", working_line):
+            raise ValueError(
+                "A backward -2-[...] correction must be followed by lyric text "
+                "on the same line."
+            )
         trailing_gap = _parse_trailing_marker(working_line)
         if trailing_gap is not None:
             working_line, seconds, interlude, source = trailing_gap
 
         line_index = len(lyric_lines)
+        working_line, inline = _extract_inline_timing_hints(
+            working_line, line_index=line_index,
+        )
         model_line, display_line, fragments = _parse_lyric_control_fragments(
-            working_line,
-            line_index=line_index,
+            working_line, line_index=line_index,
         )
         if model_line:
+            word_count = len(model_line.split())
+            if any(hint.after_word >= word_count for hint in inline):
+                raise ValueError("An inline timing control needs alignable lyrics on both sides.")
+            if len({hint.after_word for hint in inline}) != len(inline):
+                raise ValueError("Place at least one alignable word between inline timing controls.")
             lyric_lines.append(model_line)
             display_lines.append(display_line)
             control_fragments.extend(fragments)
+            inline_hints.extend(inline)
 
             if trailing_gap is not None:
                 position = len(lyric_lines)
@@ -374,6 +463,7 @@ def parse_lyrics_gap_hints(lyrics: str) -> ParsedLyrics:
         display_text="\n".join(display_lines),
         display_lines=tuple(display_lines),
         control_fragments=tuple(control_fragments),
+        inline_hints=tuple(inline_hints),
     )
 
 
