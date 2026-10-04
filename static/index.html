@@ -3358,6 +3358,14 @@ function applyCompletedTasks(state) {
       maybeShowPropose();
     }
 
+    if (task.type === 'sync' && task.status === 'error'
+        && /timing marker reached the alignment output/i.test(String(task.error ?? ''))) {
+      _appliedTaskIds.add(task.id);
+      // A failed Sync never owns the editable source; it remains available as-is.
+      setTab('plain');
+      setSyncStatus(String(task.error), 'error');
+    }
+
     // Auto is a full Whisper transcription. It owns both raw Lyrics and Preview timing.
     if (task.type === 'auto' && task.status === 'done' && task.result?.lines?.length) {
       _appliedTaskIds.add(task.id);
