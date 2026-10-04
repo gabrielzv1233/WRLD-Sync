@@ -377,3 +377,30 @@ def test_backward_correction_after_end_of_line():
 def test_backward_correction_needs_following_line():
     with pytest.raises(ValueError, match="needs lyrics after"):
         parse_lyrics_gap_hints("First line\n-2-[...]")
+
+
+def test_hennessy_inline_marker_and_background_control_regression():
+    parsed = parse_lyrics_gap_hints(
+        r"+\{(S-S-S-Styn)} I take Hennessy to heal the pain, "
+        "I take Hennessy to heal the pain, yeah, to heal the pain\n"
+        "I take Hennessy to heal the pain, Percocets to forget my name\n"
+        "Ah, 2-[...]pour up, pour up, I take Hennessey to pour up +{(Woah-oh)}"
+    )
+    assert len(parsed.lines) == 3
+    assert "2-[...]" not in parsed.text
+    assert "2-[...]" not in parsed.display_text
+    assert parsed.lines[-1] == "Ah, pour up, pour up, I take Hennessey to pour up (Woah-oh)"
+    assert [(h.line_index, h.after_word, h.seconds, h.backward, h.interlude)
+            for h in parsed.inline_hints] == [(2, 1, 2.0, False, "forbid")]
+    assert parsed.control_fragments[0].align is False
+    assert parsed.control_fragments[-1].align is True
+    assert parsed.control_fragments[-1].background_mode == "force"
+
+
+def test_hennessy_backward_marker_shifts_only_following_segment_metadata():
+    parsed = parse_lyrics_gap_hints(
+        "Ah, -2-[...]pour up, pour up, I take Hennessey to pour up"
+    )
+    assert parsed.text == "Ah, pour up, pour up, I take Hennessey to pour up"
+    assert [(h.after_word, h.seconds, h.backward)
+            for h in parsed.inline_hints] == [(1, 2.0, True)]
